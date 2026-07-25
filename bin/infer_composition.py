@@ -63,8 +63,11 @@ def run(a) -> None:
 
     rng = np.random.default_rng(a.seed)
     reads_dir = a.reads_dir or Path(".")
+    fwd = None if a.no_trim_primers else a.fwd_primer
+    rev = None if a.no_trim_primers else a.rev_primer
     H_obs, total = si.observed_score_histograms(
-        reads_dir, a.read_glob, v4_seqs, emits, bin_edges, a.gap_penalty, a.max_reads, rng)
+        reads_dir, a.read_glob, v4_seqs, emits, bin_edges, a.gap_penalty, a.max_reads, rng,
+        fwd_primer=fwd, rev_primer=rev, primer_mismatches=a.primer_mismatches)
     if total == 0:
         raise SystemExit(f"no reads matched {a.read_glob} under {reads_dir}")
     log.info("sample %s: %d reads, %d refs, %d genomes, mode=%s",
@@ -140,6 +143,16 @@ def demo() -> None:
     assert np.abs(est - theta_true).max() < 0.1, (est, theta_true)
     print("demo OK:", np.round(est, 3), "~", theta_true)
 
+    # primer-trim self-check: a primer-flanked read is cut back to its amplicon; an
+    # already-trimmed read (no primers) is returned unchanged.
+    fwd, rev = si.DEFAULT_FWD_PRIMER, si.DEFAULT_REV_PRIMER
+    amplicon = "ACGT" * 40
+    read = fwd + amplicon + si.revcomp(rev)
+    assert si.trim_read_primers(read, fwd, rev, 3) == amplicon, "forward-orientation trim failed"
+    assert si.trim_read_primers(si.revcomp(read), fwd, rev, 3) == amplicon, "reverse-orientation trim failed"
+    assert si.trim_read_primers(amplicon, fwd, rev, 3) == amplicon, "already-trimmed read altered"
+    print("trim OK")
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
@@ -153,6 +166,13 @@ def main() -> None:
     ap.add_argument("--mode", choices=["nuts", "vi", "mle"], default="vi")
     ap.add_argument("--alpha", type=float, default=0.5, help="Dirichlet prior concentration")
     ap.add_argument("--gap-penalty", type=float, default=4.0)
+    ap.add_argument("--fwd-primer", default=si.DEFAULT_FWD_PRIMER,
+                    help="forward primer; observed reads are trimmed to the primer-free "
+                         "amplicon before scoring (already-trimmed reads are left as-is)")
+    ap.add_argument("--rev-primer", default=si.DEFAULT_REV_PRIMER, help="reverse primer")
+    ap.add_argument("--primer-mismatches", type=int, default=3)
+    ap.add_argument("--no-trim-primers", action="store_true",
+                    help="disable primer trimming (reads are already primer-trimmed)")
     ap.add_argument("--max-reads", type=int, default=20000)
     ap.add_argument("--comp-scale", type=float, default=None,
                     help="composite-likelihood downweight (default = n_refs)")

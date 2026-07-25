@@ -136,6 +136,22 @@ def extract_v4(seq: str, fwd: str, rev: str, max_mismatch: int) -> str | None:
     return amplicon or None
 
 
+def trim_read_primers(seq: str, fwd: str, rev: str, max_mismatch: int) -> str:
+    """Return ``seq`` cut down to its primer-free amplicon, trying both orientations.
+
+    Observed amplicon reads carry the primers (and are longer than the primer-trimmed
+    reference amplicons the reads are scored against); the primer bases misalign at the
+    amplicon boundary and wreck the score histograms. Extracting the amplicon between the
+    primers puts reads in the same coordinate space as ``extract_v4``'s references. If no
+    primer pair is found in either orientation (e.g. reads were already trimmed, or a read
+    is off-target), the read is returned unchanged so it self-sorts into the low-score
+    background rather than being dropped."""
+    amp = extract_v4(seq, fwd, rev, max_mismatch)
+    if amp is None:
+        amp = extract_v4(revcomp(seq), fwd, rev, max_mismatch)
+    return amp if amp else seq
+
+
 # ── Error-model emission distributions & mis-mapping matrix ───────────────────
 
 
@@ -504,7 +520,9 @@ def _score_bin(score: float, bin_edges: np.ndarray) -> int:
 
 def observed_score_histograms(cell_dir: Path, read_glob: str, v4_seqs: list[str],
                               emits: list[np.ndarray], bin_edges: np.ndarray,
-                              gap_penalty: float, max_reads: int, rng) -> tuple[np.ndarray, int]:
+                              gap_penalty: float, max_reads: int, rng,
+                              fwd_primer: str | None = None, rev_primer: str | None = None,
+                              primer_mismatches: int = 3) -> tuple[np.ndarray, int]:
     """Per-reference score histograms ``H[S,K]`` and read count ``N`` for one cell.
 
     For each read, score it against every reference (best of both orientations, decided
@@ -513,12 +531,19 @@ def observed_score_histograms(cell_dir: Path, read_glob: str, v4_seqs: list[str]
     subsampled to ``max_reads`` (a distribution estimate needs far fewer than the full
     depth, and the scorer is O(reads x refs)). ``ponytail:`` per-read orientation detected
     once via ref 0; large community DBs would also want a top-K ref prefilter.
+
+    When ``fwd_primer``/``rev_primer`` are given, each read is trimmed to its primer-free
+    amplicon first (see ``trim_read_primers``) so it lines up with the primer-trimmed
+    reference amplicons; without it, primer bases misalign at the amplicon boundary and
+    the score histograms collapse. Already-trimmed reads are left unchanged.
     """
     S, K = len(v4_seqs), bin_edges.shape[0] - 1
     c2i = _char_to_idx()
     reads = [seq for path in sorted(cell_dir.glob(read_glob)) for seq in _iter_fastq(path)]
     if max_reads and len(reads) > max_reads:
         reads = [reads[i] for i in rng.choice(len(reads), size=max_reads, replace=False)]
+    if fwd_primer and rev_primer:
+        reads = [trim_read_primers(seq, fwd_primer, rev_primer, primer_mismatches) for seq in reads]
 
     H = np.zeros((S, K), dtype=np.float64)
     for seq in reads:

@@ -142,6 +142,15 @@ Composition inference (Pyro):
 | `--infer_warmup` | `500` | NUTS warmup. |
 | `--infer_max_reads` | `20000` | Reads scored per sample. |
 | `--infer_comp_scale` | – | Composite-likelihood downweight (default = n refs). |
+| `--trim_primers` | `true` | Trim primers off observed reads before scoring (uses `--fwd_primer`/`--rev_primer`). Set `false` if reads are already primer-trimmed. |
+
+> **Primer trimming.** Observed reads normally carry the amplification primers and so are
+> longer than the primer-trimmed reference amplicons they are scored against; the primer
+> bases misalign at the amplicon boundary and collapse the score histograms. By default
+> the pipeline trims each read to its primer-free amplicon (same primers as the mis-mapping
+> stage, both read orientations) before scoring. Reads that are already trimmed — or have no
+> detectable primer — are left unchanged, so it is safe to leave on; disable with
+> `--trim_primers false` only if you have a reason to.
 
 Container: `--sra_skiver_tag` (default `latest`). Resources: `--max_cpus`,
 `--max_memory`, `--max_time`.
