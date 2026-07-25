@@ -1,0 +1,18 @@
+# Nextflow
+work/
+.nextflow/
+.nextflow.log*
+results/
+.nf-test/
+.nf-test.log
+null/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+.serena/

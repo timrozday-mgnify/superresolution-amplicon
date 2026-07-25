@@ -1,0 +1,18 @@
+# superresolution-amplicon samplesheet.
+#
+# A YAML list of samples (or a map with `samples:`). Each sample:
+#   id          required. Unique sample id (used for output routing).
+#   reads       fastq(s): a single path or a list. (Or use fastq_1[/fastq_2].)
+#   platform    optional. skiver error-model context / report notebook.
+#               one of: hq-illumina | lq-illumina | ont | pacbio  (default: hq-illumina)
+#   references  optional. Per-sample reference fasta; overrides --references.
+#   error_model optional. Path to a pre-trained .pt model; skips training for this sample.
+#
+# Reference fasta headers MUST encode genome membership as `genome|index|orig`
+# (the part before the first '|' is the genome id). Multiple entries with the same
+# genome id are its 16S copies.
+
+- id: demo
+  reads: tests/data/sample.fastq.gz
+  platform: hq-illumina
+  references: tests/data/refs.fasta

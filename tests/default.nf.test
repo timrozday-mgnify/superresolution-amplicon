@@ -1,0 +1,27 @@
+nextflow_pipeline {
+    name "Test Pipeline SUPERRESOLUTION_AMPLICON"
+    script "main.nf"
+
+    tag "pipeline"
+
+    test("single sample - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input  = "${projectDir}/assets/samplesheet.example.yml"
+                outdir = "$outputDir"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                // 1 sample: SKIVER_DUMP + SKIVER_TRAIN + SKIVER_REPORT + MISMAPPING
+                // + INFER_COMPOSITION = 5
+                { assert workflow.trace.succeeded().size() == 5 },
+                { assert path("${params.outdir}/composition/demo/demo.inferred_composition.csv").exists() },
+                { assert path("${params.outdir}/mismapping/demo_mismapping").exists() }
+            )
+        }
+    }
+}
