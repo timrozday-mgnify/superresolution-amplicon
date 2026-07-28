@@ -1,22 +1,22 @@
 #!/usr/bin/env python
 """Standalone per-sample genome-composition inference for superresolution-amplicon.
 
-Thin driver over ``subspecies_infer.py``: the benchmark's ``stage_infer`` is coupled
-to a ``find_cells``/``read_truth`` directory harness, so instead of reusing it we call
-the un-coupled math directly for a single sample. Observed signal is the score-hist
-path (reads scored against the reference V4 amplicons with the trained error model —
-no external aligner).
+Both observed signal and mis-mapping come from **mapseq**: the observed per-reference
+read counts are the top hits of the real reads, and the mis-mapping matrix ``M`` is
+measured by mapping simulated reads (whose names carry their source reference) through
+the same mapper. Feeding both into the ``dirichlet_multinomial`` likelihood inverts the
+confusion between (near-)identical references rather than ignoring it. Fitting defaults
+to VI (posterior mean): the mode/MLE collapses weak components (e.g. a low-abundance
+subspecies) to exactly 0, the mean does not.
 
     infer_composition.py \
-        --mismap-dir MISMAP_DIR --model-pt model.pt --reads-dir READS_DIR \
+        --amplicon-dir AMPLICON_DIR --sim-mseq sim.mseq --obs-mseq obs.mseq \
         --sample-id S1 --mode vi -o out/
-
-ponytail: standalone replacement for subspecies_infer's stage_infer; if an aligner is
-ever wired in, add an mseq-count path here (see observed_refseq_counts).
 """
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,45 +37,34 @@ def _fit_args(a) -> SimpleNamespace:
     """The attribute bag _fit / composition_model read off ``args``."""
     return SimpleNamespace(
         mode=a.mode, lr=a.lr, steps=a.steps, num_samples=a.num_samples,
-        warmup=a.warmup, comp_scale=a.comp_scale, progress=False,
-        # score_hist ignores use_mismapping, but _fit reads it.
-        use_mismapping=False,
+        warmup=a.warmup, progress=False, use_mismapping=not a.no_mismapping,
     )
 
 
 def run(a) -> None:
     import torch
 
-    mm = a.mismap_dir
-    npz = np.load(mm / "score_components.npz", allow_pickle=True)
-    D, bin_edges = npz["D"], npz["bin_edges"]
-    refseqs = [str(r) for r in npz["refseqs"]]
-    model = si._load_error_model(a.model_pt, a.use_vi)
-    v4_map = dict(si.read_fasta(mm / "v4_amplicons.fasta"))
-    v4_seqs = [v4_map[r] for r in refseqs]
-    emits = [si.emission_distribution(model, s) for s in v4_seqs]
-    M = torch.tensor(D, dtype=torch.float64)
-
-    T_df = pd.read_csv(mm / "translation_table.csv", index_col=0)
+    T_df = pd.read_csv(a.amplicon_dir / "translation_table.csv", index_col=0)
     genomes = list(T_df.index)
-    T = torch.tensor(T_df.loc[genomes, refseqs].to_numpy(), dtype=torch.float64)
+    refseqs = list(T_df.columns)
+    T = torch.tensor(T_df.to_numpy(), dtype=torch.float64)
     g_of_ref = np.array([genomes.index(si.genome_of_header(r)) for r in refseqs])
 
-    rng = np.random.default_rng(a.seed)
-    reads_dir = a.reads_dir or Path(".")
-    fwd = None if a.no_trim_primers else a.fwd_primer
-    rev = None if a.no_trim_primers else a.rev_primer
-    H_obs, total = si.observed_score_histograms(
-        reads_dir, a.read_glob, v4_seqs, emits, bin_edges, a.gap_penalty, a.max_reads, rng,
-        fwd_primer=fwd, rev_primer=rev, primer_mismatches=a.primer_mismatches)
+    # M measured from the simulated reads, mapped by the same mapper as the real reads.
+    M_np = si.build_mismapping(a.sim_mseq, refseqs, a.min_identity)
+    M = torch.tensor(M_np, dtype=torch.float64)
+
+    counts = si.observed_refseq_counts(a.obs_mseq, refseqs, a.min_identity)
+    obs = np.array([counts.get(r, 0) for r in refseqs], dtype=np.float64)
+    total = int(obs.sum())
     if total == 0:
-        raise SystemExit(f"no reads matched {a.read_glob} under {reads_dir}")
-    log.info("sample %s: %d reads, %d refs, %d genomes, mode=%s",
+        raise SystemExit(f"no reads in {a.obs_mseq} hit a reference amplicon")
+    ref_rel = obs / total
+
+    log.info("sample %s: %d mapped reads, %d refs, %d genomes, mode=%s",
              a.sample_id, total, len(refseqs), len(genomes), a.mode)
 
-    # Per-ref proxy (upper-half score mass) -> observed genome composition (init + baseline).
-    w = H_obs[:, H_obs.shape[1] // 2:].sum(1)
-    ref_rel = w / w.sum() if w.sum() > 0 else np.full(len(refseqs), 1.0 / len(refseqs))
+    # Observed per-ref signal collapsed to genome-space -> observed composition (init + baseline).
     theta_obs = np.zeros(len(genomes))
     np.add.at(theta_obs, g_of_ref, ref_rel)
     theta_init = torch.tensor(np.clip(theta_obs, 1e-4, None), dtype=torch.float64)
@@ -83,9 +72,8 @@ def run(a) -> None:
 
     fa = _fit_args(a)
     samples, point, diag, losses = si._fit(
-        a.mode, M, T, a.alpha, float(total),
-        torch.tensor(H_obs, dtype=torch.float64), "score_hist", theta_init, fa,
-        desc=a.sample_id)
+        a.mode, M, T, a.alpha, float(total), torch.tensor(ref_rel, dtype=torch.float64),
+        "dirichlet_multinomial", theta_init, fa, desc=a.sample_id)
     inferred = point.numpy()
     lo = hi = [np.nan] * len(genomes)
     if samples is not None:
@@ -94,6 +82,7 @@ def run(a) -> None:
 
     out = a.output_dir
     out.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(M_np, index=refseqs, columns=refseqs).to_csv(out / "mismapping_matrix.csv")
     comp = pd.DataFrame([{
         "sample": a.sample_id, "genome_id": g,
         "observed_rel_abundance": float(theta_obs[i]),
@@ -102,8 +91,10 @@ def run(a) -> None:
     } for i, g in enumerate(genomes)])
     comp.to_csv(out / "inferred_composition.csv", index=False)
     pd.DataFrame([{
-        "sample": a.sample_id, "mode": a.mode, "likelihood": "score_hist",
-        "n_reads": int(total), **{k: si.json.dumps(v) for k, v in diag.items()},
+        "sample": a.sample_id, "mode": a.mode, "likelihood": "dirichlet_multinomial",
+        "use_mismapping": not a.no_mismapping, "min_identity": a.min_identity,
+        "n_reads": int(total), "mean_diagonal": float(np.diag(M_np).mean()),
+        **{k: json.dumps(v) for k, v in diag.items()},
     }]).to_csv(out / "inference_diagnostics.csv", index=False)
     if losses is not None:
         pd.DataFrame([{"sample": a.sample_id, "step": s, "loss": l}
@@ -112,70 +103,84 @@ def run(a) -> None:
 
 
 def demo() -> None:
-    """Self-check: fit histograms generated at a known theta and recover it.
+    """Self-check: the mis-mapping matrix recovers a genome whose only amplicon is
+    byte-identical to a copy of another genome (the B. uniformis identifiability case).
 
-    Two refs / two genomes (T=I). Build distinct per-ref score components D and set the
-    observed H exactly to the model's prediction at theta_true — MLE must invert it.
+    Genomes [uni, strain2]; refs [uni|0(A), strain2|0(A), strain2|1(B)] — refs 0,1 are
+    identical (A), ref 2 is distinct (B). ``M`` fully confuses the identical pair; ``T``
+    encodes strain2's two equal copies. The observed counts collapse the identical pair
+    (mapseq can't tell 0 from 1), yet fitting through ``M`` + ``T`` must invert the shared
+    ref-2 anchor to back out uni's small excess — the naive observed massively
+    overestimates uni.
     """
+    import tempfile
     import torch
 
-    K, S = 6, 2
-    D = np.zeros((S, S, K))
-    # ref a scores high (upper bins) against itself, low (lower bins) against the other.
-    hi = np.array([0.02, 0.03, 0.05, 0.15, 0.35, 0.40])
-    lo = hi[::-1]
-    for a in range(S):
-        for j in range(S):
-            D[a, j] = hi if a == j else lo
-    T = torch.eye(S, dtype=torch.float64)
-    theta_true = np.array([0.7, 0.3])
-    p = np.einsum("a,ajk->jk", theta_true, D)      # [S,K]
-    p = p / p.sum(-1, keepdims=True)
-    total = 5000
-    H = np.round(p * total)
-    theta_init = torch.tensor([0.5, 0.5], dtype=torch.float64)
-    fa = SimpleNamespace(mode="mle", lr=0.05, steps=1500, num_samples=1,
-                         warmup=0, comp_scale=None, progress=False, use_mismapping=False)
-    _, point, _, _ = si._fit("mle", torch.tensor(D), T, 0.5, float(total),
-                             torch.tensor(H), "score_hist", theta_init, fa, desc="demo")
+    M = torch.tensor([[0.5, 0.5, 0.0], [0.5, 0.5, 0.0], [0.0, 0.0, 1.0]], dtype=torch.float64)
+    T = torch.tensor([[1.0, 0.0, 0.0], [0.0, 0.5, 0.5]], dtype=torch.float64)  # uni / strain2
+    theta_true = np.array([0.05, 0.95])
+    r_true = torch.tensor(theta_true, dtype=torch.float64) @ T
+    r_obs = (r_true @ M)                                   # observed per-ref fractions
+    theta_obs = np.array([float(r_obs[0]), float(r_obs[1] + r_obs[2])])   # naive collapse
+    assert theta_obs[0] > 0.2, theta_obs                  # naive overestimates uni (~0.26)
+    theta_init = torch.tensor(theta_obs, dtype=torch.float64)
+
+    fa = SimpleNamespace(mode="mle", lr=0.05, steps=3000, num_samples=1,
+                         warmup=0, progress=False, use_mismapping=True)
+    _, point, _, _ = si._fit("mle", M, T, 0.5, 5000.0, r_obs, "dirichlet_multinomial",
+                             theta_init, fa, desc="demo")
     est = point.numpy()
     assert np.allclose(est.sum(), 1.0, atol=1e-3), est
-    assert np.abs(est - theta_true).max() < 0.1, (est, theta_true)
-    print("demo OK:", np.round(est, 3), "~", theta_true)
+    assert np.abs(est - theta_true).max() < 0.03, (est, theta_true, theta_obs)
+    print("demo OK:", np.round(est, 4), "~", theta_true, "(naive uni was", round(theta_obs[0], 3), ")")
 
-    # primer-trim self-check: a primer-flanked read is cut back to its amplicon; an
-    # already-trimmed read (no primers) is returned unchanged.
-    fwd, rev = si.DEFAULT_FWD_PRIMER, si.DEFAULT_REV_PRIMER
-    amplicon = "ACGT" * 40
-    read = fwd + amplicon + si.revcomp(rev)
-    assert si.trim_read_primers(read, fwd, rev, 3) == amplicon, "forward-orientation trim failed"
-    assert si.trim_read_primers(si.revcomp(read), fwd, rev, 3) == amplicon, "reverse-orientation trim failed"
-    assert si.trim_read_primers(amplicon, fwd, rev, 3) == amplicon, "already-trimmed read altered"
-    print("trim OK")
+    # End-to-end on synthetic mseq files: the same case, driven through run().
+    refs = ["uni|0|A", "strain2|0|A", "strain2|1|B"]
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        amp = td / "amp"
+        amp.mkdir()
+        pd.DataFrame(T.numpy(), index=["uni", "strain2"], columns=refs).to_csv(
+            amp / "translation_table.csv")
+        # Simulated reads: identical refs 0/1 split 50:50, ref 2 self-hits.
+        with open(td / "sim.mseq", "w") as fh:
+            for a_i, hits in enumerate([[0, 1], [0, 1], [2]]):
+                for i in range(100):
+                    fh.write(f"{refs[a_i]}:{i}\t{refs[hits[i % len(hits)]]}\t500\t0.99\n")
+        with open(td / "obs.mseq", "w") as fh:
+            for j, frac in enumerate(r_obs.numpy()):
+                for i in range(int(round(frac * 10000))):
+                    fh.write(f"read{j}_{i}\t{refs[j]}\t500\t0.99\n")
+        args = argparse.Namespace(
+            amplicon_dir=amp, sim_mseq=[td / "sim.mseq"], obs_mseq=[td / "obs.mseq"],
+            min_identity=None, sample_id="demo", mode="mle", alpha=0.5, steps=3000,
+            lr=0.05, num_samples=1, warmup=0, no_mismapping=False, seed=0,
+            output_dir=td / "out")
+        run(args)
+        got = pd.read_csv(td / "out" / "inferred_composition.csv").set_index("genome_id")
+        assert abs(got.loc["uni", "inferred_mean"] - 0.05) < 0.03, got
+        assert got.loc["uni", "observed_rel_abundance"] > 0.2, got   # naive is wrong
+        Mio = pd.read_csv(td / "out" / "mismapping_matrix.csv", index_col=0)
+        assert np.allclose(Mio.loc[refs[0]].to_numpy(), [0.5, 0.5, 0.0]), Mio
+    print("end-to-end mseq demo OK")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mismap-dir", type=Path, help="dir with score_components.npz etc.")
-    ap.add_argument("--model-pt", type=Path, help="trained error model (.pt)")
-    ap.add_argument("--reads-dir", type=Path, help="dir of the sample's fastq(s)")
-    ap.add_argument("--read-glob", default="*.fastq.gz", help="reads glob within --reads-dir")
+    ap.add_argument("--amplicon-dir", type=Path,
+                    help="dir with translation_table.csv (from `subspecies_infer.py amplicons`)")
+    ap.add_argument("--sim-mseq", type=Path, nargs="+",
+                    help="mapseq output for the simulated reads (source ref in the read name)")
+    ap.add_argument("--obs-mseq", type=Path, nargs="+",
+                    help="mapseq output for this sample's real reads")
+    ap.add_argument("--min-identity", type=float, default=None,
+                    help="drop mapseq hits below this pairwise identity (off-target background)")
     ap.add_argument("--sample-id", default="sample")
-    ap.add_argument("--use-vi", action="store_true", help="use the model's VI posterior mean")
     ap.add_argument("--mode", choices=["nuts", "vi", "mle"], default="vi")
     ap.add_argument("--alpha", type=float, default=0.5, help="Dirichlet prior concentration")
-    ap.add_argument("--gap-penalty", type=float, default=4.0)
-    ap.add_argument("--fwd-primer", default=si.DEFAULT_FWD_PRIMER,
-                    help="forward primer; observed reads are trimmed to the primer-free "
-                         "amplicon before scoring (already-trimmed reads are left as-is)")
-    ap.add_argument("--rev-primer", default=si.DEFAULT_REV_PRIMER, help="reverse primer")
-    ap.add_argument("--primer-mismatches", type=int, default=3)
-    ap.add_argument("--no-trim-primers", action="store_true",
-                    help="disable primer trimming (reads are already primer-trimmed)")
-    ap.add_argument("--max-reads", type=int, default=20000)
-    ap.add_argument("--comp-scale", type=float, default=None,
-                    help="composite-likelihood downweight (default = n_refs)")
+    ap.add_argument("--no-mismapping", action="store_true",
+                    help="disable the mis-mapping correction (r_obs=r_true baseline)")
     ap.add_argument("--num-samples", type=int, default=500)
     ap.add_argument("--warmup", type=int, default=500)
     ap.add_argument("--steps", type=int, default=3000, help="SVI steps (vi/mle)")
@@ -188,9 +193,8 @@ def main() -> None:
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     if a.demo:
-        demo()
-        return
-    for req in ("mismap_dir", "model_pt", "output_dir"):
+        return demo()
+    for req in ("amplicon_dir", "sim_mseq", "obs_mseq", "output_dir"):
         if getattr(a, req) is None:
             ap.error(f"--{req.replace('_', '-')} is required (unless --demo)")
     run(a)

@@ -5,10 +5,11 @@ process INFER_COMPOSITION {
     container "ghcr.io/timrozday-mgnify/sra-skiver:${params.sra_skiver_tag}"
 
     input:
-    tuple val(meta), path(reads), path(mismap_dir), path(model_pt)
+    tuple val(meta), path(amplicon_dir), path(sim_mseq), path(obs_mseq)
 
     output:
     tuple val(meta), path("${meta.id}.inferred_composition.csv"),    emit: composition
+    tuple val(meta), path("${meta.id}.mismapping_matrix.csv"),       emit: mismapping
     tuple val(meta), path("${meta.id}.inference_diagnostics.csv"),   emit: diagnostics
     tuple val(meta), path("${meta.id}.loss_trace.csv"), optional: true, emit: loss
     path "versions.yml",                                             emit: versions
@@ -19,21 +20,18 @@ process INFER_COMPOSITION {
     script:
     def args   = task.ext.args   ?: ''
     def prefix = task.ext.prefix ?: "${meta.id}"
-    // Reads are staged flat into the task dir; point --reads-dir at '.' and glob them.
     """
-    export SKIVER_SCRIPTS=\${SKIVER_SCRIPTS:-/opt/skiver/scripts}
-
     infer_composition.py \\
-        --mismap-dir ${mismap_dir} \\
-        --model-pt ${model_pt} \\
-        --reads-dir . \\
-        --read-glob '*.fastq.gz' \\
+        --amplicon-dir ${amplicon_dir} \\
+        --sim-mseq ${sim_mseq} \\
+        --obs-mseq ${obs_mseq} \\
         --sample-id ${prefix} \\
         --seed ${params.seed} \\
         -o out \\
         $args
 
     cp out/inferred_composition.csv  ${prefix}.inferred_composition.csv
+    cp out/mismapping_matrix.csv     ${prefix}.mismapping_matrix.csv
     cp out/inference_diagnostics.csv ${prefix}.inference_diagnostics.csv
     [ -f out/loss_trace.csv ] && cp out/loss_trace.csv ${prefix}.loss_trace.csv || true
 
@@ -47,6 +45,7 @@ process INFER_COMPOSITION {
     def prefix = task.ext.prefix ?: "${meta.id}"
     """
     echo 'sample,genome_id,observed_rel_abundance,inferred_mean,inferred_lo,inferred_hi' > ${prefix}.inferred_composition.csv
+    echo ',ref|0|x' > ${prefix}.mismapping_matrix.csv
     echo 'sample,mode,likelihood,n_reads' > ${prefix}.inference_diagnostics.csv
 
     cat <<-END_VERSIONS > versions.yml

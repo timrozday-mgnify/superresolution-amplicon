@@ -4,7 +4,7 @@ nextflow_pipeline {
 
     tag "pipeline"
 
-    test("single sample - stub") {
+    test("single sample, flat error model (default) - stub") {
         tag "stub"
         options "-stub"
         when {
@@ -16,11 +16,33 @@ nextflow_pipeline {
         then {
             assertAll(
                 { assert workflow.success },
-                // 1 sample: SKIVER_DUMP + SKIVER_TRAIN + SKIVER_REPORT + MISMAPPING
-                // + INFER_COMPOSITION = 5
-                { assert workflow.trace.succeeded().size() == 5 },
+                // 1 sample: EXTRACT_AMPLICONS + MAPSEQ_CLUSTER + SIMULATE_READS
+                // + MAPSEQ_SIM + READS_TO_FASTA + MAPSEQ_OBS + INFER_COMPOSITION = 7.
+                // No SKIVER_*: the error model is only used by the read simulator.
+                { assert workflow.trace.succeeded().size() == 7 },
+                { assert workflow.trace.tasks().every { !it.name.contains('SKIVER') } },
                 { assert path("${params.outdir}/composition/demo/demo.inferred_composition.csv").exists() },
-                { assert path("${params.outdir}/mismapping/demo_mismapping").exists() }
+                { assert path("${params.outdir}/amplicons/demo_amplicons").exists() },
+                { assert path("${params.outdir}/mapseq/demo/demo.obs.mseq.gz").exists() }
+            )
+        }
+    }
+
+    test("trained error model adds the skiver subworkflow - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input           = "${projectDir}/assets/samplesheet.example.yml"
+                outdir          = "$outputDir"
+                sim_error_model = "trained"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                // + SKIVER_DUMP + SKIVER_TRAIN + SKIVER_REPORT = 10
+                { assert workflow.trace.succeeded().size() == 10 }
             )
         }
     }

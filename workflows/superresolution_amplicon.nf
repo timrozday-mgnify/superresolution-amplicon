@@ -1,10 +1,16 @@
 //
-// superresolution-amplicon: train an error model from amplicon reads, quantify
-// reference-to-reference mis-mapping, and infer true genome composition.
+// superresolution-amplicon: extract the reference amplicons, measure reference-to-
+// reference mis-mapping by simulating reads and mapping them with the same mapper the
+// real reads go through (mapseq), and infer the true genome composition.
 //
-include { TRAIN_ERROR_MODEL } from '../subworkflows/local/train_error_model/main'
-include { MISMAPPING        } from '../modules/local/mismapping/main'
-include { INFER_COMPOSITION } from '../modules/local/infer_composition/main'
+include { TRAIN_ERROR_MODEL    } from '../subworkflows/local/train_error_model/main'
+include { EXTRACT_AMPLICONS    } from '../modules/local/extract_amplicons/main'
+include { MAPSEQ_CLUSTER       } from '../modules/local/mapseq/cluster/main'
+include { MAPSEQ as MAPSEQ_SIM } from '../modules/local/mapseq/map/main'
+include { MAPSEQ as MAPSEQ_OBS } from '../modules/local/mapseq/map/main'
+include { SIMULATE_READS       } from '../modules/local/simulate_reads/main'
+include { READS_TO_FASTA       } from '../modules/local/reads_to_fasta/main'
+include { INFER_COMPOSITION    } from '../modules/local/infer_composition/main'
 
 workflow SUPERRESOLUTION_AMPLICON {
     take:
@@ -15,36 +21,71 @@ workflow SUPERRESOLUTION_AMPLICON {
     main:
     ch_versions = Channel.empty()
 
-    // Split samples that bring a pre-trained model from those that need training.
-    ch_reads
-        .branch { meta, reads ->
-            pretrained: meta.error_model != null
-            train:      true
-        }
-        .set { ch_split }
+    // Error model: only the read simulator uses it, so the whole skiver training
+    // subworkflow is skipped under the flat model. [ id, model_pt ] either way.
+    if (params.sim_error_model == 'flat') {
+        ch_model = ch_reads.map { meta, reads -> [ meta.id, file("${projectDir}/assets/NO_MODEL") ] }
+    }
+    else {
+        // Split samples that bring a pre-trained model from those that need training.
+        ch_reads
+            .branch { meta, reads ->
+                pretrained: meta.error_model != null
+                train:      true
+            }
+            .set { ch_split }
 
-    TRAIN_ERROR_MODEL(ch_split.train)
-    ch_versions = ch_versions.mix(TRAIN_ERROR_MODEL.out.versions)
+        TRAIN_ERROR_MODEL(ch_split.train)
+        ch_versions = ch_versions.mix(TRAIN_ERROR_MODEL.out.versions)
 
-    // Unified model channel keyed by id: [ id, model_pt ].
-    ch_model = TRAIN_ERROR_MODEL.out.model
-        .map { meta, model -> [ meta.id, model ] }
-        .mix(ch_pretrained)
+        ch_model = TRAIN_ERROR_MODEL.out.model
+            .map { meta, model -> [ meta.id, model ] }
+            .mix(ch_pretrained)
+    }
 
-    // MISMAPPING: join references with the model by id -> [ meta, refs, model ].
-    ch_mismap_in = ch_refs
-        .map { meta, refs -> [ meta.id, meta, refs ] }
+    // In-silico PCR -> the mapseq reference set (+ translation table T).
+    EXTRACT_AMPLICONS(ch_refs)
+    ch_versions = ch_versions.mix(EXTRACT_AMPLICONS.out.versions)
+
+    // Build the mapseq clustering once; both mappings reuse it.
+    MAPSEQ_CLUSTER(EXTRACT_AMPLICONS.out.refs)
+    ch_versions = ch_versions.mix(MAPSEQ_CLUSTER.out.versions)
+
+    // [ id, fasta, tax, mscluster ] — the mapseq DB slots, shared by both mappings.
+    ch_db = EXTRACT_AMPLICONS.out.refs
+        .map { meta, fasta, tax -> [ meta.id, fasta, tax ] }
+        .join(MAPSEQ_CLUSTER.out.mscluster.map { meta, mscluster -> [ meta.id, mscluster ] })
+
+    // Simulated reads -> mapseq -> the mis-mapping matrix M.
+    ch_sim_in = EXTRACT_AMPLICONS.out.refs
+        .map { meta, fasta, tax -> [ meta.id, meta, fasta ] }
         .join(ch_model)
-        .map { id, meta, refs, model -> [ meta, refs, model ] }
-    MISMAPPING(ch_mismap_in)
-    ch_versions = ch_versions.mix(MISMAPPING.out.versions)
+        .map { id, meta, fasta, model -> [ meta, fasta, model ] }
+    SIMULATE_READS(ch_sim_in)
+    ch_versions = ch_versions.mix(SIMULATE_READS.out.versions)
 
-    // INFER_COMPOSITION: reads + mismap dir + model, joined by id.
-    ch_infer_in = ch_reads
+    MAPSEQ_SIM(SIMULATE_READS.out.reads
         .map { meta, reads -> [ meta.id, meta, reads ] }
-        .join(MISMAPPING.out.dir.map { meta, d -> [ meta.id, d ] })
-        .join(ch_model)
-        .map { id, meta, reads, d, model -> [ meta, reads, d, model ] }
+        .join(ch_db)
+        .map { id, meta, reads, fasta, tax, mscluster -> [ meta, reads, fasta, tax, mscluster ] })
+    ch_versions = ch_versions.mix(MAPSEQ_SIM.out.versions)
+
+    // Real reads -> fasta -> mapseq -> the observed per-reference counts.
+    READS_TO_FASTA(ch_reads)
+    ch_versions = ch_versions.mix(READS_TO_FASTA.out.versions)
+
+    MAPSEQ_OBS(READS_TO_FASTA.out.reads
+        .map { meta, reads -> [ meta.id, meta, reads ] }
+        .join(ch_db)
+        .map { id, meta, reads, fasta, tax, mscluster -> [ meta, reads, fasta, tax, mscluster ] })
+    ch_versions = ch_versions.mix(MAPSEQ_OBS.out.versions)
+
+    // INFER_COMPOSITION: amplicon dir + both mseq files, joined by id.
+    ch_infer_in = EXTRACT_AMPLICONS.out.dir
+        .map { meta, d -> [ meta.id, meta, d ] }
+        .join(MAPSEQ_SIM.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
+        .join(MAPSEQ_OBS.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
+        .map { id, meta, d, sim, obs -> [ meta, d, sim, obs ] }
     INFER_COMPOSITION(ch_infer_in)
     ch_versions = ch_versions.mix(INFER_COMPOSITION.out.versions)
 
@@ -53,8 +94,8 @@ workflow SUPERRESOLUTION_AMPLICON {
         .collectFile(name: 'software_versions.yml', storeDir: "${params.outdir}/pipeline_info")
 
     emit:
-    model       = ch_model
-    mismapping  = MISMAPPING.out.dir
+    amplicons   = EXTRACT_AMPLICONS.out.dir
+    mismapping  = INFER_COMPOSITION.out.mismapping
     composition = INFER_COMPOSITION.out.composition
     versions    = ch_versions
 }

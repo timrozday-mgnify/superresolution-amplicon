@@ -1,5 +1,6 @@
 # sra-skiver: skiver Rust binary (`skiver dump`) + Python env for error-model
-# training, mis-mapping (incl. edlib sampling), and Pyro composition inference.
+# training, read simulation, and Pyro composition inference. Read mapping itself runs
+# in the mapseq biocontainer (see modules/local/mapseq/).
 # Build context is the repo root so the vendor/skiver submodule is visible:
 #   docker build -f containers/skiver/Dockerfile -t sra-skiver .
 
@@ -45,14 +46,14 @@ COPY vendor/skiver/scripts/ ${SKIVER_SCRIPTS}/
 ENV SKIVER_NOTEBOOKS=/opt/skiver/notebooks
 COPY vendor/skiver/notebooks/context_error_model_*.qmd vendor/skiver/notebooks/_context_error_model_body.qmd ${SKIVER_NOTEBOOKS}/
 
-# CPU-only torch keeps the image lean. pyro drives inference; edlib is the argmax
-# assigner for the sampling mis-mapping path; plotly/ipykernel/papermill render the
-# Quarto error-model report. The pipeline's own bin/ scripts are staged onto PATH by
-# Nextflow, so they are not baked in here.
+# CPU-only torch keeps the image lean. pyro drives inference and the error-model
+# sampler; plotly/ipykernel/papermill render the Quarto error-model report. The
+# pipeline's own bin/ scripts are staged onto PATH by Nextflow, so they are not baked in
+# here.
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
     && pip install --no-cache-dir \
         numpy scipy pandas h5py pyyaml matplotlib rich "pyro-ppl>=1.9" \
-        edlib plotly ipykernel jupyter papermill \
+        plotly ipykernel jupyter papermill \
     && python -m ipykernel install --name skiver --sys-prefix
 
 # Nextflow's docker executor runs the container as the host UID, not root, so
@@ -61,7 +62,7 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 ENV HOME=/tmp
 RUN chmod 1777 /tmp
 
-RUN skiver --version && quarto --version && python -c "import edlib, pyro, torch"
+RUN skiver --version && quarto --version && python -c "import pyro, torch"
 
 # The checks above ran as root and left root-owned junk under /tmp that a later
 # non-root runtime UID can't write around; clear it so /tmp starts empty.
