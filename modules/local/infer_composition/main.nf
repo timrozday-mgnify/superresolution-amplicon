@@ -44,7 +44,7 @@ process INFER_COMPOSITION {
     stub:
     def prefix = task.ext.prefix ?: "${meta.id}"
     """
-    echo 'sample,genome_id,observed_rel_abundance,inferred_mean,inferred_lo,inferred_hi' > ${prefix}.inferred_composition.csv
+    echo 'sample,genome_id,observed_rel_abundance,inferred_mean,inferred_lo,inferred_hi,presence_prob' > ${prefix}.inferred_composition.csv
     echo ',ref|0|x' > ${prefix}.mismapping_matrix.csv
     echo 'sample,mode,likelihood,n_reads' > ${prefix}.inference_diagnostics.csv
 

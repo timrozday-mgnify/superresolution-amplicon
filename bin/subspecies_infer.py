@@ -44,6 +44,17 @@ log = logging.getLogger("subspecies_infer")
 DEFAULT_FWD_PRIMER = "GTGYCAGCMGCCGCGGTAA"
 DEFAULT_REV_PRIMER = "GGACTACNVGGGTWTCTAAT"
 
+# Presence/absence gate. The prior probability is the sparsity regulariser (small =>
+# a genome must earn its place); the temperature controls how hard the Concrete
+# relaxation is. Both chosen by Jaccard against a subset-present truth on the 21-genome
+# B. uniformis V4 set — see dev/presence_prior_sweep.md. Temperature turned out to matter
+# more than the prior: below ~1 the gate barely moves and no prior can sparsify it. Both
+# defaults sit inside the plateau of settings scoring Jaccard 1.0 rather than on its edge.
+DEFAULT_PRESENCE_PRIOR = 0.01
+DEFAULT_PRESENCE_TEMP = 1.0
+# A gate above this is called "present" (Jaccard / n_present / the hard MLE gate).
+PRESENCE_THRESHOLD = 0.5
+
 _IUPAC = {
     "A": set("A"), "C": set("C"), "G": set("G"), "T": set("T"),
     "R": set("AG"), "Y": set("CT"), "S": set("GC"), "W": set("AT"),
@@ -288,19 +299,27 @@ def build_mismapping(sim_mseq_paths, refseqs: list[str],
 
 
 def composition_model(M, T, alpha, N, y_obs=None, likelihood="dirichlet_multinomial",
-                      use_mismapping=True, s_sigma=0.3, od_loc=1.1, od_scale=1.0):
+                      use_mismapping=True, s_sigma=0.3, od_loc=1.1, od_scale=1.0,
+                      use_presence=True, presence_prior=DEFAULT_PRESENCE_PRIOR,
+                      presence_temp=DEFAULT_PRESENCE_TEMP):
     """Generative model of the observed per-reference counts.
 
     ``theta`` is the true **read-space** genome composition; ``T`` rows sum to 1
     (within-genome copy distribution) so ``r_true = theta@T`` has genome-marginal
-    ``theta``. ``theta ~ Dirichlet`` -> ``r_true = theta@T``. When ``use_mismapping`` a sampled
-    scalar ``s`` scales the mis-mapping matrix (``M_eff = (1-s)I + s*M``,
+    ``theta``. ``theta ~ Dirichlet`` -> ``r_true = theta@T``. When ``use_presence`` a
+    per-genome Bernoulli gate ``z`` multiplies ``theta`` before renormalising; its
+    posterior probability is the reported presence confidence and an absent genome's
+    abundance is shrunk towards zero by it. When ``use_mismapping`` a
+    sampled scalar ``s`` scales the mis-mapping matrix (``M_eff = (1-s)I + s*M``,
     ``s~LogNormal`` centred at 1) which then acts on ``r_true`` to give
     ``r_obs = r_true@M_eff``; otherwise ``r_obs = r_true`` (no correction — the
     baseline control). Counts follow a Dirichlet-Multinomial whose concentration is
     ``conc_frac*N*r_obs`` — overdispersion parameterised as a *fraction of N* so the
     prior is sample-size-invariant and centred near the multinomial limit rather than
     discarding read-count precision — or plain Multinomial.
+
+    The gated composition is exposed as the deterministic site ``theta_eff`` (equal to
+    ``theta`` when the gate is off), which is what downstream code reads.
     """
     import pyro
     import pyro.distributions as dist
@@ -309,6 +328,25 @@ def composition_model(M, T, alpha, N, y_obs=None, likelihood="dirichlet_multinom
     dt = M.dtype
     G, Sdim = T.shape[0], M.shape[0]
     theta = pyro.sample("theta", dist.Dirichlet(alpha * torch.ones(G, dtype=dt)))
+
+    if use_presence:
+        # Bernoulli presence per genome, relaxed to a Concrete distribution so SVI can
+        # differentiate through it. ``presence_prior`` << 0.5 is the regulariser: the KL
+        # pulls every gate towards 0 and the likelihood has to pay for each genome it
+        # keeps.
+        #
+        # NB: the straight-through variant (RelaxedBernoulliStraightThrough) was tried
+        # first, for hard 0/1 gates. It does not work here: the hard value loses the soft
+        # sample that carries the gradient, so both model and guide score the gate at the
+        # clamped boundary where the Concrete density is ~470 nats and almost insensitive
+        # to the logits. The gates never leave their initialisation and the prior is inert
+        # (identical fits at 0.05 and 1e-12). See dev/presence_prior_sweep.md.
+        z = pyro.sample("z", dist.RelaxedBernoulli(
+            temperature=torch.tensor(presence_temp, dtype=dt),
+            probs=presence_prior * torch.ones(G, dtype=dt)).to_event(1))
+        theta = z * theta
+        theta = theta / theta.sum()
+    theta = pyro.deterministic("theta_eff", theta)
 
     r_true = theta @ T
     r_true = r_true / r_true.sum()
@@ -344,16 +382,57 @@ def composition_model(M, T, alpha, N, y_obs=None, likelihood="dirichlet_multinom
                     obs=counts)
 
 
+def _presence_guide(G, temp, dt, init_logit=2.0):
+    """Mean-field guide for the presence gate: a learnable per-genome Bernoulli.
+
+    ``z`` gets its own site rather than an autoguide entry so the variational family
+    matches the prior's: an AutoNormal over the Concrete's unit-interval support would
+    fit a sigmoid-normal instead, and ``sigmoid(z_logits)`` would no longer be a
+    Bernoulli probability. As written the learned ``sigmoid(z_logits)`` *is* the
+    posterior presence probability we report. Initialised at ~0.88 ("start with
+    everything present") so the prior has to earn the zeros off the data.
+    """
+    import pyro
+    import pyro.distributions as dist
+    import torch
+
+    def guide(*a, **kw):
+        logits = pyro.param("z_logits", lambda: torch.full((G,), init_logit, dtype=dt))
+        pyro.sample("z", dist.RelaxedBernoulli(
+            temperature=torch.tensor(temp, dtype=dt), logits=logits).to_event(1))
+    return guide
+
+
+def _presence_probs(G):
+    """The fitted presence probabilities, or all-ones when the gate is off."""
+    import pyro
+    import torch
+    if "z_logits" not in pyro.get_param_store():
+        return torch.ones(G, dtype=torch.float64)
+    return torch.sigmoid(pyro.param("z_logits").detach())
+
+
 def _fit(mode, M, T, alpha, N, y_obs, likelihood, theta_init, args, desc=""):
-    """Return (theta_samples[K,G] or None, theta_point[G], diagnostics dict, loss_trace)."""
+    """Return (theta_samples[K,G] or None, theta_point[G], diagnostics dict, loss_trace).
+
+    ``theta`` here is the *gated* composition (the ``theta_eff`` site). When the presence
+    gate is on the diagnostics carry ``presence_prob`` (per-genome posterior probability
+    of presence) and ``n_present``.
+    """
     import pyro
     import torch
     from pyro.infer.autoguide.initialization import init_to_value
 
     use_mm = getattr(args, "use_mismapping", True)
+    use_presence = getattr(args, "use_presence", True)
+    p_prior = getattr(args, "presence_prior", DEFAULT_PRESENCE_PRIOR)
+    p_temp = getattr(args, "presence_temp", DEFAULT_PRESENCE_TEMP)
     show = getattr(args, "progress", True)
-    mk = {"y_obs": y_obs, "likelihood": likelihood, "use_mismapping": use_mm}
+    G = T.shape[0]
+    mk = {"y_obs": y_obs, "likelihood": likelihood, "use_mismapping": use_mm,
+          "use_presence": use_presence, "presence_prior": p_prior, "presence_temp": p_temp}
 
+    pyro.set_rng_seed(int(getattr(args, "seed", 0) or 0))
     pyro.clear_param_store()
     init = {"theta": theta_init}
     if use_mm:
@@ -367,7 +446,18 @@ def _fit(mode, M, T, alpha, N, y_obs, likelihood, theta_init, args, desc=""):
         hi = torch.quantile(samples, 0.95, dim=0)
         return mean, lo, hi
 
+    def _presence_diag():
+        if not use_presence:
+            return {}
+        p = _presence_probs(G)
+        return {"presence_prob": p.tolist(),
+                "n_present": int((p >= PRESENCE_THRESHOLD).sum())}
+
     if mode == "nuts":
+        if use_presence:
+            # A Concrete density is stiff for HMC and not worth the step-size tuning.
+            raise SystemExit("presence gate is not supported in nuts mode; "
+                             "use --mode vi or --no-presence")
         from pyro.infer import MCMC, NUTS
         log.debug("%s NUTS: %d warmup + %d samples", desc, args.warmup, args.num_samples)
         kernel = NUTS(composition_model, init_strategy=init_to_value(values=init))
@@ -382,12 +472,17 @@ def _fit(mode, M, T, alpha, N, y_obs, likelihood, theta_init, args, desc=""):
         return s, mean, {"r_hat": rhat.tolist(), "n_eff": ess.tolist(),
                          "max_r_hat": float(np.nanmax(rhat))}, None
 
+    from pyro import poutine
     from pyro.infer import SVI, Trace_ELBO, Predictive
-    from pyro.infer.autoguide import AutoNormal, AutoDelta
+    from pyro.infer.autoguide import AutoNormal, AutoDelta, AutoGuideList
     from pyro.optim import Adam
 
     guide_cls = AutoDelta if mode == "mle" else AutoNormal
-    guide = guide_cls(composition_model, init_loc_fn=init_to_value(values=init))
+    guide = AutoGuideList(composition_model)
+    guide.append(guide_cls(poutine.block(composition_model, hide=["z"]),
+                           init_loc_fn=init_to_value(values=init)))
+    if use_presence:
+        guide.append(_presence_guide(G, p_temp, M.dtype))
     svi = SVI(composition_model, guide, Adam({"lr": args.lr}), Trace_ELBO())
     log.debug("%s %s: %d SVI steps (lr=%g)", desc, mode.upper(), args.steps, args.lr)
     losses = []
@@ -401,14 +496,42 @@ def _fit(mode, M, T, alpha, N, y_obs, likelihood, theta_init, args, desc=""):
             if hasattr(bar, "set_postfix"):
                 bar.set_postfix(loss=f"{loss:.1f}")
             log.debug("%s %s step %d/%d loss=%.3f", desc, mode, step, args.steps, loss)
+    diag = {"final_loss": losses[-1], **_presence_diag()}
     if mode == "mle":
+        # AutoDelta.median() has no deterministic sites, so apply the hard gate here.
         point = guide.median()["theta"].detach()
-        return None, point, {"final_loss": losses[-1]}, losses
+        if use_presence:
+            point = point * (_presence_probs(G) >= PRESENCE_THRESHOLD).to(point.dtype)
+            point = point / point.sum().clamp(min=1e-12)
+        return None, point, diag, losses
     pred = Predictive(composition_model, guide=guide, num_samples=args.num_samples,
-                      return_sites=["theta"])
-    s = pred(M, T, alpha, N, **{**mk, "y_obs": None})["theta"].squeeze()
+                      return_sites=["theta_eff"])
+    s = pred(M, T, alpha, N, **{**mk, "y_obs": None})["theta_eff"].squeeze()
     mean, lo, hi = _summ(s)
-    return s, mean, {"final_loss": losses[-1]}, losses
+    return s, mean, diag, losses
+
+
+# ── Presence/absence scoring ──────────────────────────────────────────────────
+
+
+def presence_metrics(pred: np.ndarray, truth: np.ndarray) -> dict:
+    """Set-overlap metrics for two boolean presence vectors.
+
+    Jaccard is the headline number (intersection over union of the present sets); it is
+    1.0 for a perfect call and, unlike accuracy, is not inflated by the many genomes both
+    sides agree are absent. Precision/recall are reported alongside because the two
+    failure modes differ in cost: a missed low-abundance sub-species (recall) is the one
+    this pipeline exists to avoid.
+    """
+    pred, truth = np.asarray(pred, bool), np.asarray(truth, bool)
+    tp = int((pred & truth).sum())
+    union = int((pred | truth).sum())
+    prec = tp / pred.sum() if pred.sum() else 0.0
+    rec = tp / truth.sum() if truth.sum() else 0.0
+    return {"jaccard": tp / union if union else 1.0,
+            "precision": float(prec), "recall": float(rec),
+            "f1": 2 * prec * rec / (prec + rec) if prec + rec else 0.0,
+            "n_pred": int(pred.sum())}
 
 
 # ── Demos ─────────────────────────────────────────────────────────────────────
@@ -478,10 +601,13 @@ def demo_infer() -> None:
     T = torch.tensor([[1, 0, 0, 0],
                       [0, .5, .5, 0],
                       [0, 0, 0, 1]], dtype=torch.float64)
-    M = torch.tensor([[0.95, 0.03, 0.01, 0.01],
-                      [0.02, 0.55, 0.40, 0.03],   # copies 1<->2 heavily confused
-                      [0.02, 0.42, 0.53, 0.03],
-                      [0.01, 0.02, 0.02, 0.95]], dtype=torch.float64)
+    # Leakage is *across* genomes as well as between genome 1's two copies: confusion
+    # within a genome cancels when the naive estimate collapses refseq->genome, so a
+    # within-genome-only M leaves nothing for the inversion to beat.
+    M = torch.tensor([[0.80, 0.12, 0.05, 0.03],
+                      [0.08, 0.50, 0.38, 0.04],   # copies 1<->2 heavily confused
+                      [0.06, 0.40, 0.50, 0.04],
+                      [0.04, 0.06, 0.05, 0.85]], dtype=torch.float64)
     theta_true = torch.tensor([0.2, 0.5, 0.3], dtype=torch.float64)
     r_true = theta_true @ T
     r_obs = (r_true / r_true.sum()) @ M
@@ -493,8 +619,9 @@ def demo_infer() -> None:
     for s in range(4):
         obs_genome[memb[s]] += r_obs[s]
 
-    args = argparse.Namespace(mode="vi", num_samples=200, warmup=0, steps=1200, lr=0.05,
-                              progress=False)
+    # Gate off: this case is testing the mis-mapping inversion in isolation.
+    args = argparse.Namespace(mode="vi", num_samples=500, warmup=0, steps=2000, lr=0.05,
+                              progress=False, use_presence=False, seed=0)
     _, point, diag, losses = _fit("vi", M, T, 0.5, 5000.0, r_obs, "dirichlet_multinomial",
                                   obs_genome / obs_genome.sum(), args)
     inferred = point.numpy()
@@ -502,7 +629,46 @@ def demo_infer() -> None:
     err_inf = float(np.abs(inferred - theta_true.numpy()).sum())
     assert losses[-1] < losses[0], (losses[0], losses[-1])
     assert err_inf < err_naive, (err_inf, err_naive)
+    assert "presence_prob" not in diag, diag
     print(f"demo infer: L1 naive={err_naive:.3f} -> inferred={err_inf:.3f} OK")
+
+
+def demo_presence() -> None:
+    """The gate must call a genome that contributes no reads absent, and keep the rest.
+
+    4 genomes over 4 refseqs; genome 3 is truly absent. Mis-mapping leaks a little signal
+    onto its reference, so the ungated fit gives it a non-zero abundance and has no way
+    to say it isn't there. The gate has to (a) drop it from the present set and (b) shrink
+    its abundance well below the ungated tail.
+    """
+    import torch
+
+    T = torch.eye(4, dtype=torch.float64)
+    M = torch.eye(4, dtype=torch.float64) * 0.80 + 0.05   # 5% leakage per off-diagonal
+    theta_true = np.array([0.5, 0.3, 0.2, 0.0])
+    r_obs = torch.tensor(theta_true, dtype=torch.float64) @ M
+    r_obs = r_obs / r_obs.sum()
+
+    def fit(**kw):
+        args = argparse.Namespace(mode="vi", num_samples=500, warmup=0, steps=1500,
+                                  lr=0.05, progress=False, seed=0,
+                                  presence_prior=DEFAULT_PRESENCE_PRIOR,
+                                  presence_temp=DEFAULT_PRESENCE_TEMP, **kw)
+        return _fit("vi", M, T, 0.5, 20000.0, r_obs, "dirichlet_multinomial",
+                    torch.tensor([.25] * 4, dtype=torch.float64), args)
+
+    _, ungated, off_diag, _ = fit(use_presence=False)
+    _, point, diag, _ = fit(use_presence=True)
+    p = np.array(diag["presence_prob"])
+    m = presence_metrics(p >= PRESENCE_THRESHOLD, theta_true > 0)
+    assert "presence_prob" not in off_diag, off_diag
+    assert m["jaccard"] == 1.0, (p, m)                 # absent genome dropped, rest kept
+    assert diag["n_present"] == 3, diag
+    # The reported mean still marginalises over presence uncertainty, so it is ~p*theta,
+    # not a hard zero — but it must be a small fraction of the ungated tail.
+    assert point.numpy()[3] < 0.25 * float(ungated.numpy()[3]), (point, ungated)
+    print(f"demo presence: probs={np.round(p, 3)} jaccard={m['jaccard']:.2f} "
+          f"absent abundance {ungated.numpy()[3]:.4f} -> {point.numpy()[3]:.4f} OK")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -528,7 +694,8 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
     if args.demo:
         demo_amplicons()
-        return demo_infer()
+        demo_infer()
+        return demo_presence()
     for req in ("db_fasta", "output_dir"):
         if getattr(args, req) is None:
             ap.error(f"--{req.replace('_', '-')} required")

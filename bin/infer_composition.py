@@ -9,6 +9,11 @@ confusion between (near-)identical references rather than ignoring it. Fitting d
 to VI (posterior mean): the mode/MLE collapses weak components (e.g. a low-abundance
 subspecies) to exactly 0, the mean does not.
 
+A per-genome Bernoulli presence gate (on by default) answers the separate question of
+whether a genome is in the sample at all. Its prior probability is a sparsity
+regulariser, and its posterior probability is reported per genome as ``presence_prob`` —
+the confidence in the presence call, not in the abundance.
+
     infer_composition.py \
         --amplicon-dir AMPLICON_DIR --sim-mseq sim.mseq --obs-mseq obs.mseq \
         --sample-id S1 --mode vi -o out/
@@ -38,6 +43,8 @@ def _fit_args(a) -> SimpleNamespace:
     return SimpleNamespace(
         mode=a.mode, lr=a.lr, steps=a.steps, num_samples=a.num_samples,
         warmup=a.warmup, progress=False, use_mismapping=not a.no_mismapping,
+        use_presence=not a.no_presence, presence_prior=a.presence_prior,
+        presence_temp=a.presence_temp, seed=a.seed,
     )
 
 
@@ -79,6 +86,9 @@ def run(a) -> None:
     if samples is not None:
         lo = torch.quantile(samples, 0.05, dim=0).numpy()
         hi = torch.quantile(samples, 0.95, dim=0).numpy()
+    # Posterior probability that each genome is present at all (the Bernoulli gate);
+    # NaN when the gate is off, so "no call" is never confused with "called absent".
+    presence = np.array(diag.pop("presence_prob", [np.nan] * len(genomes)))
 
     out = a.output_dir
     out.mkdir(parents=True, exist_ok=True)
@@ -88,11 +98,14 @@ def run(a) -> None:
         "observed_rel_abundance": float(theta_obs[i]),
         "inferred_mean": float(inferred[i]),
         "inferred_lo": float(lo[i]), "inferred_hi": float(hi[i]),
+        "presence_prob": float(presence[i]),
     } for i, g in enumerate(genomes)])
     comp.to_csv(out / "inferred_composition.csv", index=False)
     pd.DataFrame([{
         "sample": a.sample_id, "mode": a.mode, "likelihood": "dirichlet_multinomial",
         "use_mismapping": not a.no_mismapping, "min_identity": a.min_identity,
+        "use_presence": not a.no_presence, "presence_prior": a.presence_prior,
+        "presence_temp": a.presence_temp,
         "n_reads": int(total), "mean_diagonal": float(np.diag(M_np).mean()),
         **{k: json.dumps(v) for k, v in diag.items()},
     }]).to_csv(out / "inference_diagnostics.csv", index=False)
@@ -125,8 +138,9 @@ def demo() -> None:
     assert theta_obs[0] > 0.2, theta_obs                  # naive overestimates uni (~0.26)
     theta_init = torch.tensor(theta_obs, dtype=torch.float64)
 
-    fa = SimpleNamespace(mode="mle", lr=0.05, steps=3000, num_samples=1,
-                         warmup=0, progress=False, use_mismapping=True)
+    # Gate off: this half is testing the mis-mapping inversion in isolation.
+    fa = SimpleNamespace(mode="mle", lr=0.05, steps=3000, num_samples=1, warmup=0,
+                         progress=False, use_mismapping=True, use_presence=False, seed=0)
     _, point, _, _ = si._fit("mle", M, T, 0.5, 5000.0, r_obs, "dirichlet_multinomial",
                              theta_init, fa, desc="demo")
     est = point.numpy()
@@ -153,15 +167,40 @@ def demo() -> None:
                     fh.write(f"read{j}_{i}\t{refs[j]}\t500\t0.99\n")
         args = argparse.Namespace(
             amplicon_dir=amp, sim_mseq=[td / "sim.mseq"], obs_mseq=[td / "obs.mseq"],
-            min_identity=None, sample_id="demo", mode="mle", alpha=0.5, steps=3000,
-            lr=0.05, num_samples=1, warmup=0, no_mismapping=False, seed=0,
-            output_dir=td / "out")
+            min_identity=None, sample_id="demo", mode="vi", alpha=0.5, steps=2000,
+            lr=0.05, num_samples=300, warmup=0, no_mismapping=False, seed=0,
+            no_presence=True, presence_prior=si.DEFAULT_PRESENCE_PRIOR,
+            presence_temp=si.DEFAULT_PRESENCE_TEMP, output_dir=td / "out")
         run(args)
         got = pd.read_csv(td / "out" / "inferred_composition.csv").set_index("genome_id")
         assert abs(got.loc["uni", "inferred_mean"] - 0.05) < 0.03, got
         assert got.loc["uni", "observed_rel_abundance"] > 0.2, got   # naive is wrong
+        assert got["presence_prob"].isna().all(), got                # no call when gate off
         Mio = pd.read_csv(td / "out" / "mismapping_matrix.csv", index_col=0)
         assert np.allclose(Mio.loc[refs[0]].to_numpy(), [0.5, 0.5, 0.0]), Mio
+
+        # Same sample with the gate on. This is the *worst* case for a presence call:
+        # uni's only amplicon is byte-identical to a copy of strain2, so "uni present at
+        # 5%" and "uni absent, strain2 slightly commoner" fit the reads equally well.
+        # Presence is therefore not identifiable and the prior decides — strictly at the
+        # default, present under a permissive prior. Abundance stays recoverable either
+        # way (the ref-2 anchor still pins it), which is the point worth guarding: a low
+        # presence_prob here means "can't tell", not "the abundance is wrong".
+        def gated(prior, out):
+            args.no_presence, args.presence_prior, args.output_dir = False, prior, td / out
+            run(args)
+            return pd.read_csv(td / out / "inferred_composition.csv").set_index("genome_id")
+
+        strict = gated(si.DEFAULT_PRESENCE_PRIOR, "out_gated")
+        loose = gated(0.9, "out_gated_loose")
+        assert strict.loc["strain2", "presence_prob"] > si.PRESENCE_THRESHOLD, strict
+        assert strict.loc["uni", "presence_prob"] < si.PRESENCE_THRESHOLD, strict
+        assert loose.loc["uni", "presence_prob"] > si.PRESENCE_THRESHOLD, loose
+        assert abs(loose.loc["uni", "inferred_mean"] - 0.05) < 0.03, loose
+        print(f"gated (identical amplicon): p(uni) = "
+              f"{strict.loc['uni', 'presence_prob']:.3f} at prior "
+              f"{si.DEFAULT_PRESENCE_PRIOR:g} -> {loose.loc['uni', 'presence_prob']:.3f} "
+              f"at prior 0.9")
     print("end-to-end mseq demo OK")
 
 
@@ -181,6 +220,13 @@ def main() -> None:
     ap.add_argument("--alpha", type=float, default=0.5, help="Dirichlet prior concentration")
     ap.add_argument("--no-mismapping", action="store_true",
                     help="disable the mis-mapping correction (r_obs=r_true baseline)")
+    ap.add_argument("--no-presence", action="store_true",
+                    help="disable the presence/absence gate (every genome always present)")
+    ap.add_argument("--presence-prior", type=float, default=si.DEFAULT_PRESENCE_PRIOR,
+                    help="prior probability a genome is present; the sparsity regulariser "
+                         "(smaller => stronger pull towards absent)")
+    ap.add_argument("--presence-temp", type=float, default=si.DEFAULT_PRESENCE_TEMP,
+                    help="Concrete relaxation temperature for the presence gate")
     ap.add_argument("--num-samples", type=int, default=500)
     ap.add_argument("--warmup", type=int, default=500)
     ap.add_argument("--steps", type=int, default=3000, help="SVI steps (vi/mle)")

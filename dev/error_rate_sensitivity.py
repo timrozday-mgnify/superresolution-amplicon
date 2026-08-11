@@ -126,8 +126,11 @@ def fit(M_np, T, genomes, ref_rel, total, use_mismapping=True):
     theta_obs = np.zeros(len(genomes))
     np.add.at(theta_obs, g_of_ref, ref_rel)
     init = torch.tensor(np.clip(theta_obs, 1e-4, None), dtype=torch.float64)
+    # Gate off: this experiment is about M, and all 21 genomes are present in its truth,
+    # so a presence gate would only add noise. See dev/presence_prior_sweep.py.
     args = SimpleNamespace(mode="vi", lr=0.02, steps=1500, num_samples=200, warmup=0,
-                           progress=False, use_mismapping=use_mismapping)
+                           progress=False, use_mismapping=use_mismapping,
+                           use_presence=False, seed=0)
     _, point, _, _ = si._fit(
         "vi", torch.tensor(M_np, dtype=torch.float64),
         torch.tensor(T.to_numpy(), dtype=torch.float64), 0.5, float(total),

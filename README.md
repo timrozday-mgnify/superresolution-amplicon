@@ -162,6 +162,36 @@ Composition inference (Pyro):
 | `--infer_lr` | `0.02` | SVI learning rate. |
 | `--infer_num_samples` | `500` | Posterior samples (vi/nuts). |
 | `--infer_warmup` | `500` | NUTS warmup. |
+| `--infer_presence` | `true` | Per-genome Bernoulli presence/absence gate. Not supported with `--infer_mode nuts`. |
+| `--infer_presence_prior` | `0.01` | Prior probability a genome is present — the sparsity regulariser. |
+| `--infer_presence_temp` | `1.0` | Concrete relaxation temperature for the gate. Below ~1 the gate barely moves off its initialisation and no prior can sparsify it. |
+
+> **Presence/absence.** Abundance and presence are different questions. `theta` is a
+> Dirichlet, so every genome in the reference DB gets *some* mass and the output can
+> never say a genome simply isn't there. The gate adds a Bernoulli `z_g` per genome
+> (`theta_eff ∝ z ⊙ theta`), relaxed to a Concrete distribution so SVI can differentiate
+> through it. Its posterior probability is reported per genome as **`presence_prob`** —
+> the confidence that the genome is in the sample at all, distinct from the credible
+> interval on its abundance — and an absent genome's abundance is shrunk towards zero
+> along with it.
+>
+> On a subset-present truth (8 of 21 genomes) the gate reaches **Jaccard 1.0** at the
+> defaults and cuts abundance L1 by a third versus the ungated fit, because zeroing an
+> absent genome stops it absorbing mis-mapped reads that belong to its neighbours.
+> Thresholding the ungated abundance can match the Jaccard, but only at a cutoff picked by
+> hand per dataset. Recall was 1.0 at every setting tried — the gate never deleted a
+> genome that was really there, including a 3% sub-species — so `infer_presence_prior`
+> trades precision, not recall. See
+> [dev/presence_prior_sweep.md](dev/presence_prior_sweep.md) for the numbers (and for why
+> the straight-through variant of the gate does not work), and
+> `dev/presence_prior_sweep.py` to re-run the sweep on your own reference set.
+>
+> **Identical amplicons are the exception.** If a genome's only amplicon is byte-identical
+> to another genome's 16S copy, "present at 5%" and "absent, neighbour slightly commoner"
+> fit the reads equally well: presence is not identifiable and the gate follows the prior.
+> The abundance is still recovered. Read a low `presence_prob` on such a genome as "V4
+> can't tell", not "not there" — `refseq_index.csv` and the mis-mapping matrix show which
+> genomes are in that position.
 
 > **Primer trimming.** Observed reads normally carry the amplification primers and so are
 > longer than the primer-trimmed reference amplicons they are mapped against. By default
@@ -203,8 +233,9 @@ results/
 ```
 
 `inferred_composition.csv` has one row per genome: `observed_rel_abundance`,
-`inferred_mean`, and `inferred_lo`/`inferred_hi` (5–95% credible interval for
-`vi`/`nuts`).
+`inferred_mean`, `inferred_lo`/`inferred_hi` (5–95% credible interval for `vi`/`nuts`),
+and `presence_prob` (posterior probability the genome is present; empty when
+`--infer_presence false`). Call a genome present at `presence_prob >= 0.5`.
 
 ## Containers
 
