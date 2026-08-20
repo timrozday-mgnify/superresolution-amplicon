@@ -105,6 +105,37 @@ References that do not yield a V4 amplicon under the configured primers are repo
 (`refseq_index.csv`) and excluded from the matrix. The genome-space of the inferred
 composition is the set of distinct genome ids.
 
+### Build a reference database from genome FASTAs
+
+`bin/build_mapseq_database.py` builds a pipeline-compatible reference FASTA and its
+required MAPseq `.tax` sidecar from one FASTA per genome. The input has a `genomes` list;
+relative `fasta` paths are resolved relative to this YAML file. `taxonomy` is a
+semicolon-delimited lineage. Mixed lineage depths are allowed and are padded with
+`unclassified` in the MAPseq metadata.
+
+```yaml
+genomes:
+  - id: Escherichia_coli
+    taxonomy: Bacteria;Pseudomonadota;Gammaproteobacteria;Enterobacterales
+    fasta: genomes/E_coli_16S.fasta.gz
+  - id: Salmonella_enterica
+    taxonomy: Bacteria;Pseudomonadota;Gammaproteobacteria;Enterobacterales
+    fasta: genomes/S_enterica_16S.fasta
+```
+
+```bash
+python bin/build_mapseq_database.py \
+    --input genomes.yml \
+    --output-prefix db/references
+
+# Use db/references.fasta with the pipeline.
+nextflow run main.nf --input samples.yml --references db/references.fasta
+```
+
+Each source sequence receives a header such as
+`Escherichia_coli|0|original_accession`; copy indices reset for each genome. Run
+`python bin/build_mapseq_database.py --demo` for a self-contained check.
+
 ## Parameters
 
 Run mode / IO:
@@ -305,6 +336,9 @@ python bin/subspecies_infer.py amplicons --demo   # in-silico PCR, T, M-from-mse
 python bin/simulate_amplicon_reads.py --demo      # fragment sampler + flat error model
 python bin/reads_to_fasta.py --demo
 python bin/infer_composition.py --demo            # needs numpy/torch/pyro (use the container)
+
+# Build a custom database, then verify MAPseq accepts its FASTA/tax pair.
+pytest tests/test_build_mapseq_database.py         # needs Docker; pulls the pinned MAPseq image
 
 # Does the flat error rate have to be accurate? (needs docker + mapseq)
 python dev/error_rate_sensitivity.py
