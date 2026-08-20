@@ -143,6 +143,26 @@ Mis-mapping (simulate reads → map with mapseq):
 | `--flat_del_rate` | `0.0005` | Flat model: per-base deletion probability. |
 | `--sim_n_per_ref` | `500` | Simulated reads per reference (sampling depth for `M`). |
 | `--sim_read_len` | – | Draw substrings of this length; unset simulates the whole amplicon (correct for merged reads). |
+| `--mismapping_matrix` | – | A previously generated `mismapping_matrix.csv` for the same amplicon reference set. Skips read simulation and simulated-read mapseq; the CSV is checked against the current reference IDs before inference. |
+
+The default flow now materialises the matrix before composition inference, so its
+published `composition/<sample>/<sample>.mismapping_matrix.csv` can be reused:
+
+```bash
+nextflow run main.nf --input samples.yml --references refs.fasta \
+  --mismapping_matrix results/composition/sample/sample.mismapping_matrix.csv
+```
+
+The matrix is tied to the amplicon reference IDs and mapseq settings used to create it;
+reuse it only with the same reference set and mapper configuration.
+
+For a simulation-only pre-computation outside Nextflow, use the inference utility's
+matrix-build mode:
+
+```bash
+bin/infer_composition.py --amplicon-dir sample_amplicons \
+  --sim-mseq sample.sim.mseq.gz --build-mismapping -o mismapping_only
+```
 
 Read mapping (mapseq):
 

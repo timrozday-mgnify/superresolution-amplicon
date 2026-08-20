@@ -5,7 +5,7 @@ process INFER_COMPOSITION {
     container "ghcr.io/timrozday-mgnify/sra-skiver:${params.sra_skiver_tag}"
 
     input:
-    tuple val(meta), path(amplicon_dir), path(sim_mseq), path(obs_mseq)
+    tuple val(meta), path(amplicon_dir), path(mismapping_matrix), path(obs_mseq)
 
     output:
     tuple val(meta), path("${meta.id}.inferred_composition.csv"),    emit: composition
@@ -23,7 +23,7 @@ process INFER_COMPOSITION {
     """
     infer_composition.py \\
         --amplicon-dir ${amplicon_dir} \\
-        --sim-mseq ${sim_mseq} \\
+        --mismapping-matrix ${mismapping_matrix} \\
         --obs-mseq ${obs_mseq} \\
         --sample-id ${prefix} \\
         --seed ${params.seed} \\

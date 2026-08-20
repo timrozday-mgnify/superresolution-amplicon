@@ -9,6 +9,7 @@ include { MAPSEQ_CLUSTER       } from '../modules/local/mapseq/cluster/main'
 include { MAPSEQ as MAPSEQ_SIM } from '../modules/local/mapseq/map/main'
 include { MAPSEQ as MAPSEQ_OBS } from '../modules/local/mapseq/map/main'
 include { SIMULATE_READS       } from '../modules/local/simulate_reads/main'
+include { BUILD_MISMAPPING     } from '../modules/local/build_mismapping/main'
 include { READS_TO_FASTA       } from '../modules/local/reads_to_fasta/main'
 include { INFER_COMPOSITION    } from '../modules/local/infer_composition/main'
 
@@ -23,7 +24,7 @@ workflow SUPERRESOLUTION_AMPLICON {
 
     // Error model: only the read simulator uses it, so the whole skiver training
     // subworkflow is skipped under the flat model. [ id, model_pt ] either way.
-    if (params.sim_error_model == 'flat') {
+    if (params.mismapping_matrix || params.sim_error_model == 'flat') {
         ch_model = ch_reads.map { meta, reads -> [ meta.id, file("${projectDir}/assets/NO_MODEL") ] }
     }
     else {
@@ -56,19 +57,33 @@ workflow SUPERRESOLUTION_AMPLICON {
         .map { meta, fasta, tax -> [ meta.id, fasta, tax ] }
         .join(MAPSEQ_CLUSTER.out.mscluster.map { meta, mscluster -> [ meta.id, mscluster ] })
 
-    // Simulated reads -> mapseq -> the mis-mapping matrix M.
-    ch_sim_in = EXTRACT_AMPLICONS.out.refs
-        .map { meta, fasta, tax -> [ meta.id, meta, fasta ] }
-        .join(ch_model)
-        .map { id, meta, fasta, model -> [ meta, fasta, model ] }
-    SIMULATE_READS(ch_sim_in)
-    ch_versions = ch_versions.mix(SIMULATE_READS.out.versions)
+    // A supplied matrix skips the simulation and mapping work. Otherwise build and
+    // materialise it before inference so its CSV can be reused in a later run.
+    if (params.mismapping_matrix) {
+        ch_mismapping = EXTRACT_AMPLICONS.out.dir
+            .map { meta, d -> [ meta, file(params.mismapping_matrix, checkIfExists: true) ] }
+    }
+    else {
+        ch_sim_in = EXTRACT_AMPLICONS.out.refs
+            .map { meta, fasta, tax -> [ meta.id, meta, fasta ] }
+            .join(ch_model)
+            .map { id, meta, fasta, model -> [ meta, fasta, model ] }
+        SIMULATE_READS(ch_sim_in)
+        ch_versions = ch_versions.mix(SIMULATE_READS.out.versions)
 
-    MAPSEQ_SIM(SIMULATE_READS.out.reads
-        .map { meta, reads -> [ meta.id, meta, reads ] }
-        .join(ch_db)
-        .map { id, meta, reads, fasta, tax, mscluster -> [ meta, reads, fasta, tax, mscluster ] })
-    ch_versions = ch_versions.mix(MAPSEQ_SIM.out.versions)
+        MAPSEQ_SIM(SIMULATE_READS.out.reads
+            .map { meta, reads -> [ meta.id, meta, reads ] }
+            .join(ch_db)
+            .map { id, meta, reads, fasta, tax, mscluster -> [ meta, reads, fasta, tax, mscluster ] })
+        ch_versions = ch_versions.mix(MAPSEQ_SIM.out.versions)
+
+        BUILD_MISMAPPING(EXTRACT_AMPLICONS.out.dir
+            .map { meta, d -> [ meta.id, meta, d ] }
+            .join(MAPSEQ_SIM.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
+            .map { id, meta, d, mseq -> [ meta, d, mseq ] })
+        ch_versions = ch_versions.mix(BUILD_MISMAPPING.out.versions)
+        ch_mismapping = BUILD_MISMAPPING.out.mismapping
+    }
 
     // Real reads -> fasta -> mapseq -> the observed per-reference counts.
     READS_TO_FASTA(ch_reads)
@@ -80,12 +95,12 @@ workflow SUPERRESOLUTION_AMPLICON {
         .map { id, meta, reads, fasta, tax, mscluster -> [ meta, reads, fasta, tax, mscluster ] })
     ch_versions = ch_versions.mix(MAPSEQ_OBS.out.versions)
 
-    // INFER_COMPOSITION: amplicon dir + both mseq files, joined by id.
+    // INFER_COMPOSITION: amplicon dir + matrix + observed mseq, joined by id.
     ch_infer_in = EXTRACT_AMPLICONS.out.dir
         .map { meta, d -> [ meta.id, meta, d ] }
-        .join(MAPSEQ_SIM.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
+        .join(ch_mismapping.map { meta, matrix -> [ meta.id, matrix ] })
         .join(MAPSEQ_OBS.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
-        .map { id, meta, d, sim, obs -> [ meta, d, sim, obs ] }
+        .map { id, meta, d, matrix, obs -> [ meta, d, matrix, obs ] }
     INFER_COMPOSITION(ch_infer_in)
     ch_versions = ch_versions.mix(INFER_COMPOSITION.out.versions)
 

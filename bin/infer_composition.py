@@ -17,6 +17,10 @@ the confidence in the presence call, not in the abundance.
     infer_composition.py \
         --amplicon-dir AMPLICON_DIR --sim-mseq sim.mseq --obs-mseq obs.mseq \
         --sample-id S1 --mode vi -o out/
+
+To pre-compute a reusable matrix, omit ``--obs-mseq`` and use
+``--build-mismapping``.  Later inference can use that CSV through
+``--mismapping-matrix`` instead of ``--sim-mseq``.
 """
 from __future__ import annotations
 
@@ -48,6 +52,31 @@ def _fit_args(a) -> SimpleNamespace:
     )
 
 
+def _mismapping_matrix(a, refseqs: list[str]) -> np.ndarray:
+    """Return a measured or pre-computed mis-mapping matrix in reference order."""
+    if a.mismapping_matrix is None:
+        return si.build_mismapping(a.sim_mseq, refseqs, a.min_identity)
+
+    matrix = pd.read_csv(a.mismapping_matrix, index_col=0)
+    if matrix.index.has_duplicates or matrix.columns.has_duplicates:
+        raise SystemExit(f"mis-mapping matrix {a.mismapping_matrix} has duplicate reference IDs")
+    if set(matrix.index) != set(refseqs) or set(matrix.columns) != set(refseqs):
+        raise SystemExit(
+            f"mis-mapping matrix {a.mismapping_matrix} must have exactly the reference IDs "
+            "in translation_table.csv as both rows and columns"
+        )
+    matrix = matrix.loc[refseqs, refseqs]
+    try:
+        values = matrix.to_numpy(dtype=np.float64)
+    except ValueError as exc:
+        raise SystemExit(f"mis-mapping matrix {a.mismapping_matrix} contains non-numeric values") from exc
+    if not np.isfinite(values).all() or (values < 0).any():
+        raise SystemExit(f"mis-mapping matrix {a.mismapping_matrix} must contain finite, non-negative values")
+    if not np.allclose(values.sum(axis=1), 1.0, rtol=1e-6, atol=1e-8):
+        raise SystemExit(f"mis-mapping matrix {a.mismapping_matrix} must be row-stochastic")
+    return values
+
+
 def run(a) -> None:
     import torch
 
@@ -57,9 +86,17 @@ def run(a) -> None:
     T = torch.tensor(T_df.to_numpy(), dtype=torch.float64)
     g_of_ref = np.array([genomes.index(si.genome_of_header(r)) for r in refseqs])
 
-    # M measured from the simulated reads, mapped by the same mapper as the real reads.
-    M_np = si.build_mismapping(a.sim_mseq, refseqs, a.min_identity)
+    # M is either measured from simulated mapseq output or loaded from a prior run.
+    M_np = _mismapping_matrix(a, refseqs)
     M = torch.tensor(M_np, dtype=torch.float64)
+
+    if a.build_mismapping:
+        a.output_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(M_np, index=refseqs, columns=refseqs).to_csv(
+            a.output_dir / "mismapping_matrix.csv"
+        )
+        print(f"mismapping: {len(refseqs)} references -> {a.output_dir}")
+        return
 
     counts = si.observed_refseq_counts(a.obs_mseq, refseqs, a.min_identity)
     obs = np.array([counts.get(r, 0) for r in refseqs], dtype=np.float64)
@@ -210,7 +247,11 @@ def main() -> None:
     ap.add_argument("--amplicon-dir", type=Path,
                     help="dir with translation_table.csv (from `subspecies_infer.py amplicons`)")
     ap.add_argument("--sim-mseq", type=Path, nargs="+",
-                    help="mapseq output for the simulated reads (source ref in the read name)")
+                    help="mapseq output for simulated reads (required unless --mismapping-matrix is used)")
+    ap.add_argument("--mismapping-matrix", type=Path,
+                    help="pre-computed row-stochastic CSV matrix; skips simulated-read mapping")
+    ap.add_argument("--build-mismapping", action="store_true",
+                    help="write mismapping_matrix.csv from --sim-mseq and exit")
     ap.add_argument("--obs-mseq", type=Path, nargs="+",
                     help="mapseq output for this sample's real reads")
     ap.add_argument("--min-identity", type=float, default=None,
@@ -240,7 +281,14 @@ def main() -> None:
                         format="%(asctime)s %(levelname)s %(message)s")
     if a.demo:
         return demo()
-    for req in ("amplicon_dir", "sim_mseq", "obs_mseq", "output_dir"):
+    if a.sim_mseq and a.mismapping_matrix:
+        ap.error("--sim-mseq and --mismapping-matrix are mutually exclusive")
+    required = ["amplicon_dir", "output_dir"]
+    if a.mismapping_matrix is None:
+        required.append("sim_mseq")
+    if not a.build_mismapping:
+        required.append("obs_mseq")
+    for req in required:
         if getattr(a, req) is None:
             ap.error(f"--{req.replace('_', '-')} is required (unless --demo)")
     run(a)
