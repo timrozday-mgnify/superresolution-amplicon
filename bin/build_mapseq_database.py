@@ -226,7 +226,7 @@ def build_database(genomes: Sequence[Genome], output_prefix: Path) -> tuple[Path
                         raise ValueError(f"duplicate generated reference ID: {reference_id!r}")
                     seen_references.add(reference_id)
                     fasta_handle.write(f">{reference_id}\n{sequence}\n")
-                    taxonomy = ";".join(*padded_taxonomy)
+                    taxonomy = ";".join(padded_taxonomy)
                     tax_handle.write(f"{reference_id}\t{taxonomy}\n")
                     record_count += 1
         fasta_temp.replace(fasta_path)
