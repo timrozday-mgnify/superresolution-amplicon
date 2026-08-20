@@ -204,7 +204,7 @@ def build_database(genomes: Sequence[Genome], output_prefix: Path) -> tuple[Path
     fasta_path, tax_path = output_paths(output_prefix)
     fasta_path.parent.mkdir(parents=True, exist_ok=True)
     max_taxonomy_depth = max(len(genome.taxonomy) for genome in genomes)
-    levels = [f"Taxonomy_{index}" for index in range(1, max_taxonomy_depth + 1)] + ["Copy"]
+    levels = [f"Taxonomy_{index}" for index in range(1, max_taxonomy_depth + 1)]
     fasta_temp = _temporary_path(fasta_path.parent, ".fasta")
     tax_temp = _temporary_path(tax_path.parent, ".tax")
     seen_references: set[str] = set()
@@ -226,7 +226,7 @@ def build_database(genomes: Sequence[Genome], output_prefix: Path) -> tuple[Path
                         raise ValueError(f"duplicate generated reference ID: {reference_id!r}")
                     seen_references.add(reference_id)
                     fasta_handle.write(f">{reference_id}\n{sequence}\n")
-                    taxonomy = ";".join((*padded_taxonomy, reference_id))
+                    taxonomy = ";".join(*padded_taxonomy)
                     tax_handle.write(f"{reference_id}\t{taxonomy}\n")
                     record_count += 1
         fasta_temp.replace(fasta_path)
