@@ -51,7 +51,9 @@ workflow SUPERRESOLUTION_AMPLICON {
                 .flatMap { meta, reads -> reads.collect { read -> [ meta.platform, read ] } }
                 .groupTuple()
             POOL_TRAINING_READS(ch_pool_input)
-            TRAIN_ERROR_MODEL(POOL_TRAINING_READS.out.reads.map { meta, reads -> [ meta, [ reads ] ] })
+            ch_pooled_reads = POOL_TRAINING_READS.out.reads
+                .map { platform, reads -> [ [id: "pooled_${platform}", platform: platform], [reads] ] }
+            TRAIN_ERROR_MODEL(ch_pooled_reads)
             ch_versions = ch_versions.mix(POOL_TRAINING_READS.out.versions).mix(TRAIN_ERROR_MODEL.out.versions)
             ch_pooled_model = ch_split.train
                 .map { meta, reads -> [ meta.platform, meta.id ] }

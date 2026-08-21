@@ -8,7 +8,7 @@ process POOL_TRAINING_READS {
     tuple val(platform), path(reads, stageAs: 'inputs??/*')
 
     output:
-    tuple val([id: "pooled_${platform}", platform: platform]), path("pooled_${platform}.fastq.gz"), emit: reads
+    tuple val(platform), path("pooled_${platform}.fastq.gz"), emit: reads
     path "versions.yml", emit: versions
 
     script:
