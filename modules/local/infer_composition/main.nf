@@ -5,11 +5,10 @@ process INFER_COMPOSITION {
     container "ghcr.io/timrozday-mgnify/sra-skiver:${params.sra_skiver_tag}"
 
     input:
-    tuple val(meta), path(amplicon_dir), path(mismapping_matrix), path(obs_mseq)
+    tuple val(meta), path(amplicon_dir), path(mismapping_matrix), path(obs_mseq), val(matrix_key)
 
     output:
     tuple val(meta), path("${meta.id}.inferred_composition.csv"),    emit: composition
-    tuple val(meta), path("${meta.id}.mismapping_matrix.csv"),       emit: mismapping
     tuple val(meta), path("${meta.id}.inference_diagnostics.csv"),   emit: diagnostics
     tuple val(meta), path("${meta.id}.loss_trace.csv"), optional: true, emit: loss
     path "versions.yml",                                             emit: versions
@@ -25,13 +24,14 @@ process INFER_COMPOSITION {
         --amplicon-dir ${amplicon_dir} \\
         --mismapping-matrix ${mismapping_matrix} \\
         --obs-mseq ${obs_mseq} \\
+        --mismapping-group-id ${matrix_key} \\
+        --mismapping-matrix-path mismapping/${matrix_key}/mismapping_matrix.csv \\
         --sample-id ${prefix} \\
         --seed ${params.seed} \\
         -o out \\
         $args
 
     cp out/inferred_composition.csv  ${prefix}.inferred_composition.csv
-    cp out/mismapping_matrix.csv     ${prefix}.mismapping_matrix.csv
     cp out/inference_diagnostics.csv ${prefix}.inference_diagnostics.csv
     [ -f out/loss_trace.csv ] && cp out/loss_trace.csv ${prefix}.loss_trace.csv || true
 
@@ -45,8 +45,7 @@ process INFER_COMPOSITION {
     def prefix = task.ext.prefix ?: "${meta.id}"
     """
     echo 'sample,genome_id,observed_rel_abundance,inferred_mean,inferred_lo,inferred_hi,presence_prob' > ${prefix}.inferred_composition.csv
-    echo ',ref|0|x' > ${prefix}.mismapping_matrix.csv
-    echo 'sample,mode,likelihood,n_reads' > ${prefix}.inference_diagnostics.csv
+    echo 'sample,mode,likelihood,n_reads,mismapping_group_id,mismapping_matrix_path' > ${prefix}.inference_diagnostics.csv
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":

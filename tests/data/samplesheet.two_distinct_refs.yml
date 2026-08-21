@@ -1,0 +1,8 @@
+- id: demo_a
+  reads: tests/data/sample.fastq.gz
+  platform: hq-illumina
+  references: tests/data/refs.fasta
+- id: demo_b
+  reads: tests/data/sample.fastq.gz
+  platform: hq-illumina
+  references: tests/data/refs_alt.fasta

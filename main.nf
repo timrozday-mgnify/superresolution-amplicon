@@ -43,7 +43,8 @@ workflow {
         def meta = [
             id:          row.id,
             platform:    (row.platform ?: params.platform),
-            error_model: (row.error_model ? resolveFile(row.error_model.toString()) : null),
+            error_model: (row.error_model ? resolveFile(row.error_model.toString()) :
+                          (params.error_model ? resolveFile(params.error_model.toString()) : null)),
         ]
         [ meta, reads ]
     }

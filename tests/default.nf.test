@@ -16,11 +16,10 @@ nextflow_pipeline {
         then {
             assertAll(
                 { assert workflow.success },
-                // 1 sample: EXTRACT_AMPLICONS + MAPSEQ_CLUSTER + SIMULATE_READS
-                // + MAPSEQ_SIM + BUILD_MISMAPPING + READS_TO_FASTA + MAPSEQ_OBS
-                // + INFER_COMPOSITION = 8.
+                // 1 sample: extraction, reference fingerprinting, observed mapping,
+                // a canonical matrix build/publish path, and inference = 11.
                 // No SKIVER_*: the error model is only used by the read simulator.
-                { assert workflow.trace.succeeded().size() == 8 },
+                { assert workflow.trace.succeeded().size() == 11 },
                 { assert workflow.trace.tasks().every { !it.name.contains('SKIVER') } },
                 { assert path("${params.outdir}/composition/demo/demo.inferred_composition.csv").exists() },
                 { assert path("${params.outdir}/amplicons/demo_amplicons").exists() },
@@ -42,8 +41,8 @@ nextflow_pipeline {
         then {
             assertAll(
                 { assert workflow.success },
-                // + SKIVER_DUMP + SKIVER_TRAIN + SKIVER_REPORT = 11
-                { assert workflow.trace.succeeded().size() == 11 }
+                // + SKIVER_DUMP + SKIVER_TRAIN + SKIVER_REPORT = 14
+                { assert workflow.trace.succeeded().size() == 14 }
             )
         }
     }
@@ -62,11 +61,75 @@ nextflow_pipeline {
         then {
             assertAll(
                 { assert workflow.success },
-                // EXTRACT_AMPLICONS + MAPSEQ_CLUSTER + READS_TO_FASTA + MAPSEQ_OBS
-                // + INFER_COMPOSITION. The pre-computed matrix also makes training unnecessary.
-                { assert workflow.trace.succeeded().size() == 5 },
+                // Matrix fingerprinting + canonical-bundle publication replace the
+                // simulated branch. The pre-computed matrix skips training too.
+                { assert workflow.trace.succeeded().size() == 7 },
                 { assert workflow.trace.tasks().every { !it.name.contains('SIMULATE') } },
-                { assert workflow.trace.tasks().every { !it.name.contains('SKIVER') } }
+                { assert workflow.trace.tasks().every { !it.name.contains('SKIVER') } },
+                { assert path("${params.outdir}/mismapping/groups.tsv").exists() },
+                { assert !path("${params.outdir}/composition/demo/demo.mismapping_matrix.csv").exists() }
+            )
+        }
+    }
+
+    test("identical reference sets share one canonical mis-mapping matrix - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input = "${projectDir}/tests/data/samplesheet.two_same_refs.yml"
+                outdir = "$outputDir"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.succeeded().findAll { it.name.contains('SIMULATE_READS') }.size() == 1 },
+                { assert workflow.trace.succeeded().findAll { it.name.contains('BUILD_MISMAPPING') }.size() == 1 },
+                { assert path("${params.outdir}/mismapping/groups.tsv").exists() },
+                { assert path("${params.outdir}/composition/demo_a/demo_a.inference_diagnostics.csv").exists() },
+                { assert path("${params.outdir}/composition/demo_b/demo_b.inference_diagnostics.csv").exists() }
+            )
+        }
+    }
+
+    test("pooled trained model is built once per platform - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input = "${projectDir}/tests/data/samplesheet.two_same_refs.yml"
+                outdir = "$outputDir"
+                sim_error_model = "trained"
+                trained_error_model_scope = "pooled"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.succeeded().findAll { it.name.contains('POOL_TRAINING_READS') }.size() == 1 },
+                { assert workflow.trace.succeeded().findAll { it.name.contains('SKIVER_TRAIN') }.size() == 1 },
+                { assert workflow.trace.succeeded().findAll { it.name.contains('SIMULATE_READS') }.size() == 1 },
+                { assert path("${params.outdir}/composition/demo_a/demo_a.inference_diagnostics.csv").exists() },
+                { assert path("${params.outdir}/composition/demo_b/demo_b.inference_diagnostics.csv").exists() }
+            )
+        }
+    }
+
+    test("distinct reference sets build distinct matrices - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input = "${projectDir}/tests/data/samplesheet.two_distinct_refs.yml"
+                outdir = "$outputDir"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.succeeded().findAll { it.name.contains('SIMULATE_READS') }.size() == 2 },
+                { assert workflow.trace.succeeded().findAll { it.name.contains('BUILD_MISMAPPING') }.size() == 2 }
             )
         }
     }

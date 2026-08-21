@@ -143,6 +143,8 @@ def run(a) -> None:
         "use_mismapping": not a.no_mismapping, "min_identity": a.min_identity,
         "use_presence": not a.no_presence, "presence_prior": a.presence_prior,
         "presence_temp": a.presence_temp,
+        "mismapping_group_id": a.mismapping_group_id,
+        "mismapping_matrix_path": a.mismapping_matrix_path,
         "n_reads": int(total), "mean_diagonal": float(np.diag(M_np).mean()),
         **{k: json.dumps(v) for k, v in diag.items()},
     }]).to_csv(out / "inference_diagnostics.csv", index=False)
@@ -257,6 +259,10 @@ def main() -> None:
     ap.add_argument("--min-identity", type=float, default=None,
                     help="drop mapseq hits below this pairwise identity (off-target background)")
     ap.add_argument("--sample-id", default="sample")
+    ap.add_argument("--mismapping-group-id", default=None,
+                    help="canonical matrix bundle identifier for diagnostics")
+    ap.add_argument("--mismapping-matrix-path", default=None,
+                    help="output-relative canonical matrix path for diagnostics")
     ap.add_argument("--mode", choices=["nuts", "vi", "mle"], default="vi")
     ap.add_argument("--alpha", type=float, default=0.5, help="Dirichlet prior concentration")
     ap.add_argument("--no-mismapping", action="store_true",

@@ -39,12 +39,13 @@ process EXTRACT_AMPLICONS {
     stub:
     def prefix = task.ext.prefix ?: "${meta.id}"
     """
+    REF_ID="ref|0|\$(sha256sum ${references} | awk '{print \$1}' | cut -c1-12)"
     mkdir -p ${prefix}_amplicons
     cd ${prefix}_amplicons
-    printf '>ref|0|x\\nACGTACGTACGT\\n' > amplicons.fasta
-    printf '#cutoff: 0.00:0.08\\n#name: refdb\\n#levels: Kingdom Genome Copy\\nref|0|x\\tBacteria;ref;ref|0|x\\n' > amplicons.tax
-    printf ',ref|0|x\\nref,1.0\\n' > translation_table.csv
-    printf 'refseq,genome,amplicon_len,amplifiable\\nref|0|x,ref,12,True\\n' > refseq_index.csv
+    printf '>%s\\nACGTACGTACGT\\n' "\$REF_ID" > amplicons.fasta
+    printf '#cutoff: 0.00:0.08\\n#name: refdb\\n#levels: Kingdom Genome Copy\\n%s\\tBacteria;ref;%s\\n' "\$REF_ID" "\$REF_ID" > amplicons.tax
+    printf ',%s\\nref,1.0\\n' "\$REF_ID" > translation_table.csv
+    printf 'refseq,genome,amplicon_len,amplifiable\\n%s,ref,12,True\\n' "\$REF_ID" > refseq_index.csv
     cd ..
 
     cat <<-END_VERSIONS > versions.yml

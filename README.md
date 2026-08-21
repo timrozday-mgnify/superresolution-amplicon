@@ -168,7 +168,9 @@ Mis-mapping (simulate reads → map with mapseq):
 
 | param | default | description |
 |-------|---------|-------------|
-| `--sim_error_model` | `flat` | `flat` (constant per-base probability per mutation type; **no training at all**) or `trained` (skiver context model — runs the training subworkflow). See [the sensitivity result](dev/error_rate_sensitivity.md) for why `flat` is the default. |
+| `--sim_error_model` | `flat` | `flat` (constant per-base probability per mutation type; **no training at all**) or `trained` (skiver context model). See [the sensitivity result](dev/error_rate_sensitivity.md) for why `flat` is the default. |
+| `--trained_error_model_scope` | `per-sample` | With `trained`, fit one model per sample or one pooled model per platform. Explicit sample `error_model` files always win. |
+| `--trained_error_model_max_reads` | `1000000` | Pooled mode: deterministic, uniformly sampled FASTQ records per platform (`0` = all). |
 | `--flat_sub_rate` | `0.005` | Flat model: per-base substitution probability. |
 | `--flat_ins_rate` | `0.0005` | Flat model: per-base insertion probability. |
 | `--flat_del_rate` | `0.0005` | Flat model: per-base deletion probability. |
@@ -176,16 +178,17 @@ Mis-mapping (simulate reads → map with mapseq):
 | `--sim_read_len` | – | Draw substrings of this length; unset simulates the whole amplicon (correct for merged reads). |
 | `--mismapping_matrix` | – | A previously generated `mismapping_matrix.csv` for the same amplicon reference set. Skips read simulation and simulated-read mapseq; the CSV is checked against the current reference IDs before inference. |
 
-The default flow now materialises the matrix before composition inference, so its
-published `composition/<sample>/<sample>.mismapping_matrix.csv` can be reused:
+The pipeline fingerprints extracted amplicons and builds each compatible matrix once
+per run. Canonical reusable matrices are published under `mismapping/<matrix-key>/`:
 
 ```bash
 nextflow run main.nf --input samples.yml --references refs.fasta \
-  --mismapping_matrix results/composition/sample/sample.mismapping_matrix.csv
+  --mismapping_matrix results/mismapping/<matrix-key>/mismapping_matrix.csv
 ```
 
-The matrix is tied to the amplicon reference IDs and mapseq settings used to create it;
-reuse it only with the same reference set and mapper configuration.
+Each bundle also contains its reference sidecars and `provenance.json`. The matrix is
+tied to the extracted amplicon sequences, simulator, and mapseq settings; reuse it
+only with the same reference set and mapper configuration.
 
 For a simulation-only pre-computation outside Nextflow, use the inference utility's
 matrix-build mode:
@@ -275,10 +278,16 @@ results/
     refseq_index.csv                 per-reference amplifiability
   mapseq/<id>/
     <id>.obs.mseq.gz                 mapseq classification of the real reads
+  mismapping/
+    groups.tsv                       index of canonical matrix bundles
+    <matrix-key>/
+      mismapping_matrix.csv          measured reference->reference mis-mapping M
+      provenance.json                 simulator, mapper, and member-sample metadata
+      samples.tsv                     samples consuming this matrix
+      reference/                      amplicons + mapseq/inference sidecars
   composition/<id>/
     <id>.inferred_composition.csv    inferred vs observed genome abundances
-    <id>.mismapping_matrix.csv       measured reference->reference mis-mapping M
-    <id>.inference_diagnostics.csv
+    <id>.inference_diagnostics.csv   includes canonical matrix bundle ID/path
     <id>.loss_trace.csv              (vi/mle)
   pipeline_info/                     trace, report, timeline, dag, software versions
 ```
