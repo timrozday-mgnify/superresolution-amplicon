@@ -101,9 +101,15 @@ def run(a) -> None:
     counts = si.observed_refseq_counts(a.obs_mseq, refseqs, a.min_identity)
     obs = np.array([counts.get(r, 0) for r in refseqs], dtype=np.float64)
     total = int(obs.sum())
-    if total == 0:
-        raise SystemExit(f"no reads in {a.obs_mseq} hit a reference amplicon")
-    ref_rel = obs / total
+    # A sample whose reads hit no reference amplicon is a result, not an error: it is
+    # reported as an all-zero composition flagged `status=no_reference_hits` (with
+    # `n_reads=0`) in the same files a normal run writes, so a multi-sample run is not
+    # taken down by one empty sample and the outcome is unambiguous downstream.
+    no_hits = total == 0
+    if no_hits:
+        log.warning("no reads in %s hit a reference amplicon; emitting a zero composition",
+                    a.obs_mseq)
+    ref_rel = obs / total if total else obs
 
     log.info("sample %s: %d mapped reads, %d refs, %d genomes, mode=%s",
              a.sample_id, total, len(refseqs), len(genomes), a.mode)
@@ -111,18 +117,23 @@ def run(a) -> None:
     # Observed per-ref signal collapsed to genome-space -> observed composition (init + baseline).
     theta_obs = np.zeros(len(genomes))
     np.add.at(theta_obs, g_of_ref, ref_rel)
-    theta_init = torch.tensor(np.clip(theta_obs, 1e-4, None), dtype=torch.float64)
-    theta_init = theta_init / theta_init.sum()
 
-    fa = _fit_args(a)
-    samples, point, diag, losses = si._fit(
-        a.mode, M, T, a.alpha, float(total), torch.tensor(ref_rel, dtype=torch.float64),
-        "dirichlet_multinomial", theta_init, fa, desc=a.sample_id)
-    inferred = point.numpy()
     lo = hi = [np.nan] * len(genomes)
-    if samples is not None:
-        lo = torch.quantile(samples, 0.05, dim=0).numpy()
-        hi = torch.quantile(samples, 0.95, dim=0).numpy()
+    if no_hits:
+        samples, losses, diag = None, None, {}
+        inferred = np.zeros(len(genomes))
+    else:
+        theta_init = torch.tensor(np.clip(theta_obs, 1e-4, None), dtype=torch.float64)
+        theta_init = theta_init / theta_init.sum()
+
+        fa = _fit_args(a)
+        samples, point, diag, losses = si._fit(
+            a.mode, M, T, a.alpha, float(total), torch.tensor(ref_rel, dtype=torch.float64),
+            "dirichlet_multinomial", theta_init, fa, desc=a.sample_id)
+        inferred = point.numpy()
+        if samples is not None:
+            lo = torch.quantile(samples, 0.05, dim=0).numpy()
+            hi = torch.quantile(samples, 0.95, dim=0).numpy()
     # Posterior probability that each genome is present at all (the Bernoulli gate);
     # NaN when the gate is off, so "no call" is never confused with "called absent".
     presence = np.array(diag.pop("presence_prob", [np.nan] * len(genomes)))
@@ -146,6 +157,7 @@ def run(a) -> None:
         "mismapping_group_id": a.mismapping_group_id,
         "mismapping_matrix_path": a.mismapping_matrix_path,
         "n_reads": int(total), "mean_diagonal": float(np.diag(M_np).mean()),
+        "status": "no_reference_hits" if no_hits else "ok",
         **{k: json.dumps(v) for k, v in diag.items()},
     }]).to_csv(out / "inference_diagnostics.csv", index=False)
     if losses is not None:
