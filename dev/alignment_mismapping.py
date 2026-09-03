@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -58,6 +59,31 @@ SUPPORT_EPS = 1e-3
 TAUS = (0, 1, 2)
 # Tie-break weight per ambiguous position, swept when --inject-n is on.
 AMBIGUITY_WEIGHTS = (0.0, 0.05, 0.1, 0.19, 0.3, 0.5)
+
+
+MINIMAP2_IMAGE = "quay.io/biocontainers/minimap2:2.28--he4a0461_3"
+# The pipeline's own defaults (nextflow.config minimap2_index_args / minimap2_args).
+MINIMAP2_INDEX_ARGS = ["-k", "11", "-w", "5"]
+MINIMAP2_ARGS = ["-p", "0", "-N", "1000", "--secondary=yes", "-c"]
+
+
+def minimap2_distances(fasta: Path, refseqs: list[str], sentinel: int) -> np.ndarray:
+    """Index once, all-vs-all, PAF -> distances — exactly what the pipeline's
+    ``--align_backend minimap2`` does, in the same container."""
+    work = fasta.parent.resolve()
+    def run(cmd, out=None):
+        full = ["docker", "run", "--rm", "--platform", "linux/amd64",
+                "-v", f"{work}:/d", "-w", "/d", MINIMAP2_IMAGE] + cmd
+        if out is None:
+            subprocess.run(full, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, check=True)
+        else:
+            with open(out, "w") as fh:
+                subprocess.run(full, stdout=fh, stderr=subprocess.DEVNULL, check=True)
+    run(["minimap2"] + MINIMAP2_INDEX_ARGS + ["-d", "amplicons.mmi", fasta.name])
+    run(["minimap2"] + MINIMAP2_ARGS + ["amplicons.mmi", fasta.name],
+        out=work / "allvsall.paf")
+    return bma.paf_distances(work / "allvsall.paf", refseqs, sentinel)
 
 
 def compare(M: np.ndarray, ref: np.ndarray) -> dict:
@@ -158,12 +184,21 @@ def main() -> None:
     # ── the candidates ───────────────────────────────────────────────────────
     t0 = time.perf_counter()
     d = bma.pairwise_distances(amps_db)
-    Ms["alignment tau=0"] = (bma.tie_cluster_matrix(d, 0) if a.read_len is None
-                             else bma.windowed_matrix(amps_db, a.read_len, 0))
+    w = bma.ambiguity_weights(amps_db, bma.DEFAULT_AMBIGUITY_WEIGHT)
+    Ms["align edlib tau=0"] = bma.tie_cluster_matrix(d, 0, w)
     t_align = time.perf_counter() - t0
     for tau in TAUS[1:]:
-        Ms[f"alignment tau={tau}"] = (bma.tie_cluster_matrix(d, tau) if a.read_len is None
-                                      else bma.windowed_matrix(amps_db, a.read_len, tau))
+        Ms[f"align edlib tau={tau}"] = bma.tie_cluster_matrix(d, tau, w)
+
+    # The other shipped backend, run exactly as the pipeline runs it.
+    t0 = time.perf_counter()
+    d_mm = minimap2_distances(fasta, refseqs, bma.SUMMARY_DISTANCE + 1)
+    Ms["align minimap2 tau=0"] = bma.tie_cluster_matrix(d_mm, 0, w)
+    t_mm = time.perf_counter() - t0
+    print(f"backends agree on M: "
+          f"{np.allclose(Ms['align edlib tau=0'], Ms['align minimap2 tau=0'])}   "
+          f"pairs where they disagree on d<=0: "
+          f"{int(((d <= 0) != (d_mm <= 0)).sum() // 2)}")
     if a.inject_n:
         # The pre-fix kernel: ambiguity as a plain mismatch. This is what the injected Ns
         # are here to break.
@@ -172,15 +207,15 @@ def main() -> None:
             for j in range(i + 1, len(amps_db)):
                 strict[i, j] = strict[j, i] = bma.edlib.align(
                     amps_db[i], amps_db[j], mode="NW", task="distance")["editDistance"]
-        Ms["alignment tau=0 (ambiguity = mismatch)"] = bma.tie_cluster_matrix(strict, 0)
+        Ms["align edlib tau=0 (ambiguity = mismatch)"] = bma.tie_cluster_matrix(strict, 0)
         # The penalty model: down-weight cluster members by their ambiguous-position count.
-        for w in AMBIGUITY_WEIGHTS:
-            Ms[f"alignment tau=0 (ambiguity weight {w})"] = bma.tie_cluster_matrix(
-                d, 0, bma.ambiguity_weights(amps_db, w))
+        for aw in AMBIGUITY_WEIGHTS:
+            Ms[f"align edlib tau=0 (ambiguity weight {aw})"] = bma.tie_cluster_matrix(
+                d, 0, bma.ambiguity_weights(amps_db, aw))
     if a.read_len is not None:
-        # The whole-amplicon kernel is the *bug* this run exists to check: it is what the
-        # estimator produced before --read-len, and it should now be visibly worse.
-        Ms["alignment tau=0 (whole-amplicon)"] = bma.tie_cluster_matrix(d, 0)
+        # align mode has no read-window model on purpose: this run shows what it costs.
+        # M is the whole-reference matrix while M_sim was measured with short reads.
+        pass
 
     # Negative control: the same kernel on shuffled distances. Must fail everything.
     rng = np.random.default_rng(0)
@@ -190,8 +225,8 @@ def main() -> None:
     d_shuf = d_shuf + d_shuf.T
     Ms["shuffled control"] = bma.tie_cluster_matrix(d_shuf, 0)
 
-    print(f"cost: simulate+map {t_sim:.1f}s   alignment {t_align:.2f}s "
-          f"({t_sim / t_align:.0f}x)\n")
+    print(f"cost: simulate+map {t_sim:.1f}s   align/edlib {t_align:.2f}s "
+          f"({t_sim / t_align:.0f}x)   align/minimap2 {t_mm:.2f}s\n")
 
     diag = {name: compare(M, M_sim) for name, M in Ms.items()}
     for name, m in diag.items():
@@ -239,10 +274,12 @@ def main() -> None:
     df["noise_floor_frobenius"] = floor
     df["seconds_simulate_map"] = t_sim
     df["seconds_alignment"] = t_align
+    df["seconds_minimap2"] = t_mm
     df.to_csv(a.out, index=False)
     pd.set_option("display.width", 200)
     print("\n" + df.drop(columns=[c for c in ("tv_worst_row", "noise_floor_frobenius",
-                                              "seconds_simulate_map", "seconds_alignment")
+                                              "seconds_simulate_map", "seconds_alignment",
+                                              "seconds_minimap2")
                                   if c in df]).to_string(index=False,
                                                          float_format=lambda v: f"{v:.4f}"))
     print(f"\n-> {a.out}")

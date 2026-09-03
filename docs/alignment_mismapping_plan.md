@@ -158,7 +158,12 @@ merge or split abruptly; simulation degrades smoothly instead. Two specific trap
   mapseq is not ambiguity-agnostic, giving an `N`-bearing reference **0.19×** the incoming
   mass of its clean cluster partners, and `‖M_measured(N-DB) − M_measured(clean-DB)‖_F =
   2.481` — essentially the entire remaining gap. No ambiguity-agnostic distance can
-  express that penalty *exactly* — but `--align_ambiguity_weight` (default 0.3) now models
+  express that penalty *exactly*. **This is also where the two backends part company:**
+  `--align_backend minimap2` has no IUPAC handling at all — its `NM` counts an `N` as a
+  mismatch — so it reproduces the pre-fix failure exactly (5.097 against a 0.536 floor,
+  versus 1.406 for edlib) and the estimator warns when given a PAF for an ambiguous
+  reference set. Use `edlib` there. On the edlib side, `--align_ambiguity_weight`
+  (default 0.3) models
   it approximately, demoting a cluster member as `w ** (its ambiguous positions)`, which
   recovers ~40% of the residual (2.450 → 1.351). The fitted `w` matches the independently
   measured penalty in 5 of 5 configurations, so the model has the right form; the penalty
@@ -171,49 +176,20 @@ merge or split abruptly; simulation degrades smoothly instead. Two specific trap
 - **Amplicon extraction.** 16 of 97 DB entries produced no amplicon and are excluded from
   both methods. That bound is unchanged by this work but caps it.
 
-### 7. Short and unmerged reads — ~~unsupported~~ **fixed** (and mostly avoided, by merging pairs)
+### 7. Short and unmerged reads — out of scope for `align`, by decision
 
-*Was:* the kernel compared whole amplicons, so a read shorter than the amplicon — which
-sees only a window, and cannot distinguish references differing *outside* it — got an `M`
-that understated confusion, silently.
+A query shorter than the reference sees only a window of it, and references differing
+*outside* that window are confusable in a way whole-sequence distance cannot represent. A
+windowed kernel for this was built and measured (it worked: `‖·‖_F` 0.432 against a 0.609
+floor at L=150, where the whole-reference kernel scored 0.912) and then **removed**:
+approximating a read-window model inside a method whose whole claim is "no simulation
+needed" adds a second thing to validate for a case the pipeline can already measure
+exactly. `align` now refuses `--sim_read_len` outright rather than quietly understating
+confusion, and short/unmerged reads go to `simulate`.
 
-*Now:* `--read-len` (wired from `--sim_read_len`, which both methods honour) scores every
-length-`L` window of the source reference against every reference by *infix* alignment
-(edlib `HW`: the best placement of the read anywhere in the reference, which is the
-question a mapper asks) and averages the tie clusters over windows. It collapses back to
-the whole-amplicon kernel when reads span the amplicon.
-
-Verified by re-running the equivalence study at `L = 150`: the windowed kernel scores
-`‖·‖_F = 0.432` against a 0.609 floor (systematic part **0.040**), while the old
-whole-amplicon kernel scores **0.912 — above the floor, i.e. a real failure**, with its
-diagonal stuck at 0.3086 where the measurement drops to 0.2844. The bias was exactly the
-predicted direction and size. Windowing also repairs §2's missing tail at this read length
-(support Jaccard 0.701 vs 0.610, ρ 0.846 vs 0.792 — at or above the reseed's own).
-
-For paired data this path is now the *fallback* rather than the norm: mates are merged
-into whole-fragment queries first (see the paired bullet below), so `--read-len` is only
-needed when the fragments genuinely do not cover the amplicon.
-
-Residual limitations:
-
-- **The cost argument mostly evaporates for short reads.** `n_refs² × n_windows` infix
-  alignments: 1.96 s vs 4.8 s, a 2× saving rather than 460×. Simplicity (no mapper, no
-  container, no error model) remains; speed does not. `--window-stride` subsamples the
-  highly-redundant windows if a much larger reference set needs it, and is untested beyond
-  the demo's sanity check. Note the k-mer prefilter does **not** apply to the windowed
-  path — it filters whole-sequence pairs, not read windows.
-- **One read length, one set.** `L = 150` only.
-- ~~**Paired reads are not modelled as pairs.**~~ **Fixed by merging them.** A paired
-  sample (`fastq_1`+`fastq_2`, or `paired: true`) now has its mates merged into **one
-  query per fragment** in `READS_TO_FASTA` before mapping, rather than being flattened into
-  independent 150bp reads as before. A merged 2x150 pair spans a 253bp V4 amplicon, so
-  every query covers the reference the way the reference set does and the whole-amplicon
-  kernel is the correct one — the coverage assumption is now *established by the pipeline*
-  rather than hoped for. Pairs that do not overlap cannot be merged; they are counted, and
-  above 20% the run warns that the fragments do not cover the amplicon and the matrix
-  should come from `simulate --sim_read_len` instead. Verified end to end: merging the
-  paired fixture reconstructs all 1500 original reads byte-for-byte, and the paired run
-  infers the same composition as the single-end one.
+This is a narrow exception in practice: paired samples have their mates merged into
+whole-fragment queries before mapping (see the paired bullet below), so queries normally
+span the amplicon.
 
 ### 8. High-error long reads are outside the tested regime
 

@@ -180,7 +180,7 @@ Mis-mapping — how `M` is built:
 | `--align_ambiguity_weight` | `0.3` | `align` only: a cluster member carrying `k` IUPAC ambiguity codes takes `w**k` of a uniform share, since mapseq scores an `N` as a mismatch and prefers a clean duplicate. No-op on reference sets without ambiguity codes; `1` disables. The real penalty varies (0.18–0.97), so this is a compromise — see [the sweep](dev/ambiguity_weight_sweep.md). |
 
 | `--min_pair_overlap` | `20` | Paired samples: shortest mate overlap accepted when merging R1/R2. Unmergeable pairs are dropped and counted; past 20% the run warns that the fragments do not cover the amplicon, and `--mismapping_method simulate --sim_read_len` is the right choice for that sample. |
-| `--sim_read_len` | – | Reads are this long, i.e. shorter than the amplicon (unmerged / short reads). **Honoured by both methods.** Unset = reads span the whole amplicon, correct for merged reads. |
+| `--sim_read_len` | – | Reads are this long, i.e. shorter than the amplicon (unmerged / short reads). **`simulate` only** — `align` builds `M` from whole-reference alignments and refuses this combination rather than understating confusion. Unset = reads span the whole amplicon, correct for merged reads. |
 
 The remaining `simulate` settings below (everything except `--mismapping_matrix`) are
 ignored under `--mismapping_method align`, including `--sim_error_model trained` — nothing

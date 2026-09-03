@@ -89,44 +89,47 @@ construction.
    path also removes: the `mapseq -mscluster` build, the container pull, and — under
    `--sim_error_model trained` — the entire skiver training subworkflow.
 
-## Short and unmerged reads (`--read-len`)
+## Align mode's error, by backend and condition
 
-The kernel above compares whole amplicons, which is wrong as soon as a read is shorter
-than one: the read sees a window, and references differing *outside* that window are
-indistinguishable to the mapper. `build_mismapping_align.py --read-len L` instead scores
-every length-`L` window of the source reference against every reference by *infix*
-alignment (edlib `HW` — the best placement of the read anywhere in the reference) and
-averages the tie clusters over windows. Re-running the whole study at `L = 150`
-(`python dev/alignment_mismapping.py --read-len 150`, raw numbers in
-`alignment_mismapping_readlen150.csv`):
+`align` builds `M` from **whole-reference** alignments only. Two backends produce those
+distances: `edlib` (in-process, lossless k-mer filter, IUPAC-aware) and `minimap2` (the
+binary in its biocontainer, index built once). Reproduce with
+`python dev/alignment_mismapping.py` and `--inject-n 0.25`.
 
-| candidate | ‖·−M_sim‖_F | beyond one run's noise | mean diag | TV med / max | support J | ρ off-diag |
-|---|---|---|---|---|---|---|
-| reseed (seed 99) | **0.609** *(the floor)* | 0.430 | 0.2844 | 0.067 / 0.143 | 0.695 | 0.826 |
-| trained error model | 0.663 | 0.504 | 0.2869 | 0.070 / 0.147 | 0.704 | 0.848 |
-| **alignment tau=0, windowed** | **0.432** | **0.040** | 0.2885 | **0.045 / 0.087** | 0.701 | 0.846 |
-| alignment tau=0, *whole-amplicon* | 0.912 | 0.804 | 0.3086 | 0.053 / 0.360 | 0.610 | 0.792 |
+| condition | candidate | ‖·−M_sim‖_F | systematic part | mean diag | TV med / max | support J | ρ |
+|---|---|---|---|---|---|---|---|
+| clean DB *(floor 0.604)* | reseed | 0.604 | 0.427 | 0.3087 | 0.060 / 0.127 | 0.709 | 0.833 |
+| clean DB | **align edlib** | **0.462** | **0.176** | 0.3086 | 0.050 / 0.113 | 0.590 | 0.780 |
+| clean DB | **align minimap2** | **0.462** | **0.176** | 0.3086 | 0.050 / 0.113 | 0.590 | 0.780 |
+| 27% ambiguous *(floor 0.536)* | reseed | 0.536 | 0.379 | – | – | – | – |
+| 27% ambiguous | **align edlib** | **1.421** | **1.406** | – | – | – | – |
+| 27% ambiguous | **align minimap2** | **5.104** | **5.097** | – | – | – | – |
+| 27% ambiguous | edlib, ambiguity = mismatch | 5.104 | 5.097 | – | – | – | – |
 
-1. **The windowed kernel passes and the whole-amplicon one fails.** 0.432 against a 0.609
-   floor, versus 0.912 — the pre-fix estimator is the only non-control candidate here that
-   lands *above* the noise floor. Its error is systematic (0.804), not sampling.
-2. **The bias was in the predicted direction.** The whole-amplicon matrix holds its
-   diagonal at 0.3086 while the measurement drops to 0.2844: at 150bp reads there is
-   genuinely *more* confusion, and a whole-amplicon distance cannot see it. TV max 0.360
-   says a few rows are badly wrong rather than everything being slightly off.
-3. **Windowing also fixes the low-identity tail complaint.** Support Jaccard rises to
-   0.701 and ρ to 0.846 — at or above the reseed's own 0.695 / 0.826, where the
-   whole-amplicon kernel sat at 0.610 / 0.792. 104 overlapping windows generate the
-   near-ties a single global comparison has no way to produce.
-4. **The cost argument mostly evaporates.** 1.96 s vs 4.8 s — 2×, not 460×. The windowed
-   kernel is `n_refs² × n_windows` infix alignments. It is still simpler (no mapper, no
-   container, no error model), but speed stops being the reason to choose it.
-5. **Everything is harder at 150bp**, as it should be: naive-observed L1 rises to
-   0.026–0.031 from 0.022–0.028. Downstream, windowed alignment is again indistinguishable
-   from simulate+map (0.0199 / 0.0299 vs 0.0256 / 0.0294) — and note the *whole-amplicon*
-   matrix posted the best L1 of all under one generator (0.0234) while being demonstrably
-   the wrong matrix. That is §4 of the reading above, in one line: the downstream test
-   cannot rank candidates.
+Downstream (clean DB), composition L1 against truth: naive observed 0.0229 / 0.0255,
+simulate+map 0.0177 / 0.0206, **align 0.0156 / 0.0191 on either backend**, shuffled control
+0.0524 / 0.0499. The confusable pair comes back at −0.0002 / +0.0002 and +0.0007 / −0.0018.
+
+1. **On a clean reference set the two backends are indistinguishable** — identical to four
+   decimal places on every metric, because both resolve the same tie clusters. The choice
+   between them is cost and scaling, not accuracy.
+2. **On an ambiguous reference set they are not.** `align minimap2` scores **exactly** what
+   the pre-fix "ambiguity = mismatch" kernel scored (5.097): minimap2's `NM` counts an `N`
+   as a mismatch, so an `N`-bearing reference is split out of the cluster it belongs to.
+   The IUPAC handling that fixes this lives in edlib's `additionalEqualities` and has no
+   equivalent in a PAF. 68 pairs disagree on `d ≤ 0`. The estimator now warns when it is
+   given a PAF and the references carry ambiguity codes.
+3. **Cost at this size favours edlib**: 0.10 s vs 0.60 s at 81 references, the difference
+   being container startup. minimap2 wins only where indexing pays — see
+   [the backend benchmark](alignment_backend_benchmark.md).
+4. **Read windows are not modelled at all, on purpose.** A query shorter than the reference
+   sees a window of it and is confusable in ways whole-sequence distance cannot represent.
+   Rather than approximate it, `align` refuses `--sim_read_len` and the pipeline directs
+   short/unmerged reads to `simulate`, which measures it. Paired samples are merged into
+   whole-fragment queries first, so this is the exception rather than the norm.
+
+**Choosing a backend:** `edlib` unless the reference set is large enough that indexing
+pays; `edlib` regardless if it carries IUPAC ambiguity.
 
 ## IUPAC ambiguity in the references (`N`)
 

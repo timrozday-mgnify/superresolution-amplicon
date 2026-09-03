@@ -43,10 +43,12 @@ workflow SUPERRESOLUTION_AMPLICON {
         // index. Putting them here would look like they applied when they did not.
         error "-k/-w belong in --minimap2_index_args, not --minimap2_args"
     }
-    if (params.mismapping_method == 'align' && params.align_backend == 'minimap2'
-            && params.sim_read_len) {
-        error "--align_backend minimap2 aligns whole references, so it cannot model " +
-              "--sim_read_len windows; use --align_backend edlib, or --mismapping_method simulate"
+    if (params.mismapping_method == 'align' && params.sim_read_len) {
+        // Whole-reference distances cannot see what a short read cannot see, and quietly
+        // understating confusion is worse than refusing.
+        error "--mismapping_method align builds M from whole-reference alignments and " +
+              "cannot model --sim_read_len windows. Use --mismapping_method simulate for " +
+              "reads shorter than the amplicon, or merge pairs so queries span it."
     }
 
     if (params.mismapping_matrix) {

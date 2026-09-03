@@ -23,6 +23,13 @@ dev/amplicon_distance_census.md and dev/error_rate_sensitivity.md. A reference s
 members differ by one or two bases is the case this kernel is expected to miss; the
 printed nearest-neighbour histogram is there so you can see which kind of set you have.
 
+**Whole references only.** ``M`` here describes queries that span the reference amplicon:
+merged pairs, or single reads long enough to cover it. Reads shorter than the amplicon see
+a window of it and are confusable in ways whole-sequence distance cannot see, and this
+kernel does not model that — use ``--mismapping_method simulate --sim_read_len``, which
+measures it directly. The pipeline refuses the combination rather than quietly
+understating confusion.
+
 Output is the same CSV ``infer_composition.py --build-mismapping`` writes, so it drops
 straight into ``--mismapping-matrix`` / ``--mismapping_matrix``.
 
@@ -248,50 +255,8 @@ def tie_cluster_matrix(d: np.ndarray, tau: int = 0,
     return _normalise(d <= tau, weights)
 
 
-def windowed_matrix(seqs: list[str], read_len: int, tau: int = 0,
-                    stride: int = 1, weights: np.ndarray | None = None) -> np.ndarray:
-    """``M`` for reads *shorter* than the amplicon.
-
-    A read sees only a window of its source amplicon, so two references that differ
-    outside that window are indistinguishable to the mapper — confusion the whole-amplicon
-    distance cannot see, and would silently understate. This mirrors what the simulate path
-    does with ``--read-len``: draw every length-``read_len`` window of the source reference
-    (uniformly, as ``draw_fragment`` does), score it against every reference by *infix*
-    alignment (edlib ``HW``: the best placement of the read anywhere in the reference —
-    which is the question a mapper asks), cluster the winners, and average over windows.
-
-    A window is a substring of its own source, so its distance to that source is 0 and the
-    cluster is never empty. Reduces to the whole-amplicon kernel when ``read_len`` covers
-    the amplicon.
-
-    ponytail: n_refs^2 * n_windows infix alignments — seconds for a per-sample reference
-    set (81 refs x 104 windows x 81 targets ~ 7 s). ``stride`` subsamples the windows if a
-    much larger set ever needs it; the windows are highly redundant, so it costs little.
-    ponytail: ``weights`` counts ambiguity across the *whole* reference, not just the span
-    a given read aligns to, so a short read is penalised for ambiguity it never saw. Both
-    ambiguity and short reads were tested, but not together; count ambiguity in the matched
-    span (edlib ``task="locations"``) if that combination ever matters.
-    """
-    n = len(seqs)
-    M = np.zeros((n, n), dtype=np.float64)
-    for a, seq in enumerate(seqs):
-        starts = range(0, max(len(seq) - read_len, 0) + 1, stride)
-        n_win = 0
-        for p in starts:
-            frag = seq[p:p + read_len]
-            d = np.fromiter(
-                (edlib.align(frag, t, mode="HW", task="distance",
-                             additionalEqualities=_EQUALITIES)["editDistance"]
-                 for t in seqs), dtype=np.int32, count=n)
-            M[a] += _normalise((d <= tau)[None, :], weights)[0]
-            n_win += 1
-        M[a] /= n_win
-    return M
-
-
-def build(amplicons: Path, tau: int = 0, read_len: int | None = None,
-          stride: int = 1, ambiguity_weight: float = 1.0, paf: Path | None = None
-          ) -> tuple[pd.DataFrame, np.ndarray]:
+def build(amplicons: Path, tau: int = 0, ambiguity_weight: float = 1.0,
+          paf: Path | None = None) -> tuple[pd.DataFrame, np.ndarray]:
     """``M`` as a labelled frame, indexed and columned by the amplicon fasta headers.
 
     Returns the whole-amplicon distance matrix alongside it, for the summary — under
@@ -307,16 +272,23 @@ def build(amplicons: Path, tau: int = 0, read_len: int | None = None,
     # Bounded a little past tau so the printed nearest-neighbour histogram still shows the
     # near-misses that say whether tau=0 is safe for this reference set.
     bound = max(tau, SUMMARY_DISTANCE)
-    d = (paf_distances(paf, refseqs, bound + 1) if paf is not None
-         else pairwise_distances(seqs, max_distance=bound))
-    w = ambiguity_weights(seqs, ambiguity_weight)
-    if read_len is not None:
-        if paf is not None:
-            raise SystemExit("--paf gives whole-sequence alignments; it cannot model "
-                             "--read-len windows. Drop one of them.")
-        M = windowed_matrix(seqs, read_len, tau, stride, w)
+    if paf is not None:
+        n_amb = sum(1 for q in seqs if any(c not in _BASES for c in q))
+        if n_amb:
+            # minimap2's NM counts an ambiguity code as a mismatch, so an N-bearing
+            # reference is split out of the cluster it belongs to — the failure the edlib
+            # backend's IUPAC equalities exist to prevent, reintroduced. Measured at 27%
+            # ambiguous references it is 3.6x worse than edlib (dev/alignment_mismapping.md).
+            log.warning("%d/%d references carry IUPAC ambiguity codes and the distances "
+                        "come from a PAF: minimap2 scores those as mismatches, so their "
+                        "tie clusters will be split. Use the edlib backend "
+                        "(--align_backend edlib) for reference sets with ambiguity.",
+                        n_amb, len(seqs))
+        d = paf_distances(paf, refseqs, bound + 1)
     else:
-        M = tie_cluster_matrix(d, tau, w)
+        d = pairwise_distances(seqs, max_distance=bound)
+    w = ambiguity_weights(seqs, ambiguity_weight)
+    M = tie_cluster_matrix(d, tau, w)
     return pd.DataFrame(M, index=refseqs, columns=refseqs), d
 
 
@@ -362,30 +334,10 @@ def demo() -> None:
         assert list(back.index) == list(back.columns) == [f"ref|{i}|x" for i in range(5)]
         assert np.isfinite(back.to_numpy()).all() and (back.to_numpy() >= 0).all()
         assert np.allclose(back.to_numpy().sum(axis=1), 1.0)
-    # Short reads: two references identical over most of their length and differing only
-    # at one end. Whole-amplicon distance calls them distinct; a read that never spans the
-    # difference cannot tell them apart, and M must say so.
     # Non-repetitive, or infix alignment matches everywhere and the example says nothing.
     rng = np.random.default_rng(0)
     draw = lambda k: "".join(rng.choice(list(_BASES), size=k))
     shared = draw(60)
-    pair = [shared + draw(20), shared + draw(20)]   # identical but for the last 20 bases
-    d2 = pairwise_distances(pair)
-    assert d2[0, 1] > 0
-    assert np.allclose(tie_cluster_matrix(d2, tau=0), np.eye(2))       # "never confused"
-
-    W = windowed_matrix(pair, read_len=20)
-    assert np.allclose(W.sum(axis=1), 1.0), W
-    # 41 of the 61 windows sit entirely inside the shared prefix and cannot separate the
-    # two references; the other 20 overlap the difference and resolve it.
-    assert np.isclose(W[0, 0], (41 * 0.5 + 20) / 61), W
-    assert W[0, 1] > 0.3 and W[1, 0] > 0.3, W
-    # A read as long as the amplicon sees everything, so the window kernel collapses back.
-    assert np.allclose(windowed_matrix(pair, read_len=len(pair[0])), np.eye(2))
-    # Truly identical references stay 50/50 at every read length.
-    assert np.allclose(windowed_matrix([shared, shared], read_len=10), 0.5)
-    # Striding subsamples the same windows, so it must not move the answer much.
-    assert abs(windowed_matrix(pair, read_len=20, stride=5)[0, 0] - W[0, 0]) < 0.05
 
     # The k-mer prefilter must be lossless: bounded distances equal exact ones, clipped.
     base = draw(200)
@@ -419,8 +371,6 @@ def demo() -> None:
     # Non-transitive, so the rows are not all the same size and M is not symmetric.
     assert np.allclose(A[1], 1 / 3), A          # the N sees all three
     assert np.allclose(A[0], [0.5, 0.5, 0.0]) and np.allclose(A[2], [0.0, 0.5, 0.5]), A
-    # Without the equalities every row would be the identity — the bug this guards.
-    assert np.allclose(windowed_matrix(amb, read_len=20)[1].sum(), 1.0)
 
     # Ambiguity weighting: the mapper prefers a clean duplicate over an N-bearing one, so
     # a cluster member carrying ambiguity takes less than its uniform share.
@@ -440,8 +390,7 @@ def demo() -> None:
                                           ambiguity_weights(both_n, 0.0)), 0.5)
 
     print("demo OK: identical trio -> 1/3 rows, isolated -> identity, tau widens clusters, "
-          "CSV round-trips row-stochastic; short reads see confusion the whole-amplicon "
-          "distance misses, and collapse back to it at full length; IUPAC ambiguity "
+          "CSV round-trips row-stochastic; IUPAC ambiguity "
           "matches rather than splitting clusters, and weighting demotes it; the k-mer "
           "prefilter is lossless")
 
@@ -454,14 +403,9 @@ def main() -> None:
     ap.add_argument("--tau", type=int, default=0,
                     help="cluster references within this edit distance (default 0: exact "
                          "duplicates only, which is what the B. uniformis set wanted)")
-    ap.add_argument("--read-len", type=int, default=None,
-                    help="reads are this long, i.e. shorter than the amplicon (unmerged / "
-                         "short reads). Default: reads span the whole amplicon.")
     ap.add_argument("--paf", type=Path, default=None,
                     help="minimap2 all-vs-all PAF (produced with -c, so NM is present) to "
                          "take distances from, instead of aligning with edlib here")
-    ap.add_argument("--window-stride", type=int, default=1,
-                    help="--read-len: sample every Nth read window (default 1: all)")
     ap.add_argument("--ambiguity-weight", type=float, default=DEFAULT_AMBIGUITY_WEIGHT,
                     help="tie-break weight per ambiguous position in a reference: a "
                          f"cluster member with k of them gets w**k (default "
@@ -478,18 +422,13 @@ def main() -> None:
     for req in ("amplicons", "output"):
         if getattr(a, req) is None:
             ap.error(f"--{req.replace('_', '-')} is required (unless --demo)")
-    if a.read_len is not None and a.read_len < 1:
-        ap.error("--read-len must be positive")
     if not 0.0 <= a.ambiguity_weight <= 1.0:
         ap.error("--ambiguity-weight must be in [0, 1]")
-    M, d = build(a.amplicons, a.tau, a.read_len, a.window_stride,
-                 a.ambiguity_weight, a.paf)
+    M, d = build(a.amplicons, a.tau, a.ambiguity_weight, a.paf)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     M.to_csv(a.output)
     summarise(M, d)
-    scope = "whole amplicon" if a.read_len is None else f"read-len {a.read_len}"
-    print(f"build_mismapping_align: {len(M)} references, tau={a.tau}, {scope} "
-          f"-> {a.output}")
+    print(f"build_mismapping_align: {len(M)} references, tau={a.tau} -> {a.output}")
 
 
 if __name__ == "__main__":
