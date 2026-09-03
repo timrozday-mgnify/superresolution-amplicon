@@ -56,6 +56,8 @@ import error_rate_sensitivity as ers  # noqa: E402
 SIM_RATE = "0.005"
 SUPPORT_EPS = 1e-3
 TAUS = (0, 1, 2)
+# Tie-break weight per ambiguous position, swept when --inject-n is on.
+AMBIGUITY_WEIGHTS = (0.0, 0.05, 0.1, 0.19, 0.3, 0.5)
 
 
 def compare(M: np.ndarray, ref: np.ndarray) -> dict:
@@ -85,6 +87,8 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=_REPO / "dev" / "alignment_mismapping.csv")
     ap.add_argument("--read-len", type=int, default=None,
                     help="reads are this long (unmerged/short); default: whole amplicon")
+    ap.add_argument("--inject-seed", type=int, default=7,
+                    help="--inject-n: which references get an N")
     ap.add_argument("--inject-n", type=float, default=0.0,
                     help="put a single N at a random position in this fraction of the "
                          "reference amplicons, to probe IUPAC ambiguity handling")
@@ -116,7 +120,7 @@ def main() -> None:
         # copy of an otherwise identical pair is what splits a tie cluster when the kernel
         # scores ambiguity as a mismatch, so put some in and see which kernel still tracks
         # mapseq.
-        rng = np.random.default_rng(7)
+        rng = np.random.default_rng(a.inject_seed)
         hit = rng.random(len(amps_db)) < a.inject_n
         for i in np.flatnonzero(hit):
             pos = int(rng.integers(0, len(amps_db[i])))
@@ -169,6 +173,10 @@ def main() -> None:
                 strict[i, j] = strict[j, i] = bma.edlib.align(
                     amps_db[i], amps_db[j], mode="NW", task="distance")["editDistance"]
         Ms["alignment tau=0 (ambiguity = mismatch)"] = bma.tie_cluster_matrix(strict, 0)
+        # The penalty model: down-weight cluster members by their ambiguous-position count.
+        for w in AMBIGUITY_WEIGHTS:
+            Ms[f"alignment tau=0 (ambiguity weight {w})"] = bma.tie_cluster_matrix(
+                d, 0, bma.ambiguity_weights(amps_db, w))
     if a.read_len is not None:
         # The whole-amplicon kernel is the *bug* this run exists to check: it is what the
         # estimator produced before --read-len, and it should now be visibly worse.

@@ -173,6 +173,7 @@ Mis-mapping — how `M` is built:
 |-------|---------|-------------|
 | `--mismapping_method` | `simulate` | `simulate` (sample errored reads from every reference and map them with the same mapper the real reads go through — `M` is *measured*) or `align` (align the reference amplicons to each other and read `M` off the distances — no simulation, no mapper, no error model). |
 | `--align_tau` | `0` | `align` only: cluster references within this edit distance. `0` (exact duplicate amplicons) beat every larger value tested; `tau > 0` was decisively worse, not softer. |
+| `--align_ambiguity_weight` | `0.3` | `align` only: a cluster member carrying `k` IUPAC ambiguity codes takes `w**k` of a uniform share, since mapseq scores an `N` as a mismatch and prefers a clean duplicate. No-op on reference sets without ambiguity codes; `1` disables. The real penalty varies (0.18–0.97), so this is a compromise — see [the sweep](dev/ambiguity_weight_sweep.md). |
 
 | `--sim_read_len` | – | Reads are this long, i.e. shorter than the amplicon (unmerged / short reads). **Honoured by both methods.** Unset = reads span the whole amplicon, correct for merged reads. |
 

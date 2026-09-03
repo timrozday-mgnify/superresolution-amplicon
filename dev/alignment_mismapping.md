@@ -166,11 +166,19 @@ reference's ambiguity is an assembly artefact and the organism has a real base t
    without, while the matrices differ by 2.481 — mass moves *within* clusters, which the
    diagonal cannot see. Third time this metric has been uninformative.
 
-**Practical reading:** the fix is necessary and removes a catastrophic failure mode, but
-on a DB where a quarter of references carry ambiguity, `align` and `simulate` genuinely
-disagree — use `simulate`, or drop/repair the ambiguous references. Modelling the penalty
-(down-weighting cluster members by their ambiguous-position count) would close the gap at
-the cost of a fitted knob; not built.
+5. **Modelling the penalty helps, and is now the default.** Down-weighting a cluster
+   member as `w ** (its ambiguous positions)` recovers ~40% of the residual
+   (2.455 → 1.351 at this injection). The fitted `w` matches the independently measured
+   mass ratio in 5 of 5 configurations — but that ratio itself ranges 0.18–0.97 across
+   draws, so `--align_ambiguity_weight` defaults to 0.3 as a compromise rather than an
+   optimum, and is a no-op on ambiguity-free sets. Details and the sweep:
+   [ambiguity_weight_sweep.md](ambiguity_weight_sweep.md).
+
+**Practical reading:** the fix is necessary and removes a catastrophic failure mode, and
+the penalty model recovers much of what is left — but at best `‖·‖_F` is 1.35–1.88 against
+a ~0.58 floor. On a DB where a meaningful fraction of references carry ambiguity, `align`
+and `simulate` genuinely disagree: use `simulate`, or drop/repair the ambiguous
+references.
 
 ## What this does not show
 

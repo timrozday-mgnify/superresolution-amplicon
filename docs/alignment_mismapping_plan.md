@@ -139,8 +139,14 @@ merge or split abruptly; simulation degrades smoothly instead. Two specific trap
   mapseq is not ambiguity-agnostic, giving an `N`-bearing reference **0.19×** the incoming
   mass of its clean cluster partners, and `‖M_measured(N-DB) − M_measured(clean-DB)‖_F =
   2.481` — essentially the entire remaining gap. No ambiguity-agnostic distance can
-  express that penalty. On a DB where a large fraction of references carry ambiguity, use
-  `simulate`, or drop/repair those references. Verified byte-identical on the
+  express that penalty *exactly* — but `--align_ambiguity_weight` (default 0.3) now models
+  it approximately, demoting a cluster member as `w ** (its ambiguous positions)`, which
+  recovers ~40% of the residual (2.450 → 1.351). The fitted `w` matches the independently
+  measured penalty in 5 of 5 configurations, so the model has the right form; the penalty
+  itself ranges 0.18–0.97 across draws, so the default is a compromise rather than an
+  optimum ([sweep](../dev/ambiguity_weight_sweep.md)). Even at best, 1.35–1.88 against a
+  ~0.58 floor: on a DB where a meaningful fraction of references carry ambiguity, use
+  `simulate`, or drop/repair those references. All of it is byte-identical on the
   ambiguity-free B. uniformis set, so nothing above changes. Details:
   [equivalence study](../dev/alignment_mismapping.md#iupac-ambiguity-in-the-references-n).
 - **Amplicon extraction.** 16 of 97 DB entries produced no amplicon and are excluded from
@@ -202,6 +208,8 @@ at three decimal places.
 3. **A soft tail on the kernel** (§2) — the cheapest fix if support Jaccard becomes the
    binding constraint: rung 3's `M[a,j] ∝ exp(−β·d)` with a large β is a tie cluster with
    a tail, at the cost of one fitted knob and the fit/validate split that avoids.
-4. **Modelling the mapper's ambiguity penalty** (§6) — down-weight cluster members by
-   their ambiguous-position count, to close the residual 2.45 on `N`-laden DBs. Costs a
-   fitted knob, and only pays off if such DBs matter; `simulate` already covers them.
+4. **Real ambiguous references** (§6) — the penalty model was validated against
+   *injected* `N`s, uniformly at random. Real ambiguity clusters in hard-to-assemble
+   regions, which could make the penalty more consistent (a portable `w`) or less (per-DB
+   fitting, which would defeat it). Until then `--align_ambiguity_weight` is a hedge, and
+   `simulate` is the answer for ambiguity-heavy DBs.

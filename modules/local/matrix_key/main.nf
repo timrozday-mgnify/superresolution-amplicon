@@ -14,6 +14,7 @@ process MATRIX_KEY {
     script:
     def settings = [
         mismapping_method: params.mismapping_method, align_tau: params.align_tau,
+        align_ambiguity_weight: params.align_ambiguity_weight,
         sim_error_model: params.sim_error_model, sim_n_per_ref: params.sim_n_per_ref,
         sim_read_len: params.sim_read_len, flat_sub_rate: params.flat_sub_rate,
         flat_ins_rate: params.flat_ins_rate, flat_del_rate: params.flat_del_rate,

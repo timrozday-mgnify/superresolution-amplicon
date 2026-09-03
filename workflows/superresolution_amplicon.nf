@@ -113,7 +113,9 @@ workflow SUPERRESOLUTION_AMPLICON {
             def provenance = [
                 matrix_key: key, reference_sha256: representative[4], model_scope: scope,
                 source: source, mismapping_method: params.mismapping_method,
-                align_tau: params.align_tau, sim_error_model: params.sim_error_model,
+                align_tau: params.align_tau,
+                align_ambiguity_weight: params.align_ambiguity_weight,
+                sim_error_model: params.sim_error_model,
                 sim_n_per_ref: params.sim_n_per_ref, sim_read_len: params.sim_read_len,
                 flat_sub_rate: params.flat_sub_rate, flat_ins_rate: params.flat_ins_rate,
                 flat_del_rate: params.flat_del_rate, mapseq_args: params.mapseq_args,
