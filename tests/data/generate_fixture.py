@@ -74,4 +74,22 @@ with gzip.open(HERE / "sample.fastq.gz", "wt") as fh:
         qual = "I" * len(read)
         fh.write(f"@read{i}_{g}\n{read}\n+\n{qual}\n")
 
-print(f"wrote {len(refs)} refs and {n_reads} reads to {HERE}")
+# Paired fixture: the same reads split into overlapping mates, so the pair-merging path
+# has input that reconstructs a known answer. 150bp mates off a ~269bp fragment overlap by
+# ~31bp — the realistic 2x150 V4 case.
+MATE = 150
+n_pairs = 0
+with gzip.open(HERE / "sample.fastq.gz", "rt") as src, \
+        gzip.open(HERE / "sample_R1.fastq.gz", "wt") as f1, \
+        gzip.open(HERE / "sample_R2.fastq.gz", "wt") as f2:
+    lines = src.read().split("\n")
+    for i in range(0, len(lines) - 3, 4):
+        name, read = lines[i][1:].split()[0], lines[i + 1]
+        if len(read) < MATE:
+            continue
+        r1, r2 = read[:MATE], revcomp(read[-MATE:])
+        f1.write(f"@{name}\n{r1}\n+\n{'I' * len(r1)}\n")
+        f2.write(f"@{name}\n{r2}\n+\n{'I' * len(r2)}\n")
+        n_pairs += 1
+
+print(f"wrote {len(refs)} refs, {n_reads} reads and {n_pairs} pairs to {HERE}")

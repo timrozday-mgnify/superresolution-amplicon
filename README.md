@@ -75,7 +75,8 @@ YAML list of samples (or a map with `samples:`). Per sample:
 |-----|----------|-------------|
 | `id` | yes | Unique sample id (output routing). |
 | `reads` | yes\* | fastq path or list of paths. |
-| `fastq_1` / `fastq_2` | yes\* | Alternative to `reads` (paired-end). |
+| `fastq_1` / `fastq_2` | yes\* | Alternative to `reads` (paired-end). Supplying `fastq_2` marks the sample paired: R1/R2 are **merged into one query per fragment** before mapping, so each query spans the amplicon like the references do. |
+| `paired` | no | `true` to merge a two-file `reads` list as R1/R2. Not inferred: two files could equally be two single-end runs. |
 | `platform` | no | `hq-illumina` \| `lq-illumina` \| `ont` \| `pacbio` (default `hq-illumina`). Sets the skiver error-model context + report notebook. |
 | `references` | no | Per-sample reference fasta; overrides `--references`. |
 | `error_model` | no | Path to a pre-trained `.pt` model; **skips training** for this sample. |
@@ -175,6 +176,7 @@ Mis-mapping — how `M` is built:
 | `--align_tau` | `0` | `align` only: cluster references within this edit distance. `0` (exact duplicate amplicons) beat every larger value tested; `tau > 0` was decisively worse, not softer. |
 | `--align_ambiguity_weight` | `0.3` | `align` only: a cluster member carrying `k` IUPAC ambiguity codes takes `w**k` of a uniform share, since mapseq scores an `N` as a mismatch and prefers a clean duplicate. No-op on reference sets without ambiguity codes; `1` disables. The real penalty varies (0.18–0.97), so this is a compromise — see [the sweep](dev/ambiguity_weight_sweep.md). |
 
+| `--min_pair_overlap` | `20` | Paired samples: shortest mate overlap accepted when merging R1/R2. Unmergeable pairs are dropped and counted; past 20% the run warns that the fragments do not cover the amplicon, and `--mismapping_method simulate --sim_read_len` is the right choice for that sample. |
 | `--sim_read_len` | – | Reads are this long, i.e. shorter than the amplicon (unmerged / short reads). **Honoured by both methods.** Unset = reads span the whole amplicon, correct for merged reads. |
 
 The remaining `simulate` settings below (everything except `--mismapping_matrix`) are

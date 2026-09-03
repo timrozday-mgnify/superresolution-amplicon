@@ -34,7 +34,12 @@ in [the error-rate study](../dev/error_rate_sensitivity.md) (mean diagonal ≈0.
 
 ## Decisions, and what they rest on
 
-**Library: `edlib`** (Myers bit-parallel edit distance, global/`NW` mode). Chosen over
+**Library: `edlib`** (Myers bit-parallel edit distance, global/`NW` mode), behind a
+**lossless k-mer prefilter** (q-gram lemma) with edlib's own `k=` early exit — 10-12x
+faster, byte-identical `M`. minimap2 via `mappy` was measured as an alternative prefilter
+(recall 1.000, ~3x faster again at n = 8000) and documented as the upgrade path rather
+than shipped, being heuristic and unnecessary at this scale:
+[backend benchmark](../dev/alignment_backend_benchmark.md). Chosen over
 `parasail` (SIMD affine-gap, `_stats_` identity), Biopython's `PairwiseAligner` (kept as a
 slow oracle), `pyopal`, and `mappy` (minimap2 — the fallback had no alignment kernel
 worked). With a 2-base amplicon length spread and 90% zero distances, nothing edlib
@@ -152,7 +157,7 @@ merge or split abruptly; simulation degrades smoothly instead. Two specific trap
 - **Amplicon extraction.** 16 of 97 DB entries produced no amplicon and are excluded from
   both methods. That bound is unchanged by this work but caps it.
 
-### 7. Short and unmerged reads — ~~unsupported~~ **fixed**, with a smaller cost case
+### 7. Short and unmerged reads — ~~unsupported~~ **fixed** (and mostly avoided, by merging pairs)
 
 *Was:* the kernel compared whole amplicons, so a read shorter than the amplicon — which
 sees only a window, and cannot distinguish references differing *outside* it — got an `M`
@@ -171,18 +176,30 @@ diagonal stuck at 0.3086 where the measurement drops to 0.2844. The bias was exa
 predicted direction and size. Windowing also repairs §2's missing tail at this read length
 (support Jaccard 0.701 vs 0.610, ρ 0.846 vs 0.792 — at or above the reseed's own).
 
+For paired data this path is now the *fallback* rather than the norm: mates are merged
+into whole-fragment queries first (see the paired bullet below), so `--read-len` is only
+needed when the fragments genuinely do not cover the amplicon.
+
 Residual limitations:
 
 - **The cost argument mostly evaporates for short reads.** `n_refs² × n_windows` infix
   alignments: 1.96 s vs 4.8 s, a 2× saving rather than 460×. Simplicity (no mapper, no
   container, no error model) remains; speed does not. `--window-stride` subsamples the
   highly-redundant windows if a much larger reference set needs it, and is untested beyond
-  the demo's sanity check.
+  the demo's sanity check. Note the k-mer prefilter does **not** apply to the windowed
+  path — it filters whole-sequence pairs, not read windows.
 - **One read length, one set.** `L = 150` only.
-- **Paired reads are not modelled as pairs.** A uniform random window is not R1+R2 from
-  opposite ends of the fragment. Both methods share this assumption — `draw_fragment` on
-  the simulate path does the same thing — so it is inherited, not introduced, but it means
-  neither `M` is right for genuinely unmerged paired data.
+- ~~**Paired reads are not modelled as pairs.**~~ **Fixed by merging them.** A paired
+  sample (`fastq_1`+`fastq_2`, or `paired: true`) now has its mates merged into **one
+  query per fragment** in `READS_TO_FASTA` before mapping, rather than being flattened into
+  independent 150bp reads as before. A merged 2x150 pair spans a 253bp V4 amplicon, so
+  every query covers the reference the way the reference set does and the whole-amplicon
+  kernel is the correct one — the coverage assumption is now *established by the pipeline*
+  rather than hoped for. Pairs that do not overlap cannot be merged; they are counted, and
+  above 20% the run warns that the fragments do not cover the amplicon and the matrix
+  should come from `simulate --sim_read_len` instead. Verified end to end: merging the
+  paired fixture reconstructs all 1500 original reads byte-for-byte, and the paired run
+  infers the same composition as the single-end one.
 
 ### 8. High-error long reads are outside the tested regime
 

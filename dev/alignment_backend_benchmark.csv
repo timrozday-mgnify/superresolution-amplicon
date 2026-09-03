@@ -1,0 +1,14 @@
+test,backend,n,seconds,recall,precision,exact_clusters
+mappy recall (real 81-ref set),mappy asm5,81,0.01754820893984288,1.0,0.900705467372134,65.0
+mappy recall (real 81-ref set),mappy asm10,81,0.015368625055998564,1.0,0.8333654000320667,54.0
+mappy recall (real 81-ref set),mappy sr,81,0.023871166980825365,1.0,0.42673839311520473,18.0
+mappy recall (real 81-ref set),mappy map-ont,81,0.020861041033640504,1.0,0.821019721019721,52.0
+cost vs n,edlib all-pairs,500,3.712862499989569,,,
+cost vs n,k-mer filter + edlib,500,0.3709437500219792,,,
+cost vs n,mappy asm5 (candidates only),500,0.36664333299268037,,,
+cost vs n,edlib all-pairs,2000,61.196987958974205,,,
+cost vs n,k-mer filter + edlib,2000,5.166365167009644,,,
+cost vs n,mappy asm5 (candidates only),2000,4.70320233295206,,,
+cost vs n,edlib all-pairs,8000,,,,
+cost vs n,k-mer filter + edlib,8000,82.20727583300322,,,
+cost vs n,mappy asm5 (candidates only),8000,25.191633958020248,,,

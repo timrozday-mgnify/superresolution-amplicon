@@ -47,6 +47,25 @@ nextflow_pipeline {
         }
     }
 
+    test("paired samples merge their mates into one query - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input  = "${projectDir}/tests/data/samplesheet.paired.yml"
+                outdir = "$outputDir"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.succeeded().size() == 11 },
+                { assert workflow.trace.tasks().any { it.name.contains('READS_TO_FASTA') } },
+                { assert path("${params.outdir}/mapseq/paired_demo/paired_demo.obs.mseq.gz").exists() }
+            )
+        }
+    }
+
     test("alignment-built M replaces the whole simulation flow - stub") {
         tag "stub"
         options "-stub"

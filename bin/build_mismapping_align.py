@@ -57,6 +57,15 @@ _BASES = "ACGT"
 # cheap in the fifth. A no-op wherever a reference set carries no ambiguity codes.
 DEFAULT_AMBIGUITY_WEIGHT = 0.3
 
+# k-mer length for the candidate-pair filter. 15 is short enough that a 250bp
+# amplicon still has plenty of k-mers to spare against the q-gram bound, and long
+# enough to be specific in a 16S reference set.
+KMER_SIZE = 15
+
+# Distances are resolved exactly out to here so the summary histogram is meaningful;
+# anything beyond is reported as "further".
+SUMMARY_DISTANCE = 5
+
 # IUPAC ambiguity: two symbols are equal when the base sets they stand for overlap, so an
 # `N` (or `R`, `Y`, …) in a draft-genome 16S matches what it could have been. Without this
 # edlib scores ambiguity as a plain mismatch, and a single `N` in one copy of an otherwise
@@ -70,22 +79,84 @@ _EQUALITIES = [(x, y) for x in si._IUPAC for y in si._IUPAC
                if x != y and si._IUPAC[x] & si._IUPAC[y]]
 
 
-def pairwise_distances(seqs: list[str]) -> np.ndarray:
+def _kmer_candidates(seqs: list[str], max_distance: int, k: int = KMER_SIZE
+                     ) -> list[set[int]]:
+    """Candidate neighbours per sequence: everything that *could* be within
+    ``max_distance``, by the q-gram lemma. Lossless — never drops a true neighbour.
+
+    A sequence of length L has ``L - k + 1`` k-mers, and one edit destroys at most ``k`` of
+    them, so two sequences within ``e`` edits share at least ``L - k + 1 - k*e``. Anything
+    sharing fewer cannot be within ``e`` and needs no alignment. Ambiguous positions are
+    charged like edits (their k-mers are skipped, since an `N` k-mer would have to match
+    every substitution of itself), which keeps the bound conservative.
+
+    ponytail: one dict of k-mer -> reference ids. Memory is O(total k-mers); for reference
+    sets far larger than this pipeline builds, a minimizer sketch (index every w-th k-mer)
+    trades a weaker bound for less memory.
+    """
+    n = len(seqs)
+    index: dict[str, list[int]] = {}
+    kmers: list[set[str]] = []
+    amb = [sum(c not in _BASES for c in s) for s in seqs]
+    for i, seq in enumerate(seqs):
+        ks = {seq[p:p + k] for p in range(len(seq) - k + 1)
+              if all(c in _BASES for c in seq[p:p + k])}
+        kmers.append(ks)
+        for km in ks:
+            index.setdefault(km, []).append(i)
+
+    out: list[set[int]] = []
+    for i, ks in enumerate(kmers):
+        shared: dict[int, int] = {}
+        for km in ks:
+            for j in index[km]:
+                if j != i:
+                    shared[j] = shared.get(j, 0) + 1
+        # The threshold uses the shorter sequence's k-mer count, and charges both
+        # sequences' ambiguity, so it can only be too permissive — never too strict.
+        cand = {i}
+        for j, count in shared.items():
+            need = (min(len(seqs[i]), len(seqs[j])) - k + 1
+                    - k * (max_distance + amb[i] + amb[j]))
+            if count >= need:
+                cand.add(j)
+        out.append(cand)
+    return out
+
+
+def pairwise_distances(seqs: list[str], max_distance: int | None = None) -> np.ndarray:
     """Symmetric all-pairs global (Needleman-Wunsch) edit distance, via edlib.
 
-    ponytail: O(n^2) alignments, ~1 us each for a 250bp amplicon — fine for the
-    per-sample reference sets this pipeline builds (tens to thousands of amplicons).
-    Past ~10k references, group exact duplicates by hash first (at tau=0 that is the whole
-    answer and needs no alignment) and align only the cluster representatives.
+    With ``max_distance`` set, only pairs that a lossless k-mer filter says *could* be that
+    close are aligned, and edlib is told to give up past it (``k=``, which also lets it
+    bail out early inside an alignment). Everything else comes back as ``max_distance + 1``
+    — a sentinel meaning "further than you asked about", not a real distance. Callers that
+    need exact distances everywhere (the census histogram) pass ``None``.
+
     IUPAC ambiguity codes match any base they could stand for (``_EQUALITIES``).
     """
     n = len(seqs)
-    d = np.zeros((n, n), dtype=np.int32)
-    for i in range(n):
-        for j in range(i + 1, n):
-            d[i, j] = d[j, i] = edlib.align(
-                seqs[i], seqs[j], mode="NW", task="distance",
-                additionalEqualities=_EQUALITIES)["editDistance"]
+    if max_distance is None:
+        d = np.zeros((n, n), dtype=np.int32)
+        for i in range(n):
+            for j in range(i + 1, n):
+                d[i, j] = d[j, i] = edlib.align(
+                    seqs[i], seqs[j], mode="NW", task="distance",
+                    additionalEqualities=_EQUALITIES)["editDistance"]
+        return d
+
+    sentinel = max_distance + 1
+    d = np.full((n, n), sentinel, dtype=np.int32)
+    np.fill_diagonal(d, 0)
+    for i, cand in enumerate(_kmer_candidates(seqs, max_distance)):
+        for j in cand:
+            if j <= i:
+                continue
+            got = edlib.align(seqs[i], seqs[j], mode="NW", task="distance",
+                              k=max_distance, additionalEqualities=_EQUALITIES
+                              )["editDistance"]
+            if got >= 0:                       # -1 means "further than k"
+                d[i, j] = d[j, i] = got
     return d
 
 
@@ -191,7 +262,9 @@ def build(amplicons: Path, tau: int = 0, read_len: int | None = None,
     if len(set(refseqs)) != len(refseqs):
         raise SystemExit(f"{amplicons} has duplicate reference ids")
     seqs = [s for _, s in records]
-    d = pairwise_distances(seqs)
+    # Bounded a little past tau so the printed nearest-neighbour histogram still shows the
+    # near-misses that say whether tau=0 is safe for this reference set.
+    d = pairwise_distances(seqs, max_distance=max(tau, SUMMARY_DISTANCE))
     w = ambiguity_weights(seqs, ambiguity_weight)
     M = (tie_cluster_matrix(d, tau, w) if read_len is None
          else windowed_matrix(seqs, read_len, tau, stride, w))
@@ -265,6 +338,27 @@ def demo() -> None:
     # Striding subsamples the same windows, so it must not move the answer much.
     assert abs(windowed_matrix(pair, read_len=20, stride=5)[0, 0] - W[0, 0]) < 0.05
 
+    # The k-mer prefilter must be lossless: bounded distances equal exact ones, clipped.
+    base = draw(200)
+    def mutate(seq, n):
+        out = list(seq)
+        for q in rng.choice(len(seq), size=n, replace=False):
+            out[q] = _BASES[(_BASES.index(out[q]) + 1) % 4]
+        return "".join(out)
+    fam = [base, base, mutate(base, 1), mutate(base, 2), mutate(base, 5),
+           mutate(base, 30), draw(200), base[:120] + draw(80)]
+    exact = pairwise_distances(fam)
+    for md in (0, 1, 2, 5):
+        bounded = pairwise_distances(fam, max_distance=md)
+        assert (bounded == np.minimum(exact, md + 1)).all(), (md, bounded, exact)
+    # ... including when ambiguity is in play (it is charged like an edit, never dropped).
+    fam_n = fam + [base[:50] + "N" + base[51:]]
+    exact_n = pairwise_distances(fam_n)
+    assert exact_n[0, -1] == 0                       # the N matches, so distance 0
+    for md in (0, 2):
+        assert (pairwise_distances(fam_n, max_distance=md)
+                == np.minimum(exact_n, md + 1)).all(), md
+
     # Ambiguity: an `N` where another reference has a real base must not split the cluster.
     amb = [shared[:30] + "A" + shared[31:],
            shared[:30] + "N" + shared[31:],
@@ -299,7 +393,8 @@ def demo() -> None:
     print("demo OK: identical trio -> 1/3 rows, isolated -> identity, tau widens clusters, "
           "CSV round-trips row-stochastic; short reads see confusion the whole-amplicon "
           "distance misses, and collapse back to it at full length; IUPAC ambiguity "
-          "matches rather than splitting clusters, and weighting demotes it")
+          "matches rather than splitting clusters, and weighting demotes it; the k-mer "
+          "prefilter is lossless")
 
 
 def main() -> None:

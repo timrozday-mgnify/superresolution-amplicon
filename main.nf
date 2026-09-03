@@ -30,12 +30,23 @@ workflow {
     ch_reads = ch_rows.map { row ->
         if (!row.id) error "Each sample needs an 'id'"
         def reads = []
+        // Paired only when the sample says so: `fastq_1`+`fastq_2`, or an explicit
+        // `paired: true`. A two-entry `reads` list is ambiguous (two single-end runs look
+        // identical to one pair), so it is never guessed at.
+        def paired = false
         if (row.reads) {
             reads = (row.reads instanceof List ? row.reads : [row.reads]).collect { resolveFile(it.toString()) }
+            paired = (row.paired?.toString() == 'true')
+            if (paired && reads.size() != 2) {
+                error "Sample ${row.id}: 'paired: true' needs exactly two files in 'reads'"
+            }
         }
         else if (row.fastq_1) {
             reads << resolveFile(row.fastq_1.toString())
-            if (row.fastq_2?.toString()?.trim()) reads << resolveFile(row.fastq_2.toString())
+            if (row.fastq_2?.toString()?.trim()) {
+                reads << resolveFile(row.fastq_2.toString())
+                paired = true
+            }
         }
         else {
             error "Sample ${row.id} needs 'reads' (list) or 'fastq_1'[/'fastq_2']"
@@ -43,6 +54,7 @@ workflow {
         def meta = [
             id:          row.id,
             platform:    (row.platform ?: params.platform),
+            paired:      paired,
             error_model: (row.error_model ? resolveFile(row.error_model.toString()) :
                           (params.error_model ? resolveFile(params.error_model.toString()) : null)),
         ]
