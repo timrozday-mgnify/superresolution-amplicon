@@ -13,6 +13,8 @@ include { MAPSEQ as MAPSEQ_OBS } from '../modules/local/mapseq/map/main'
 include { SIMULATE_READS       } from '../modules/local/simulate_reads/main'
 include { BUILD_MISMAPPING     } from '../modules/local/build_mismapping/main'
 include { ALIGN_MISMAPPING     } from '../modules/local/align_mismapping/main'
+include { MINIMAP2_INDEX       } from '../modules/local/minimap2/index/main'
+include { MINIMAP2_ALLVSALL    } from '../modules/local/minimap2/allvsall/main'
 include { MATRIX_KEY            } from '../modules/local/matrix_key/main'
 include { PUBLISH_MISMAPPING    } from '../modules/local/publish_mismapping/main'
 include { POOL_TRAINING_READS   } from '../modules/local/pool_training_reads/main'
@@ -32,6 +34,19 @@ workflow SUPERRESOLUTION_AMPLICON {
     // subworkflow is skipped under the flat model. [ id, model_pt ] either way.
     if (!(params.mismapping_method in ['simulate', 'align'])) {
         error "--mismapping_method must be 'simulate' or 'align'"
+    }
+    if (!(params.align_backend in ['edlib', 'minimap2'])) {
+        error "--align_backend must be 'edlib' or 'minimap2'"
+    }
+    if (params.minimap2_args =~ /(^|\s)-[kw]\b/) {
+        // Silently ignored: with a prebuilt .mmi target, minimap2 takes -k/-w from the
+        // index. Putting them here would look like they applied when they did not.
+        error "-k/-w belong in --minimap2_index_args, not --minimap2_args"
+    }
+    if (params.mismapping_method == 'align' && params.align_backend == 'minimap2'
+            && params.sim_read_len) {
+        error "--align_backend minimap2 aligns whole references, so it cannot model " +
+              "--sim_read_len windows; use --align_backend edlib, or --mismapping_method simulate"
     }
 
     if (params.mismapping_matrix) {
@@ -115,6 +130,9 @@ workflow SUPERRESOLUTION_AMPLICON {
                 source: source, mismapping_method: params.mismapping_method,
                 align_tau: params.align_tau,
                 align_ambiguity_weight: params.align_ambiguity_weight,
+                align_backend: params.align_backend,
+                minimap2_args: params.minimap2_args,
+                minimap2_index_args: params.minimap2_index_args,
                 sim_error_model: params.sim_error_model,
                 sim_n_per_ref: params.sim_n_per_ref, sim_read_len: params.sim_read_len,
                 flat_sub_rate: params.flat_sub_rate, flat_ins_rate: params.flat_ins_rate,
@@ -133,7 +151,27 @@ workflow SUPERRESOLUTION_AMPLICON {
     else if (params.mismapping_method == 'align') {
         // One alignment of the reference amplicons against themselves replaces the whole
         // simulate -> cluster -> map -> tally chain.
-        ALIGN_MISMAPPING(ch_matrix_groups.map { meta, d, model -> [ meta, d.resolve('amplicons.fasta') ] })
+        ch_align_refs = ch_matrix_groups.map { meta, d, model -> [ meta, d.resolve('amplicons.fasta') ] }
+        if (params.align_backend == 'minimap2') {
+            // Index once, then align against it — the reference set is the target of its
+            // own all-vs-all, so without this every run re-indexes the whole DB.
+            MINIMAP2_INDEX(ch_align_refs)
+            MINIMAP2_ALLVSALL(ch_align_refs
+                .map { meta, fasta -> [ meta.id, meta, fasta ] }
+                .join(MINIMAP2_INDEX.out.index.map { meta, mmi -> [ meta.id, mmi ] })
+                .map { id, meta, fasta, mmi -> [ meta, fasta, mmi ] })
+            ch_versions = ch_versions.mix(MINIMAP2_INDEX.out.versions)
+                                     .mix(MINIMAP2_ALLVSALL.out.versions)
+            ch_align_in = ch_align_refs
+                .map { meta, fasta -> [ meta.id, meta, fasta ] }
+                .join(MINIMAP2_ALLVSALL.out.paf.map { meta, paf -> [ meta.id, paf ] })
+                .map { id, meta, fasta, paf -> [ meta, fasta, paf ] }
+        }
+        else {
+            ch_align_in = ch_align_refs.map { meta, fasta ->
+                [ meta, fasta, file("${projectDir}/assets/NO_PAF") ] }
+        }
+        ALIGN_MISMAPPING(ch_align_in)
         ch_versions = ch_versions.mix(ALIGN_MISMAPPING.out.versions)
         ch_bundle_in = ALIGN_MISMAPPING.out.mismapping
             .map { meta, matrix -> [ meta.id, meta, matrix ] }

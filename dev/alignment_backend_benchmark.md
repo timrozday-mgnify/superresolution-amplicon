@@ -1,10 +1,11 @@
 # Which all-vs-all alignment backend should build `M`?
 
-**A lossless k-mer filter, keeping edlib as the distance oracle.** It removes 10–12× of
-the work, drops nothing by construction, and adds no dependency. minimap2 (via `mappy`) is
-a further ~3× at n = 8000 and had **recall 1.000** on the real reference set — but it is a
-heuristic, and the exact filter already removes the ceiling for the sets this pipeline
-builds.
+**Both are shipped.** `--align_backend edlib` (default) aligns in-process behind a
+lossless k-mer filter — 10–12× less work, drops nothing by construction, no container.
+`--align_backend minimap2` runs the binary in its biocontainer with an index built once,
+which scales better and is a real mapper's own view of which references look alike. They
+give **identical `M`** on the reference set tested. `mappy` was evaluated and rejected: it
+exposes `-N` but not `-p`, and cannot reach the settings that matter.
 
 Reproduce with `python dev/alignment_backend_benchmark.py` (needs `mappy` for the
 comparison rows). Raw numbers in `alignment_backend_benchmark.csv`.
@@ -22,19 +23,52 @@ operations — naively n² alignments. Two ways to skip most of them.
 | `mappy` (minimap2) | Real minimizer index, `asm5`/`asm10`/`sr`/`map-ont` presets. | **Measured, not shipped.** See below. |
 | plain edlib all-pairs | What was there before. | Kept as the exact path (`max_distance=None`) for the census histogram. |
 
-## minimap2 as a prefilter, on the real 81-amplicon set
+## What minimap2 actually returns, by edit distance
 
-| preset | recall | precision | clusters exactly right | time |
-|---|---|---|---|---|
-| asm5 | **1.000** | 0.901 | 65/81 | 0.018 s |
-| asm10 | **1.000** | 0.833 | 54/81 | 0.015 s |
-| sr | **1.000** | 0.427 | 18/81 | 0.024 s |
-| map-ont | **1.000** | 0.821 | 52/81 | 0.021 s |
+A single recall number here is misleading: 282 of the 6198 true off-diagonal pairs are at
+distance 0, and those are the easy ones. Broken out — true pairs found, per band, on the
+real 81-amplicon set:
 
-Recall 1.000 everywhere, precision 0.43–0.90: minimap2 never missed a true distance-0
-pair but returns extra candidates. That is a **prefilter** profile, not a distance oracle —
-its output would still have to be confirmed by alignment, so it competes with the k-mer
-filter, not with edlib.
+| preset | d=0 | d=1 | d=2-5 | d=6-20 | d=21-60 | d>60 |
+|---|---|---|---|---|---|---|
+| asm5 N=500 | 282/282 | 38/38 | **6/68** | **0/846** | 0/2306 | 0/2940 |
+| asm10 N=500 | 282/282 | 38/38 | 66/68 | **0/846** | 0/2306 | 0/2940 |
+| **sr** N=500 | 282/282 | 38/38 | 68/68 | **822/846** | 54/2306 | 0/2940 |
+| map-ont N=500 | 282/282 | 38/38 | 68/68 | **0/846** | 0/2306 | 0/2940 |
+| asm5 N=5 | 282/282 | 33/38 | 4/68 | 0/846 | 0/2306 | 0/2940 |
+
+**minimap2 is not keeping all alignments, and `-N` is not the binding constraint.** It
+keeps the top `-N` hits *and* drops anything scoring below `-p` (secondary-to-primary
+ratio, default 0.8) of the primary — and `mappy` exposes `-N` but not `-p`. Comparing
+`N=500` with `N=5` shows `-N` binding only slightly (38 vs 33 pairs at d=1); the presets'
+score and chaining thresholds do the rest. `sr` is by far the most permissive and still
+stops around d≈20.
+
+## minimap2 run directly, with the parameters mappy hides
+
+`mappy` cannot set `-p`, so the same measurement was repeated against the minimap2 binary
+in its biocontainer (`quay.io/biocontainers/minimap2`), which is how the pipeline now runs
+it (`--align_backend minimap2`):
+
+| flags | d=0 | d=1 | d=2-5 | d=6-20 | d=21-60 | d>60 |
+|---|---|---|---|---|---|---|
+| `-x asm5 -p 0 -N 1000` | 282/282 | 38/38 | 6/68 | 0/846 | 0/2306 | 0/2940 |
+| `-x sr -p 0 -N 1000` | 282/282 | 38/38 | 68/68 | **846/846** | 372/2306 | 0/2940 |
+| `-x ava-ont -p 0 -N 1000` | 141/282 | 19/38 | 34/68 | 423/846 | 37/2306 | 0/2940 |
+| **no preset, `-k 11 -w 5 -p 0 -N 1000`** | 282/282 | 38/38 | 68/68 | **846/846** | **1658/2306** | **1478/2940** |
+
+**The preset, not `-p`/`-N`, was the binding constraint.** `asm5` is unchanged by
+`-p 0 -N 1000` — it assumes ≤5% divergence and its chaining thresholds discard the rest
+regardless. Dropping the preset and shrinking the minimizers (`-k 11 -w 5`) recovers
+everything out to d=20 and most of d=21-60. Even so it is not complete: at >24% divergence
+there are too few shared minimizers to seed a chain, and 1478/2940 of the d>60 pairs come
+back. Those are not plausible mis-mapping targets anyway.
+
+Those flags are the shipped defaults for `--align_backend minimap2`, and the resulting `M`
+is **identical to edlib's** on the real reference set. The index is built once
+(`MINIMAP2_INDEX`, mirroring `MAPSEQ_CLUSTER`) so a large reference DB is not re-indexed
+on every all-vs-all pass; `-k`/`-w` live in the `.mmi` and are rejected in
+`--minimap2_args`, because minimap2 silently ignores them there.
 
 ## Cost against reference-set size
 
@@ -56,15 +90,16 @@ makes the problem hard.
    duplicate-heavy, so most references genuinely *have* many neighbours and the candidate
    lists stay long. The filter removes the constant, not the exponent.
 3. **minimap2 is ~3× better again at n = 8000** and would scale further. It is the
-   documented upgrade path, not the default: it is heuristic (recall 1.000 is a
-   measurement on one reference set, not a guarantee), it adds a dependency, and the
-   reference sets this pipeline builds are per-sample genome collections — 81 amplicons
-   here, where the whole operation is 0.01 s.
-4. **This changes cost, not accuracy.** None of the known limitations in
-   [the plan](../docs/alignment_mismapping_plan.md) are addressed by it. One tension worth
-   recording: the bound deliberately discards distances beyond `tau`, while a future
-   soft-tail kernel (plan rung 3, the fix for the under-dispersion bias) would need
-   exactly those distances. They pull in opposite directions.
+   documented upgrade path, not the default: it is heuristic (finding every d=0/d=1 pair
+   is a measurement on one reference set, not a guarantee), it adds a dependency, it
+   cannot return the tail from Python, and the reference sets this pipeline builds are
+   per-sample genome collections — 81 amplicons here, where the whole operation is 0.01 s.
+4. **This changes cost, not accuracy** — and the tail it could have supplied turns out
+   not to help. Having the full distance matrix is not the missing ingredient for the
+   under-dispersion bias; see
+   [the tail experiment](alignment_mismapping.md#does-a-low-identity-tail-help). One
+   mechanical note: `build()` bounds distances at `max(tau, 5)`, so a kernel that ever
+   does want the tail must ask for `pairwise_distances(..., max_distance=None)`.
 
 ## What this does not show
 

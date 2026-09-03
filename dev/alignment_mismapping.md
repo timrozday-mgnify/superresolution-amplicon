@@ -180,6 +180,46 @@ a ~0.58 floor. On a DB where a meaningful fraction of references carry ambiguity
 and `simulate` genuinely disagree: use `simulate`, or drop/repair the ambiguous
 references.
 
+## Does a low-identity tail help?
+
+The tie cluster puts *exactly zero* mass on a reference a few bases away, and step 3 found
+that to be its one measurable weakness (support Jaccard 0.588 against a floor of 0.737).
+The obvious fix is to give it a tail. With full distances available — the k-mer filter
+supplies them by raising its bound — that is directly testable.
+
+First, what the measurement's tail actually looks like: **0.0135 mass per row, 198 entries
+above 1e-3 out of 6198 possible off-cluster pairs**, at median distance 10 (90th percentile
+17, max 52). Sparse and mid-range, not a smooth decay.
+
+| kernel | ‖·−M_sim‖_F | mean diag | support J | ρ off-diag |
+|---|---|---|---|---|
+| reseed *(floor)* | 0.593 | 0.3082 | 0.737 | 0.852 |
+| tie cluster tau=0 | **0.462** | 0.3086 | 0.588 | 0.778 |
+| softmax `exp(-2.0 d)` | 0.872 | 0.2885 | 0.658 | 0.443 |
+| softmax `exp(-0.5 d)` | 1.847 | 0.2514 | 0.694 | 0.442 |
+| tie + 0.02 mass over d≤5 | **0.455** | 0.3069 | **0.702** | **0.834** |
+| tie + 0.02 mass over d≤20 | 0.454 | 0.3050 | 0.569 | 0.622 |
+| tie + 0.20 mass over d≤5 | 0.638 | 0.2914 | 0.702 | 0.834 |
+
+1. **A smooth exponential tail is the wrong shape.** Every β makes `‖·‖_F` worse, and ρ
+   collapses to 0.44 — softmax orders all 6000 off-diagonal pairs by distance when the
+   truth is that ~97% of them are exactly zero.
+2. **A small, tightly truncated tail does help** on the metrics that flagged the problem:
+   support Jaccard 0.588 → 0.702 and ρ 0.778 → 0.834, most of the way to the floor's
+   0.737 / 0.852. The `‖·‖_F` gain (0.462 → 0.455) is within run-to-run noise.
+3. **But it does not survive being checked against a different measurement.** Against
+   `M_sim` built from the *trained* error model, the plain tie cluster scores support
+   Jaccard **0.966** and ρ **0.983** — nearly perfect — and adding the tail drops it to
+   0.730 / 0.859. Against the flat-0.005 reseed it helps (0.583 → 0.658); at read-len 150
+   it hurts slightly (0.695 → 0.684).
+
+**So the tail was not shipped**, and step 3's "missing tail" limitation is now better
+understood: it is not a fixed property of the kernel but a property of *which error model
+built the reference measurement*. A flat 0.5% substitution rate scatters more reads onto
+distant references than the trained model does, so it has a fatter tail for the kernel to
+miss. Fitting a tail means fitting the simulator's error rate — the exact thing the
+alignment method exists to avoid.
+
 ## What this does not show
 
 One reference set, and the easiest kind: 73 of its 81 references are exact duplicates.

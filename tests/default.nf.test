@@ -93,6 +93,29 @@ nextflow_pipeline {
         }
     }
 
+    test("minimap2 backend indexes once, then aligns - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input             = "${projectDir}/assets/samplesheet.example.yml"
+                outdir            = "$outputDir"
+                mismapping_method = "align"
+                align_backend     = "minimap2"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                // + MINIMAP2_INDEX + MINIMAP2_ALLVSALL on top of the align flow's 8.
+                { assert workflow.trace.succeeded().size() == 10 },
+                { assert workflow.trace.tasks().any { it.name.contains('MINIMAP2_INDEX') } },
+                { assert workflow.trace.tasks().any { it.name.contains('MINIMAP2_ALLVSALL') } },
+                { assert workflow.trace.tasks().every { !it.name.contains('SIMULATE') } }
+            )
+        }
+    }
+
     test("pre-computed mis-mapping matrix skips its simulation flow - stub") {
         tag "stub"
         options "-stub"

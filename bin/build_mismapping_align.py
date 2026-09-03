@@ -124,6 +124,48 @@ def _kmer_candidates(seqs: list[str], max_distance: int, k: int = KMER_SIZE
     return out
 
 
+def paf_distances(paf: Path, refseqs: list[str], sentinel: int) -> np.ndarray:
+    """Distance matrix from a minimap2 all-vs-all PAF (run with ``-c``, so ``NM`` is set).
+
+    ``NM`` is the edit distance *within* the aligned block, so whatever minimap2 left
+    unaligned at either end is added back: an alignment covering half the query is not a
+    close match however clean its aligned half is. The smallest value over a pair's
+    alignments wins. Pairs minimap2 never reports get ``sentinel`` — "further than this
+    backend can see", not "infinitely far".
+
+    Treat the result as data, not truth: minimap2 is a heuristic whose recall falls off
+    with divergence, and which preset you ran matters more than ``-p``/``-N``
+    (dev/alignment_backend_benchmark.md). It finds every identical and one-base-apart pair
+    on the reference set tested, which is what the tie-cluster kernel needs; the far tail
+    is where it stops being complete.
+    """
+    idx = {r: i for i, r in enumerate(refseqs)}
+    n = len(refseqs)
+    d = np.full((n, n), sentinel, dtype=np.int32)
+    np.fill_diagonal(d, 0)
+    unknown = 0
+    with open(paf) as fh:
+        for line in fh:
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 12:
+                continue
+            i, j = idx.get(f[0]), idx.get(f[5])
+            if i is None or j is None:
+                unknown += 1
+                continue
+            nm = next((int(t.split(":")[2]) for t in f[12:] if t.startswith("NM:i:")), None)
+            if nm is None:
+                continue
+            dist = (nm + (int(f[1]) - (int(f[3]) - int(f[2])))
+                    + (int(f[6]) - (int(f[8]) - int(f[7]))))
+            dist = min(dist, sentinel)
+            if dist < d[i, j]:
+                d[i, j] = d[j, i] = dist
+    if unknown:
+        log.warning("%d PAF rows referenced an unknown sequence id", unknown)
+    return d
+
+
 def pairwise_distances(seqs: list[str], max_distance: int | None = None) -> np.ndarray:
     """Symmetric all-pairs global (Needleman-Wunsch) edit distance, via edlib.
 
@@ -248,7 +290,7 @@ def windowed_matrix(seqs: list[str], read_len: int, tau: int = 0,
 
 
 def build(amplicons: Path, tau: int = 0, read_len: int | None = None,
-          stride: int = 1, ambiguity_weight: float = 1.0
+          stride: int = 1, ambiguity_weight: float = 1.0, paf: Path | None = None
           ) -> tuple[pd.DataFrame, np.ndarray]:
     """``M`` as a labelled frame, indexed and columned by the amplicon fasta headers.
 
@@ -264,10 +306,17 @@ def build(amplicons: Path, tau: int = 0, read_len: int | None = None,
     seqs = [s for _, s in records]
     # Bounded a little past tau so the printed nearest-neighbour histogram still shows the
     # near-misses that say whether tau=0 is safe for this reference set.
-    d = pairwise_distances(seqs, max_distance=max(tau, SUMMARY_DISTANCE))
+    bound = max(tau, SUMMARY_DISTANCE)
+    d = (paf_distances(paf, refseqs, bound + 1) if paf is not None
+         else pairwise_distances(seqs, max_distance=bound))
     w = ambiguity_weights(seqs, ambiguity_weight)
-    M = (tie_cluster_matrix(d, tau, w) if read_len is None
-         else windowed_matrix(seqs, read_len, tau, stride, w))
+    if read_len is not None:
+        if paf is not None:
+            raise SystemExit("--paf gives whole-sequence alignments; it cannot model "
+                             "--read-len windows. Drop one of them.")
+        M = windowed_matrix(seqs, read_len, tau, stride, w)
+    else:
+        M = tie_cluster_matrix(d, tau, w)
     return pd.DataFrame(M, index=refseqs, columns=refseqs), d
 
 
@@ -408,6 +457,9 @@ def main() -> None:
     ap.add_argument("--read-len", type=int, default=None,
                     help="reads are this long, i.e. shorter than the amplicon (unmerged / "
                          "short reads). Default: reads span the whole amplicon.")
+    ap.add_argument("--paf", type=Path, default=None,
+                    help="minimap2 all-vs-all PAF (produced with -c, so NM is present) to "
+                         "take distances from, instead of aligning with edlib here")
     ap.add_argument("--window-stride", type=int, default=1,
                     help="--read-len: sample every Nth read window (default 1: all)")
     ap.add_argument("--ambiguity-weight", type=float, default=DEFAULT_AMBIGUITY_WEIGHT,
@@ -430,7 +482,8 @@ def main() -> None:
         ap.error("--read-len must be positive")
     if not 0.0 <= a.ambiguity_weight <= 1.0:
         ap.error("--ambiguity-weight must be in [0, 1]")
-    M, d = build(a.amplicons, a.tau, a.read_len, a.window_stride, a.ambiguity_weight)
+    M, d = build(a.amplicons, a.tau, a.read_len, a.window_stride,
+                 a.ambiguity_weight, a.paf)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     M.to_csv(a.output)
     summarise(M, d)

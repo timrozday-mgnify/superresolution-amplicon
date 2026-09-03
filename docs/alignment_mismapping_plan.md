@@ -36,10 +36,13 @@ in [the error-rate study](../dev/error_rate_sensitivity.md) (mean diagonal ≈0.
 
 **Library: `edlib`** (Myers bit-parallel edit distance, global/`NW` mode), behind a
 **lossless k-mer prefilter** (q-gram lemma) with edlib's own `k=` early exit — 10-12x
-faster, byte-identical `M`. minimap2 via `mappy` was measured as an alternative prefilter
-(recall 1.000, ~3x faster again at n = 8000) and documented as the upgrade path rather
-than shipped, being heuristic and unnecessary at this scale:
-[backend benchmark](../dev/alignment_backend_benchmark.md). Chosen over
+faster, byte-identical `M`. **minimap2 also ships** as `--align_backend minimap2`: run as
+the binary in its biocontainer, not through `mappy`, which exposes `-N` but not `-p` and
+cannot reach the settings that matter. Its index is built once (`MINIMAP2_INDEX`) so large
+reference DBs are not re-indexed per run, and it produces an identical `M` here.
+Which preset is used matters more than `-p`/`-N`: `-x asm5` returns nothing past d=5 even
+with `-p 0 -N 1000`, while no preset with `-k 11 -w 5` reaches d=60
+([backend benchmark](../dev/alignment_backend_benchmark.md)). Chosen over
 `parasail` (SIMD affine-gap, `_stats_` identity), Biopython's `PairwiseAligner` (kept as a
 slow oracle), `pyopal`, and `mappy` (minimap2 — the fallback had no alignment kernel
 worked). With a 2-base amplicon length spread and 90% zero distances, nothing edlib
@@ -85,6 +88,17 @@ Support Jaccard 0.584 and off-diagonal ρ 0.776 are the two metrics where alignm
 *below* the reseed floor's own values (0.726 / 0.844) — it lands where the genuinely
 different *trained* error model lands (0.594 / 0.781). A hard tie cluster puts **exactly
 zero** mass on a reference 10 bases away; mapseq occasionally puts a little there.
+
+**Update — this is a property of the reference measurement, not only of the kernel.**
+Given full distances (the k-mer filter supplies them on request), a tail *was* built and
+tested: a smooth exponential one is the wrong shape (worse on every metric), while a
+small, tightly truncated one recovers most of the support-Jaccard gap against the
+flat-0.005 `M_sim`. It was **not shipped**, because against the *trained* error model's
+`M_sim` the plain tie cluster already scores support Jaccard 0.966 and ρ 0.983, and the
+tail makes it worse. A flat 0.5% substitution rate simply scatters more reads onto distant
+references than a trained model does. Fitting a tail means fitting the simulator's error
+rate — the thing this method exists to avoid.
+[The experiment](../dev/alignment_mismapping.md#does-a-low-identity-tail-help).
 
 The bias has a direction: **`M_align` is over-confident / under-dispersed.** Isolated
 references get an exact identity row, i.e. a claim of *zero* confusion where the

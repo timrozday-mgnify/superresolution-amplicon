@@ -10,8 +10,11 @@ two sequences within ``e`` edits share at least ``L-k+1-k*e``. Anything sharing 
 needs no alignment at all, and the survivors are aligned with edlib's ``k=`` bound so it
 gives up early. Provably drops nothing.
 
-**minimap2 via ``mappy``** — a real minimizer index. Heuristic, so this measures whether
-it actually finds every true distance-0 pair, and what it costs.
+**minimap2 via ``mappy``** — a real minimizer index. Heuristic, so this measures which
+true neighbours it actually returns, *broken down by edit distance*: an overall recall
+number would be dominated by the identical pairs, which are the easy ones. minimap2 keeps
+the top ``-N`` hits and additionally drops anything below ``-p`` (0.8) of the primary's
+score; mappy exposes the first and not the second.
 
 Reference sets larger than the pipeline builds are synthesised from the real amplicons in
 the same duplicate-heavy shape, since that is what makes the problem hard.
@@ -41,6 +44,8 @@ import error_rate_sensitivity as ers  # noqa: E402
 SIZES = (500, 2000, 8000)
 NAIVE_LIMIT = 2000          # above this the n^2 baseline is projected, not run
 PRESETS = ("asm5", "asm10", "sr", "map-ont")
+# Edit-distance bands for the recall breakdown.
+BANDS = ((0, 0), (1, 1), (2, 5), (6, 20), (21, 60), (61, 300))
 
 
 def synthesise(seqs: list[str], n: int, rng) -> list[str]:
@@ -56,8 +61,14 @@ def synthesise(seqs: list[str], n: int, rng) -> list[str]:
     return out[:n]
 
 
-def mappy_clusters(seqs: list[str], preset: str, work: Path):
-    """minimap2's candidate neighbours per sequence, and what it cost."""
+def mappy_clusters(seqs: list[str], preset: str, work: Path, best_n: int = 500):
+    """minimap2's candidate neighbours per sequence, and what it cost.
+
+    ``best_n`` is minimap2's ``-N``. Note it is *not* the only filter: ``-p`` (the
+    secondary-to-primary score ratio, default 0.8) drops low-scoring hits whatever ``-N``
+    says, and mappy does not expose it — which is why the recall below is reported per
+    distance band rather than as one number.
+    """
     import mappy
 
     fa = work / f"{preset}.fasta"
@@ -65,7 +76,7 @@ def mappy_clusters(seqs: list[str], preset: str, work: Path):
         for i, s in enumerate(seqs):
             fh.write(f">r{i}\n{s}\n")
     t = time.perf_counter()
-    al = mappy.Aligner(str(fa), preset=preset, best_n=500)
+    al = mappy.Aligner(str(fa), preset=preset, best_n=best_n)
     got = [{int(h.ctg[1:]) for h in al.map(s)} | {i} for i, s in enumerate(seqs)]
     return got, time.perf_counter() - t
 
@@ -89,18 +100,24 @@ def main() -> None:
         exact = bma.pairwise_distances(real)
         truth = [set(np.flatnonzero(exact[i] == 0)) for i in range(len(real))]
         rows = []
-        for preset in PRESETS:
-            got, secs = mappy_clusters(real, preset, work)
-            rows.append({
-                "test": "mappy recall (real 81-ref set)", "backend": f"mappy {preset}",
-                "n": len(real), "seconds": secs,
-                "recall": float(np.mean([len(g & t) / len(t) for g, t in zip(got, truth)])),
-                "precision": float(np.mean([len(g & t) / len(g) for g, t in zip(got, truth)])),
-                "exact_clusters": int(sum(g == t for g, t in zip(got, truth))),
-            })
-            print(f"  {preset:8s} recall {rows[-1]['recall']:.3f} "
-                  f"precision {rows[-1]['precision']:.3f} "
-                  f"exact {rows[-1]['exact_clusters']}/{len(real)}  {secs:.3f}s")
+        print("  recall per edit-distance band (a whole-matrix 'recall' would only ever "
+              "measure the d=0 pairs, which are the easy ones):")
+        print("  " + " ".join(f"{lo if lo == hi else f'{lo}-{hi}':>9}" for lo, hi in BANDS))
+        for preset, best_n in [(p, 500) for p in PRESETS] + [("asm5", 5)]:
+            got, secs = mappy_clusters(real, preset, work, best_n)
+            cells = []
+            for lo, hi in BANDS:
+                mask = (exact >= lo) & (exact <= hi)
+                np.fill_diagonal(mask, False)
+                total = int(mask.sum())
+                found = sum(1 for i in range(len(real))
+                            for j in np.flatnonzero(mask[i]) if j in got[i])
+                cells.append(f"{found}/{total}" if total else "-")
+                rows.append({"test": "mappy recall by distance",
+                             "backend": f"mappy {preset} N={best_n}",
+                             "band": f"{lo}-{hi}", "found": found, "total": total,
+                             "seconds": secs})
+            print(f"  {preset} N={best_n}: " + " ".join(f"{c:>9}" for c in cells))
 
         # 2. Losslessness of the shipped filter, then cost against n.
         for md in (0, 1, 5):

@@ -13,7 +13,7 @@ process ALIGN_MISMAPPING {
     container "ghcr.io/timrozday-mgnify/sra-skiver:${params.sra_skiver_tag}"
 
     input:
-    tuple val(meta), path(amplicons)
+    tuple val(meta), path(amplicons), path(paf)
 
     output:
     tuple val(meta), path("${meta.id}.mismapping_matrix.csv"), emit: mismapping
@@ -25,9 +25,11 @@ process ALIGN_MISMAPPING {
     script:
     def args = task.ext.args ?: ''
     def prefix = task.ext.prefix ?: "${meta.id}"
+    def paf_arg = paf.name == 'NO_PAF' ? '' : "--paf ${paf}"
     """
     build_mismapping_align.py \\
         --amplicons ${amplicons} \\
+        ${paf_arg} \\
         -o ${prefix}.mismapping_matrix.csv \\
         $args
 
