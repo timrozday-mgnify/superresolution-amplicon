@@ -33,14 +33,6 @@ workflow SUPERRESOLUTION_AMPLICON {
     if (!(params.mismapping_method in ['simulate', 'align'])) {
         error "--mismapping_method must be 'simulate' or 'align'"
     }
-    if (params.mismapping_method == 'align' && params.sim_read_len) {
-        // The alignment kernel compares whole amplicons. Reads shorter than the amplicon
-        // see only a window of it, so references differing *outside* that window are
-        // indistinguishable to the mapper and M_align understates the confusion. The
-        // simulate path models this; alignment cannot. See docs/alignment_mismapping_plan.md.
-        log.warn "--sim_read_len is ignored by --mismapping_method align: M is built from " +
-                 "whole-amplicon distances and will understate confusion for short/unmerged reads."
-    }
 
     if (params.mismapping_matrix) {
         ch_model = ch_reads.map { meta, reads -> [ meta.id, file(params.mismapping_matrix, checkIfExists: true), 'supplied' ] }

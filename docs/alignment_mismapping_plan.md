@@ -11,7 +11,7 @@ and biases" says when they become necessary again.
 | | |
 |---|---|
 | **Goal** | Replace *simulate reads → run mapseq → tally* with *align the reference amplicons to each other → derive `M`*, so the mis-mapping stage is one Python command with no container, no mapper and no simulation. |
-| **Outcome** | `‖M_align − M_sim‖_F = 0.43` against a seed-to-seed noise floor of `0.59`; downstream composition at least as good under both generators; **460×** cheaper (0.011 s vs 5.2 s). |
+| **Outcome** | `‖M_align − M_sim‖_F = 0.43` against a seed-to-seed noise floor of `0.59`; downstream composition at least as good under both generators; **460×** cheaper (0.011 s vs 5.2 s) for whole-amplicon reads, **2×** for short reads (§7). |
 | **Shipped as** | `--mismapping_method align` (+ `--align_tau`, default 0). Default remains `simulate`. |
 | **Evidence** | [census](../dev/amplicon_distance_census.md) (step 1), [equivalence study](../dev/alignment_mismapping.md) (step 3) |
 
@@ -43,7 +43,7 @@ knob-bearing options were never needed. **This is a property of the data, not of
 a set with real length variation would need `parasail` or `HW` (infix) mode.
 
 **Kernel: rung 1, the tie cluster.** `M[a,j] = 1/|{k : d(a,k) ≤ τ}|`, zero free
-parameters. Rungs 2–4 of the original ladder (tolerance τ, softmax β, and a binomial
+parameters — averaged over read windows when reads are shorter than the amplicon (§7). Rungs 2–4 of the original ladder (tolerance τ, softmax β, and a binomial
 "who wins under `e` errors" race) were **not built**. τ > 0 was tested and failed
 decisively — `‖·‖_F` jumps from 0.43 to 2.10, TV max from 0.09 to 0.82 — so there was
 nothing to fit and the fit/validate split (§5.4 of the original plan) never applied.
@@ -135,14 +135,37 @@ merge or split abruptly; simulation degrades smoothly instead. Two specific trap
 - **Amplicon extraction.** 16 of 97 DB entries produced no amplicon and are excluded from
   both methods. That bound is unchanged by this work but caps it.
 
-### 7. Short and unmerged reads are silently unsupported
+### 7. Short and unmerged reads — ~~unsupported~~ **fixed**, with a smaller cost case
 
-The kernel compares **whole amplicons**. A read shorter than the amplicon sees only a
-window, so references differing *outside* that window are indistinguishable to the mapper
-— confusion the alignment kernel cannot see and therefore understates. `--sim_read_len`
-models this on the simulate path and is meaningless on the align path; the workflow now
-logs a warning when both are set, but there is no correct behaviour to fall back to. For
-unmerged/short-read data, use `--mismapping_method simulate`.
+*Was:* the kernel compared whole amplicons, so a read shorter than the amplicon — which
+sees only a window, and cannot distinguish references differing *outside* it — got an `M`
+that understated confusion, silently.
+
+*Now:* `--read-len` (wired from `--sim_read_len`, which both methods honour) scores every
+length-`L` window of the source reference against every reference by *infix* alignment
+(edlib `HW`: the best placement of the read anywhere in the reference, which is the
+question a mapper asks) and averages the tie clusters over windows. It collapses back to
+the whole-amplicon kernel when reads span the amplicon.
+
+Verified by re-running the equivalence study at `L = 150`: the windowed kernel scores
+`‖·‖_F = 0.432` against a 0.609 floor (systematic part **0.040**), while the old
+whole-amplicon kernel scores **0.912 — above the floor, i.e. a real failure**, with its
+diagonal stuck at 0.3086 where the measurement drops to 0.2844. The bias was exactly the
+predicted direction and size. Windowing also repairs §2's missing tail at this read length
+(support Jaccard 0.701 vs 0.610, ρ 0.846 vs 0.792 — at or above the reseed's own).
+
+Residual limitations:
+
+- **The cost argument mostly evaporates for short reads.** `n_refs² × n_windows` infix
+  alignments: 1.96 s vs 4.8 s, a 2× saving rather than 460×. Simplicity (no mapper, no
+  container, no error model) remains; speed does not. `--window-stride` subsamples the
+  highly-redundant windows if a much larger reference set needs it, and is untested beyond
+  the demo's sanity check.
+- **One read length, one set.** `L = 150` only.
+- **Paired reads are not modelled as pairs.** A uniform random window is not R1+R2 from
+  opposite ends of the fragment. Both methods share this assumption — `draw_fragment` on
+  the simulate path does the same thing — so it is inherited, not introduced, but it means
+  neither `M` is right for genuinely unmerged paired data.
 
 ### 8. High-error long reads are outside the tested regime
 
@@ -169,4 +192,4 @@ at three decimal places.
    binding constraint: rung 3's `M[a,j] ∝ exp(−β·d)` with a large β is a tie cluster with
    a tail, at the cost of one fitted knob and the fit/validate split that avoids.
 4. **Ambiguity handling** (§6) — one `additionalEqualities` argument, worth adding the
-   first time a DB with `N`s appears rather than pre-emptively.
+   first time a DB with `N`s appears rather than pre-emptively. **Still open.**

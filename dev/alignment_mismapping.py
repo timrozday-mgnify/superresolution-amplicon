@@ -83,6 +83,8 @@ def main() -> None:
     ap.add_argument("--db", type=Path, default=ers.DEFAULT_DB)
     ap.add_argument("--work", type=Path, default=_REPO / "dev" / "_alignment_work")
     ap.add_argument("--out", type=Path, default=_REPO / "dev" / "alignment_mismapping.csv")
+    ap.add_argument("--read-len", type=int, default=None,
+                    help="reads are this long (unmerged/short); default: whole amplicon")
     ap.add_argument("--keep", action="store_true")
     a = ap.parse_args()
 
@@ -113,23 +115,31 @@ def main() -> None:
 
     # ── the measurement, and its own precision ───────────────────────────────
     t0 = time.perf_counter()
-    M_sim = ers.build_M(SIM_RATE, refseqs, amps, work, fasta, tax, seed=1)
+    M_sim = ers.build_M(SIM_RATE, refseqs, amps, work, fasta, tax, seed=1,
+                        read_len=a.read_len)
     t_sim = time.perf_counter() - t0
     Ms = {
         f"reseed (flat {SIM_RATE}, seed 99)":
             ers.build_M(SIM_RATE, refseqs, amps, work, fasta, tax, seed=99,
-                        tag=f"{SIM_RATE}_reseed"),
+                        tag=f"{SIM_RATE}_reseed", read_len=a.read_len),
         "trained error model":
-            ers.build_M("trained", refseqs, amps, work, fasta, tax, seed=1),
+            ers.build_M("trained", refseqs, amps, work, fasta, tax, seed=1,
+                        read_len=a.read_len),
     }
 
     # ── the candidates ───────────────────────────────────────────────────────
     t0 = time.perf_counter()
     d = bma.pairwise_distances(amps)
-    Ms["alignment tau=0"] = bma.tie_cluster_matrix(d, 0)
+    Ms["alignment tau=0"] = (bma.tie_cluster_matrix(d, 0) if a.read_len is None
+                             else bma.windowed_matrix(amps, a.read_len, 0))
     t_align = time.perf_counter() - t0
     for tau in TAUS[1:]:
-        Ms[f"alignment tau={tau}"] = bma.tie_cluster_matrix(d, tau)
+        Ms[f"alignment tau={tau}"] = (bma.tie_cluster_matrix(d, tau) if a.read_len is None
+                                      else bma.windowed_matrix(amps, a.read_len, tau))
+    if a.read_len is not None:
+        # The whole-amplicon kernel is the *bug* this run exists to check: it is what the
+        # estimator produced before --read-len, and it should now be visibly worse.
+        Ms["alignment tau=0 (whole-amplicon)"] = bma.tie_cluster_matrix(d, 0)
 
     # Negative control: the same kernel on shuffled distances. Must fail everything.
     rng = np.random.default_rng(0)
@@ -163,7 +173,8 @@ def main() -> None:
     # ── downstream: does the composition change? ─────────────────────────────
     rows = []
     for gen in ["trained", "0.01"]:
-        ref_rel = ers.build_observed(gen, refseqs, amps, r_true, work, fasta, tax, seed=2)
+        ref_rel = ers.build_observed(gen, refseqs, amps, r_true, work, fasta, tax, seed=2,
+                                     read_len=a.read_len)
         theta_obs, _ = ers.fit(np.eye(len(refseqs)), T, genomes, ref_rel, ers.N_OBS_READS,
                                use_mismapping=False)
         rows.append(dict(generator=gen, candidate="(none: naive observed)",
@@ -182,6 +193,7 @@ def main() -> None:
             print(f"  fit gen={gen:8s} cand={name:34s} L1={rows[-1]['l1']:.4f}")
 
     df = pd.DataFrame(rows)
+    df["read_len"] = a.read_len if a.read_len is not None else 0
     df["noise_floor_frobenius"] = floor
     df["seconds_simulate_map"] = t_sim
     df["seconds_alignment"] = t_align

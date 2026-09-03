@@ -174,9 +174,11 @@ Mis-mapping — how `M` is built:
 | `--mismapping_method` | `simulate` | `simulate` (sample errored reads from every reference and map them with the same mapper the real reads go through — `M` is *measured*) or `align` (align the reference amplicons to each other and read `M` off the distances — no simulation, no mapper, no error model). |
 | `--align_tau` | `0` | `align` only: cluster references within this edit distance. `0` (exact duplicate amplicons) beat every larger value tested; `tau > 0` was decisively worse, not softer. |
 
-The `simulate` settings below (everything except `--mismapping_matrix`) are ignored under
-`--mismapping_method align`, including `--sim_error_model trained` — nothing simulates
-reads, so nothing needs an error model and the skiver subworkflow never runs.
+| `--sim_read_len` | – | Reads are this long, i.e. shorter than the amplicon (unmerged / short reads). **Honoured by both methods.** Unset = reads span the whole amplicon, correct for merged reads. |
+
+The remaining `simulate` settings below (everything except `--mismapping_matrix`) are
+ignored under `--mismapping_method align`, including `--sim_error_model trained` — nothing
+simulates reads, so nothing needs an error model and the skiver subworkflow never runs.
 
 | param | default | description |
 |-------|---------|-------------|
@@ -187,7 +189,6 @@ reads, so nothing needs an error model and the skiver subworkflow never runs.
 | `--flat_ins_rate` | `0.0005` | Flat model: per-base insertion probability. |
 | `--flat_del_rate` | `0.0005` | Flat model: per-base deletion probability. |
 | `--sim_n_per_ref` | `500` | Simulated reads per reference (sampling depth for `M`). |
-| `--sim_read_len` | – | Draw substrings of this length; unset simulates the whole amplicon (correct for merged reads). |
 | `--mismapping_matrix` | – | A previously generated `mismapping_matrix.csv` for the same amplicon reference set. Skips read simulation and simulated-read mapseq; the CSV is checked against the current reference IDs before inference. |
 
 The pipeline fingerprints extracted amplicons and builds each compatible matrix once

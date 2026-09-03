@@ -89,6 +89,45 @@ construction.
    path also removes: the `mapseq -mscluster` build, the container pull, and — under
    `--sim_error_model trained` — the entire skiver training subworkflow.
 
+## Short and unmerged reads (`--read-len`)
+
+The kernel above compares whole amplicons, which is wrong as soon as a read is shorter
+than one: the read sees a window, and references differing *outside* that window are
+indistinguishable to the mapper. `build_mismapping_align.py --read-len L` instead scores
+every length-`L` window of the source reference against every reference by *infix*
+alignment (edlib `HW` — the best placement of the read anywhere in the reference) and
+averages the tie clusters over windows. Re-running the whole study at `L = 150`
+(`python dev/alignment_mismapping.py --read-len 150`, raw numbers in
+`alignment_mismapping_readlen150.csv`):
+
+| candidate | ‖·−M_sim‖_F | beyond one run's noise | mean diag | TV med / max | support J | ρ off-diag |
+|---|---|---|---|---|---|---|
+| reseed (seed 99) | **0.609** *(the floor)* | 0.430 | 0.2844 | 0.067 / 0.143 | 0.695 | 0.826 |
+| trained error model | 0.663 | 0.504 | 0.2869 | 0.070 / 0.147 | 0.704 | 0.848 |
+| **alignment tau=0, windowed** | **0.432** | **0.040** | 0.2885 | **0.045 / 0.087** | 0.701 | 0.846 |
+| alignment tau=0, *whole-amplicon* | 0.912 | 0.804 | 0.3086 | 0.053 / 0.360 | 0.610 | 0.792 |
+
+1. **The windowed kernel passes and the whole-amplicon one fails.** 0.432 against a 0.609
+   floor, versus 0.912 — the pre-fix estimator is the only non-control candidate here that
+   lands *above* the noise floor. Its error is systematic (0.804), not sampling.
+2. **The bias was in the predicted direction.** The whole-amplicon matrix holds its
+   diagonal at 0.3086 while the measurement drops to 0.2844: at 150bp reads there is
+   genuinely *more* confusion, and a whole-amplicon distance cannot see it. TV max 0.360
+   says a few rows are badly wrong rather than everything being slightly off.
+3. **Windowing also fixes the low-identity tail complaint.** Support Jaccard rises to
+   0.701 and ρ to 0.846 — at or above the reseed's own 0.695 / 0.826, where the
+   whole-amplicon kernel sat at 0.610 / 0.792. 104 overlapping windows generate the
+   near-ties a single global comparison has no way to produce.
+4. **The cost argument mostly evaporates.** 1.96 s vs 4.8 s — 2×, not 460×. The windowed
+   kernel is `n_refs² × n_windows` infix alignments. It is still simpler (no mapper, no
+   container, no error model), but speed stops being the reason to choose it.
+5. **Everything is harder at 150bp**, as it should be: naive-observed L1 rises to
+   0.026–0.031 from 0.022–0.028. Downstream, windowed alignment is again indistinguishable
+   from simulate+map (0.0199 / 0.0299 vs 0.0256 / 0.0294) — and note the *whole-amplicon*
+   matrix posted the best L1 of all under one generator (0.0234) while being demonstrably
+   the wrong matrix. That is §4 of the reading above, in one line: the downstream test
+   cannot rank candidates.
+
 ## What this does not show
 
 One reference set, and the easiest kind: 73 of its 81 references are exact duplicates.
