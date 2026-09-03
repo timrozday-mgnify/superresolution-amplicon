@@ -47,12 +47,13 @@ ENV SKIVER_NOTEBOOKS=/opt/skiver/notebooks
 COPY vendor/skiver/notebooks/context_error_model_*.qmd vendor/skiver/notebooks/_context_error_model_body.qmd ${SKIVER_NOTEBOOKS}/
 
 # CPU-only torch keeps the image lean. pyro drives inference and the error-model
-# sampler; plotly/ipykernel/papermill render the Quarto error-model report. The
+# sampler; edlib is the alignment kernel behind build_mismapping_align.py;
+# plotly/ipykernel/papermill render the Quarto error-model report. The
 # pipeline's own bin/ scripts are staged onto PATH by Nextflow, so they are not baked in
 # here.
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
     && pip install --no-cache-dir \
-        numpy scipy pandas h5py pyyaml matplotlib rich "pyro-ppl>=1.9" \
+        numpy scipy pandas h5py pyyaml matplotlib rich "pyro-ppl>=1.9" edlib \
         plotly ipykernel jupyter papermill \
     && python -m ipykernel install --name skiver --sys-prefix
 

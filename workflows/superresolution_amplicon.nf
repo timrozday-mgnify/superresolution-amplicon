@@ -1,7 +1,8 @@
 //
-// superresolution-amplicon: extract the reference amplicons, measure reference-to-
-// reference mis-mapping by simulating reads and mapping them with the same mapper the
-// real reads go through (mapseq), and infer the true genome composition.
+// superresolution-amplicon: extract the reference amplicons, establish reference-to-
+// reference mis-mapping — by simulating reads and mapping them with the same mapper the
+// real reads go through (mapseq), or by aligning the reference amplicons to each other
+// (params.mismapping_method) — and infer the true genome composition.
 //
 include { TRAIN_ERROR_MODEL    } from '../subworkflows/local/train_error_model/main'
 include { EXTRACT_AMPLICONS    } from '../modules/local/extract_amplicons/main'
@@ -11,6 +12,7 @@ include { MAPSEQ as MAPSEQ_SIM } from '../modules/local/mapseq/map/main'
 include { MAPSEQ as MAPSEQ_OBS } from '../modules/local/mapseq/map/main'
 include { SIMULATE_READS       } from '../modules/local/simulate_reads/main'
 include { BUILD_MISMAPPING     } from '../modules/local/build_mismapping/main'
+include { ALIGN_MISMAPPING     } from '../modules/local/align_mismapping/main'
 include { MATRIX_KEY            } from '../modules/local/matrix_key/main'
 include { PUBLISH_MISMAPPING    } from '../modules/local/publish_mismapping/main'
 include { POOL_TRAINING_READS   } from '../modules/local/pool_training_reads/main'
@@ -28,8 +30,25 @@ workflow SUPERRESOLUTION_AMPLICON {
 
     // Error model: only the read simulator uses it, so the whole skiver training
     // subworkflow is skipped under the flat model. [ id, model_pt ] either way.
+    if (!(params.mismapping_method in ['simulate', 'align'])) {
+        error "--mismapping_method must be 'simulate' or 'align'"
+    }
+    if (params.mismapping_method == 'align' && params.sim_read_len) {
+        // The alignment kernel compares whole amplicons. Reads shorter than the amplicon
+        // see only a window of it, so references differing *outside* that window are
+        // indistinguishable to the mapper and M_align understates the confusion. The
+        // simulate path models this; alignment cannot. See docs/alignment_mismapping_plan.md.
+        log.warn "--sim_read_len is ignored by --mismapping_method align: M is built from " +
+                 "whole-amplicon distances and will understate confusion for short/unmerged reads."
+    }
+
     if (params.mismapping_matrix) {
         ch_model = ch_reads.map { meta, reads -> [ meta.id, file(params.mismapping_matrix, checkIfExists: true), 'supplied' ] }
+    }
+    else if (params.mismapping_method == 'align') {
+        // M comes from reference-to-reference alignment: no reads are simulated, so no
+        // error model is needed and the skiver training subworkflow never runs.
+        ch_model = ch_reads.map { meta, reads -> [ meta.id, file("${projectDir}/assets/NO_MODEL"), 'align' ] }
     }
     else if (params.sim_error_model == 'flat') {
         ch_model = ch_reads.map { meta, reads -> [ meta.id, file("${projectDir}/assets/NO_MODEL"), 'flat' ] }
@@ -101,7 +120,8 @@ workflow SUPERRESOLUTION_AMPLICON {
             def source = params.mismapping_matrix ? 'supplied' : 'generated'
             def provenance = [
                 matrix_key: key, reference_sha256: representative[4], model_scope: scope,
-                source: source, sim_error_model: params.sim_error_model,
+                source: source, mismapping_method: params.mismapping_method,
+                align_tau: params.align_tau, sim_error_model: params.sim_error_model,
                 sim_n_per_ref: params.sim_n_per_ref, sim_read_len: params.sim_read_len,
                 flat_sub_rate: params.flat_sub_rate, flat_ins_rate: params.flat_ins_rate,
                 flat_del_rate: params.flat_del_rate, mapseq_args: params.mapseq_args,
@@ -115,6 +135,16 @@ workflow SUPERRESOLUTION_AMPLICON {
 
     if (params.mismapping_matrix) {
         ch_bundle_in = ch_matrix_groups.map { meta, d, supplied_matrix -> [ meta, d, supplied_matrix ] }
+    }
+    else if (params.mismapping_method == 'align') {
+        // One alignment of the reference amplicons against themselves replaces the whole
+        // simulate -> cluster -> map -> tally chain.
+        ALIGN_MISMAPPING(ch_matrix_groups.map { meta, d, model -> [ meta, d.resolve('amplicons.fasta') ] })
+        ch_versions = ch_versions.mix(ALIGN_MISMAPPING.out.versions)
+        ch_bundle_in = ALIGN_MISMAPPING.out.mismapping
+            .map { meta, matrix -> [ meta.id, meta, matrix ] }
+            .join(ch_matrix_groups.map { meta, d, model -> [ meta.id, d ] })
+            .map { id, meta, matrix, d -> [ meta, d, matrix ] }
     }
     else {
         // The representative's amplicon directory is sufficient for the common matrix.

@@ -12,7 +12,10 @@ pipeline:
    naive flat per-mutation-type one that needs no training at all; the confusion structure
    turns out to be insensitive to it ([why](dev/error_rate_sensitivity.md)). Set
    `--sim_error_model trained` to train one from the reads instead (reference-free, via
-   [skiver](https://github.com/timrozday-mgnify/skiver)).
+   [skiver](https://github.com/timrozday-mgnify/skiver)). `--mismapping_method align`
+   replaces this whole stage with one pass of reference-to-reference alignment — no
+   mapper, no error model, ~460x cheaper, and on the reference set it was checked against
+   indistinguishable from the measurement ([evidence](dev/alignment_mismapping.md)).
 3. **Maps the real reads** with mapseq to get the observed per-reference counts.
 4. **Infers the true genome composition** with a Bayesian model (Pyro) that inverts the
    mis-mapping to recover latent genome abundances from the observed read signal.
@@ -164,7 +167,16 @@ Reference amplicons (in-silico PCR):
 | `--primer_mismatches` | `3` | Allowed primer mismatches. |
 | `--trim_primers` | `true` | Trim primers off observed reads before mapping. Set `false` if reads are already primer-trimmed. |
 
-Mis-mapping (simulate reads → map with mapseq):
+Mis-mapping — how `M` is built:
+
+| param | default | description |
+|-------|---------|-------------|
+| `--mismapping_method` | `simulate` | `simulate` (sample errored reads from every reference and map them with the same mapper the real reads go through — `M` is *measured*) or `align` (align the reference amplicons to each other and read `M` off the distances — no simulation, no mapper, no error model). |
+| `--align_tau` | `0` | `align` only: cluster references within this edit distance. `0` (exact duplicate amplicons) beat every larger value tested; `tau > 0` was decisively worse, not softer. |
+
+The `simulate` settings below (everything except `--mismapping_matrix`) are ignored under
+`--mismapping_method align`, including `--sim_error_model trained` — nothing simulates
+reads, so nothing needs an error model and the skiver subworkflow never runs.
 
 | param | default | description |
 |-------|---------|-------------|
@@ -187,8 +199,17 @@ nextflow run main.nf --input samples.yml --references refs.fasta \
 ```
 
 Each bundle also contains its reference sidecars and `provenance.json`. The matrix is
-tied to the extracted amplicon sequences, simulator, and mapseq settings; reuse it
-only with the same reference set and mapper configuration.
+tied to the extracted amplicon sequences, the mis-mapping method and its settings, and
+the mapseq settings; reuse it only with the same reference set and configuration. A
+matrix built by `align` and one built by `simulate` get different keys, so they are never
+silently interchanged.
+
+For a matrix outside Nextflow, `align` is a single command with no container:
+
+```bash
+bin/build_mismapping_align.py --amplicons sample_amplicons/amplicons.fasta \
+  -o mismapping_matrix.csv
+```
 
 For a simulation-only pre-computation outside Nextflow, use the inference utility's
 matrix-build mode:
@@ -370,3 +391,15 @@ Regenerate the fixture with `python tests/data/generate_fixture.py`.
   to mapseq — a model of an aligner is no substitute for the aligner. The simulate →
   map → tally structure mirrors `superresolution-shotgun`
   (`bin/simulate_chunk_reads.py` + `shotgun_infer.py::build_mismapping`).
+- `--mismapping_method align` is a deliberate, bounded exception to that rule, and not a
+  return to modelling the aligner's scoring. It rests on a measured finding: in a 16S
+  amplicon reference set the confusion is *redundancy* — 73 of the 81 references in the
+  B. uniformis set are byte-identical over the amplicon — so `M` is a property of the
+  references, not of the aligner, and any mapper must produce it
+  ([census](dev/amplicon_distance_census.md)). It is validated *against* the measurement
+  rather than trusted a priori ([equivalence study](dev/alignment_mismapping.md)), and it
+  stays opt-in: a reference set whose members differ by one or two bases is exactly where
+  a distance-only `M` is expected to miss, and that case has not been tested.
+  [docs/alignment_mismapping_plan.md](docs/alignment_mismapping_plan.md) records the
+  design and, in full, its limitations and biases — read it before using `align` on a
+  reference set unlike that one, on short/unmerged reads, or on high-error long reads.
