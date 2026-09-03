@@ -126,12 +126,23 @@ Step 1 confirmed the mechanism; only step 3 confirmed the matrix.
 / `--rev_primer` / `--primer_mismatches` and amplicon boundaries shift, so clusters can
 merge or split abruptly; simulation degrades smoothly instead. Two specific traps:
 
-- **Ambiguity codes.** `edlib` treats `N` as a plain mismatch, so **one `N` in one copy of
-  an otherwise-identical pair breaks the cluster** and hands both references identity
-  rows — the maximally wrong answer for sequences that are in fact indistinguishable.
-  Draft-genome 16S frequently carries ambiguity. This DB has **zero** non-ACGT bases in
-  all 81 amplicons, so the failure mode was never exercised here. The fix, if a DB needs
-  it, is edlib's `additionalEqualities`.
+- **Ambiguity codes — fixed, but ambiguity still degrades `align`.** `edlib` scored `N` as
+  a plain mismatch, so one `N` in one copy of an otherwise-identical pair broke the cluster
+  and handed both references identity rows. The kernel now passes `additionalEqualities`
+  (two symbols match when their IUPAC base sets overlap). Probed by injecting one `N` into
+  22 of 81 references *in the DB only* (reads keep the real base, since a reference's
+  ambiguity is an assembly artefact): the pre-fix kernel scores `‖·‖_F = 5.111` with mean
+  diagonal 0.556 against a measured 0.305, breaking the cluster of **57 of 81**
+  references; the fix recovers the un-`N`'d clustering **exactly** (81/81 cluster sizes,
+  no spurious merges) and drops that to 2.450.
+  **It still fails the 0.539 floor, and the residual is the mapper, not the kernel:**
+  mapseq is not ambiguity-agnostic, giving an `N`-bearing reference **0.19×** the incoming
+  mass of its clean cluster partners, and `‖M_measured(N-DB) − M_measured(clean-DB)‖_F =
+  2.481` — essentially the entire remaining gap. No ambiguity-agnostic distance can
+  express that penalty. On a DB where a large fraction of references carry ambiguity, use
+  `simulate`, or drop/repair those references. Verified byte-identical on the
+  ambiguity-free B. uniformis set, so nothing above changes. Details:
+  [equivalence study](../dev/alignment_mismapping.md#iupac-ambiguity-in-the-references-n).
 - **Amplicon extraction.** 16 of 97 DB entries produced no amplicon and are excluded from
   both methods. That bound is unchanged by this work but caps it.
 
@@ -191,5 +202,6 @@ at three decimal places.
 3. **A soft tail on the kernel** (§2) — the cheapest fix if support Jaccard becomes the
    binding constraint: rung 3's `M[a,j] ∝ exp(−β·d)` with a large β is a tie cluster with
    a tail, at the cost of one fitted knob and the fit/validate split that avoids.
-4. **Ambiguity handling** (§6) — one `additionalEqualities` argument, worth adding the
-   first time a DB with `N`s appears rather than pre-emptively. **Still open.**
+4. **Modelling the mapper's ambiguity penalty** (§6) — down-weight cluster members by
+   their ambiguous-position count, to close the residual 2.45 on `N`-laden DBs. Costs a
+   fitted knob, and only pays off if such DBs matter; `simulate` already covers them.

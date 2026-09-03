@@ -85,6 +85,9 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=_REPO / "dev" / "alignment_mismapping.csv")
     ap.add_argument("--read-len", type=int, default=None,
                     help="reads are this long (unmerged/short); default: whole amplicon")
+    ap.add_argument("--inject-n", type=float, default=0.0,
+                    help="put a single N at a random position in this fraction of the "
+                         "reference amplicons, to probe IUPAC ambiguity handling")
     ap.add_argument("--keep", action="store_true")
     a = ap.parse_args()
 
@@ -102,6 +105,27 @@ def main() -> None:
     T = pd.read_csv(work / "translation_table.csv", index_col=0)
     genomes = list(T.index)
     assert list(T.columns) == refseqs
+
+    # `amps_db` is what mapseq and the alignment kernel see; `amps` is what reads are
+    # simulated from. They differ only under --inject-n.
+    amps_db = list(amps)
+    if a.inject_n:
+        # Draft-genome 16S carries ambiguity: the *reference* has an N where the organism
+        # has a real base. Reads therefore carry the real base — injecting N into the
+        # reads too would be a different (and unrealistic) experiment. A single N in one
+        # copy of an otherwise identical pair is what splits a tie cluster when the kernel
+        # scores ambiguity as a mismatch, so put some in and see which kernel still tracks
+        # mapseq.
+        rng = np.random.default_rng(7)
+        hit = rng.random(len(amps_db)) < a.inject_n
+        for i in np.flatnonzero(hit):
+            pos = int(rng.integers(0, len(amps_db[i])))
+            amps_db[i] = amps_db[i][:pos] + "N" + amps_db[i][pos + 1:]
+        with open(fasta, "w") as fh:
+            for h, seq in zip(refseqs, amps_db):
+                fh.write(f">{h}\n{seq}\n")
+        print(f"injected one N into {int(hit.sum())}/{len(amps_db)} reference amplicons "
+              f"(the DB only; reads are simulated from the un-N'd sequences)")
 
     theta_true = np.full(len(genomes),
                          (1.0 - sum(ers.TRUTH_PAIR.values())) / (len(genomes) - 2))
@@ -129,13 +153,22 @@ def main() -> None:
 
     # ── the candidates ───────────────────────────────────────────────────────
     t0 = time.perf_counter()
-    d = bma.pairwise_distances(amps)
+    d = bma.pairwise_distances(amps_db)
     Ms["alignment tau=0"] = (bma.tie_cluster_matrix(d, 0) if a.read_len is None
-                             else bma.windowed_matrix(amps, a.read_len, 0))
+                             else bma.windowed_matrix(amps_db, a.read_len, 0))
     t_align = time.perf_counter() - t0
     for tau in TAUS[1:]:
         Ms[f"alignment tau={tau}"] = (bma.tie_cluster_matrix(d, tau) if a.read_len is None
-                                      else bma.windowed_matrix(amps, a.read_len, tau))
+                                      else bma.windowed_matrix(amps_db, a.read_len, tau))
+    if a.inject_n:
+        # The pre-fix kernel: ambiguity as a plain mismatch. This is what the injected Ns
+        # are here to break.
+        strict = np.zeros_like(d)
+        for i in range(len(amps_db)):
+            for j in range(i + 1, len(amps_db)):
+                strict[i, j] = strict[j, i] = bma.edlib.align(
+                    amps_db[i], amps_db[j], mode="NW", task="distance")["editDistance"]
+        Ms["alignment tau=0 (ambiguity = mismatch)"] = bma.tie_cluster_matrix(strict, 0)
     if a.read_len is not None:
         # The whole-amplicon kernel is the *bug* this run exists to check: it is what the
         # estimator produced before --read-len, and it should now be visibly worse.
@@ -194,6 +227,7 @@ def main() -> None:
 
     df = pd.DataFrame(rows)
     df["read_len"] = a.read_len if a.read_len is not None else 0
+    df["inject_n"] = a.inject_n
     df["noise_floor_frobenius"] = floor
     df["seconds_simulate_map"] = t_sim
     df["seconds_alignment"] = t_align

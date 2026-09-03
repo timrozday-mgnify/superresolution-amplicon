@@ -403,4 +403,6 @@ Regenerate the fixture with `python tests/data/generate_fixture.py`.
   a distance-only `M` is expected to miss, and that case has not been tested.
   [docs/alignment_mismapping_plan.md](docs/alignment_mismapping_plan.md) records the
   design and, in full, its limitations and biases — read it before using `align` on a
-  reference set unlike that one, on short/unmerged reads, or on high-error long reads.
+  reference set unlike that one, on high-error long reads, or on a reference set carrying
+  many IUPAC ambiguity codes (mapseq penalises `N`-bearing references in a way a
+  distance-based `M` cannot express — use `simulate` there).

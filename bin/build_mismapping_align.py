@@ -50,6 +50,18 @@ log = logging.getLogger("build_mismapping_align")
 
 _BASES = "ACGT"
 
+# IUPAC ambiguity: two symbols are equal when the base sets they stand for overlap, so an
+# `N` (or `R`, `Y`, …) in a draft-genome 16S matches what it could have been. Without this
+# edlib scores ambiguity as a plain mismatch, and a single `N` in one copy of an otherwise
+# identical pair splits the tie cluster and hands *both* references identity rows — the
+# maximally wrong answer for two sequences that are in fact indistinguishable.
+#
+# NB: this equality is not transitive (N=A and N=C, but A!=C), so cluster membership stays
+# symmetric while cluster *sizes* need not match, and M is no longer symmetric. That is
+# correct: M[a,j] is "where a read from a goes", which was never a symmetric question.
+_EQUALITIES = [(x, y) for x in si._IUPAC for y in si._IUPAC
+               if x != y and si._IUPAC[x] & si._IUPAC[y]]
+
 
 def pairwise_distances(seqs: list[str]) -> np.ndarray:
     """Symmetric all-pairs global (Needleman-Wunsch) edit distance, via edlib.
@@ -58,15 +70,15 @@ def pairwise_distances(seqs: list[str]) -> np.ndarray:
     per-sample reference sets this pipeline builds (tens to thousands of amplicons).
     Past ~10k references, group exact duplicates by hash first (at tau=0 that is the whole
     answer and needs no alignment) and align only the cluster representatives.
-    Ambiguity codes are plain mismatches here; edlib's `additionalEqualities` would make
-    N match everything, if a DB ever turns out to need it.
+    IUPAC ambiguity codes match any base they could stand for (``_EQUALITIES``).
     """
     n = len(seqs)
     d = np.zeros((n, n), dtype=np.int32)
     for i in range(n):
         for j in range(i + 1, n):
             d[i, j] = d[j, i] = edlib.align(
-                seqs[i], seqs[j], mode="NW", task="distance")["editDistance"]
+                seqs[i], seqs[j], mode="NW", task="distance",
+                additionalEqualities=_EQUALITIES)["editDistance"]
     return d
 
 
@@ -108,7 +120,8 @@ def windowed_matrix(seqs: list[str], read_len: int, tau: int = 0,
         for p in starts:
             frag = seq[p:p + read_len]
             d = np.fromiter(
-                (edlib.align(frag, t, mode="HW", task="distance")["editDistance"]
+                (edlib.align(frag, t, mode="HW", task="distance",
+                             additionalEqualities=_EQUALITIES)["editDistance"]
                  for t in seqs), dtype=np.int32, count=n)
             member = d <= tau
             M[a] += member / member.sum()
@@ -204,9 +217,24 @@ def demo() -> None:
     # Striding subsamples the same windows, so it must not move the answer much.
     assert abs(windowed_matrix(pair, read_len=20, stride=5)[0, 0] - W[0, 0]) < 0.05
 
+    # Ambiguity: an `N` where another reference has a real base must not split the cluster.
+    amb = [shared[:30] + "A" + shared[31:],
+           shared[:30] + "N" + shared[31:],
+           shared[:30] + "C" + shared[31:]]
+    d3 = pairwise_distances(amb)
+    assert d3[0, 1] == 0 and d3[1, 2] == 0 and d3[0, 2] == 1, d3   # N matches both, A != C
+    A = tie_cluster_matrix(d3, tau=0)
+    assert np.allclose(A.sum(axis=1), 1.0), A
+    # Non-transitive, so the rows are not all the same size and M is not symmetric.
+    assert np.allclose(A[1], 1 / 3), A          # the N sees all three
+    assert np.allclose(A[0], [0.5, 0.5, 0.0]) and np.allclose(A[2], [0.0, 0.5, 0.5]), A
+    # Without the equalities every row would be the identity — the bug this guards.
+    assert np.allclose(windowed_matrix(amb, read_len=20)[1].sum(), 1.0)
+
     print("demo OK: identical trio -> 1/3 rows, isolated -> identity, tau widens clusters, "
           "CSV round-trips row-stochastic; short reads see confusion the whole-amplicon "
-          "distance misses, and collapse back to it at full length")
+          "distance misses, and collapse back to it at full length; IUPAC ambiguity "
+          "matches rather than splitting clusters")
 
 
 def main() -> None:

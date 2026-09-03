@@ -128,6 +128,50 @@ averages the tie clusters over windows. Re-running the whole study at `L = 150`
    the wrong matrix. That is §4 of the reading above, in one line: the downstream test
    cannot rank candidates.
 
+## IUPAC ambiguity in the references (`N`)
+
+Draft-genome 16S carries ambiguity codes. edlib scores them as plain mismatches by
+default, so a single `N` in one copy of an otherwise-identical pair splits the tie cluster
+and hands *both* references identity rows. `build_mismapping_align.py` now passes
+`additionalEqualities` so two symbols match when the base sets they stand for overlap.
+
+Probed by injecting one `N` at a random position into 22 of the 81 reference amplicons —
+**in the mapseq DB only**, with reads still simulated from the un-`N`'d sequences, since a
+reference's ambiguity is an assembly artefact and the organism has a real base there
+(`python dev/alignment_mismapping.py --inject-n 0.25`, numbers in
+`alignment_mismapping_ambiguity.csv`).
+
+| candidate | ‖·−M_sim‖_F | mean diag | TV max | support J |
+|---|---|---|---|---|
+| reseed *(floor)* | **0.539** | 0.3047 | 0.160 | 0.769 |
+| **alignment tau=0 (ambiguity matches)** | **2.450** | 0.3086 | 0.663 | 0.705 |
+| alignment tau=0 (*ambiguity = mismatch*, pre-fix) | 5.111 | 0.5556 | 1.000 | 0.376 |
+
+1. **The bug is real and large.** Scoring ambiguity as a mismatch drives the mean diagonal
+   to 0.556 against a measured 0.305 — it invents distinctions mapseq does not make — with
+   TV max 1.0 (rows completely wrong) and support Jaccard 0.376, barely above the shuffled
+   control's neighbourhood. It breaks the cluster of **57 of 81** references.
+2. **The fix recovers the clustering exactly.** With the equalities, all 81 cluster sizes
+   equal those of the un-`N`'d reference set: no spurious splits, and no spurious merges
+   either (0 pairs at clean-distance 1 collapse to 0). At the sequence level this is the
+   right answer, and `‖·‖_F` drops from 5.111 to 2.450.
+3. **It still does not pass, and the reason is mapseq, not the kernel.** The mapper is
+   *not* ambiguity-agnostic: an `N`-bearing reference receives **0.19×** the incoming mass
+   of its clean cluster partners (57 references in mixed clusters) — one mismatch is enough
+   for a clean duplicate to win the read. Directly: `‖M_measured(N-DB) −
+   M_measured(clean-DB)‖_F = 2.481`, which is essentially the whole residual 2.450. The
+   equalities kernel reproduces the *clean* matrix perfectly; the gap is entirely the
+   mapper's `N`-penalty, which no ambiguity-agnostic distance can express.
+4. **The mean diagonal is blind to all of it again.** Measured 0.3063 with `N`s vs 0.3056
+   without, while the matrices differ by 2.481 — mass moves *within* clusters, which the
+   diagonal cannot see. Third time this metric has been uninformative.
+
+**Practical reading:** the fix is necessary and removes a catastrophic failure mode, but
+on a DB where a quarter of references carry ambiguity, `align` and `simulate` genuinely
+disagree — use `simulate`, or drop/repair the ambiguous references. Modelling the penalty
+(down-weighting cluster members by their ambiguous-position count) would close the gap at
+the cost of a fitted knob; not built.
+
 ## What this does not show
 
 One reference set, and the easiest kind: 73 of its 81 references are exact duplicates.
