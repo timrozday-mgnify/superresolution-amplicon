@@ -28,6 +28,29 @@ nextflow_pipeline {
         }
     }
 
+    test("a supplied mseq skips read mapping - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input  = "${projectDir}/tests/data/samplesheet.supplied_mseq.yml"
+                outdir = "$outputDir"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                // The default single-sample run is 11 tasks; supplying the classification
+                // drops READS_TO_FASTA and MAPSEQ_OBS.
+                { assert workflow.trace.succeeded().size() == 9 },
+                { assert workflow.trace.tasks().every { !it.name.contains('MAPSEQ_OBS') } },
+                { assert workflow.trace.tasks().every { !it.name.contains('READS_TO_FASTA') } },
+                { assert path("${params.outdir}/composition/demo/demo.inferred_composition.csv").exists() },
+                { assert !path("${params.outdir}/mapseq/demo").exists() }
+            )
+        }
+    }
+
     test("trained error model adds the skiver subworkflow - stub") {
         tag "stub"
         options "-stub"

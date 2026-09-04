@@ -80,6 +80,7 @@ YAML list of samples (or a map with `samples:`). Per sample:
 | `platform` | no | `hq-illumina` \| `lq-illumina` \| `ont` \| `pacbio` (default `hq-illumina`). Sets the skiver error-model context + report notebook. |
 | `references` | no | Per-sample reference fasta; overrides `--references`. |
 | `error_model` | no | Path to a pre-trained `.pt` model; **skips training** for this sample. |
+| `mseq` | no | Path to a mapseq classification of this sample's reads (a previous run's `mapseq/<id>/<id>.obs.mseq.gz`); **skips read mapping** for this sample. It must have been produced against the same reference set — the ids in it are matched to the extracted amplicons — and it carries the read-prep settings it was made with, so `--obs_max_reads`, `--trim_primers` and `--min_pair_overlap` no longer apply to that sample. Mapping is the expensive stage, so this is what makes a parameter sweep over the mis-mapping and inference knobs cheap. |
 
 \* provide either `reads` or `fastq_1`.
 
