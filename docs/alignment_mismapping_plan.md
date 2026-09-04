@@ -27,17 +27,20 @@ in [the error-rate study](../dev/error_rate_sensitivity.md) (mean diagonal ≈0.
 
 | file | what |
 |---|---|
-| [`bin/build_mismapping_align.py`](../bin/build_mismapping_align.py) | The estimator. `--amplicons … -o mismapping_matrix.csv`, `--tau`, `--demo`. Writes the CSV `infer_composition.py --build-mismapping` already emits, so it needs no downstream change. |
+| [`bin/build_mismapping_align.py`](../bin/build_mismapping_align.py) | The estimator. `--amplicons … --paf allvsall.paf -o mismapping_matrix.npz`, `--tau`, `--backend`, `--demo`. Writes the compressed labelled CSR matrix that `infer_composition.py --build-mismapping` emits, or the grouped matrix under `--backend exact-hash` / `kmer`. |
+| [`dev/grouped_mismapping_scaling.py`](../dev/grouped_mismapping_scaling.py) / [`.md`](../dev/grouped_mismapping_scaling.md) | Scaling to all of GTDB: what the reference-square CSR and the k-mer candidate count each cost, and the grouped storage + pigeonhole filter that replaced them. |
 | [`dev/amplicon_distance_census.py`](../dev/amplicon_distance_census.py) / [`.md`](../dev/amplicon_distance_census.md) | Step 1: does distance alone predict `diag(M)`? |
 | [`dev/alignment_mismapping.py`](../dev/alignment_mismapping.py) / [`.md`](../dev/alignment_mismapping.md) | Step 3: the equivalence study. |
-| `modules/local/align_mismapping/` + `params.mismapping_method` / `align_tau` | Step 6: replaces `SIMULATE_READS` + `MAPSEQ_CLUSTER_MATRIX` + `MAPSEQ_SIM` + `BUILD_MISMAPPING` (11 tasks → 8) and short-circuits the skiver subworkflow. Both params are in the `MATRIX_KEY` hash and `provenance.json`. |
+| `modules/local/grouped_mismapping/` + `params.align_backend` | The mapper-free backends: `exact-hash` (τ=0, streaming duplicate grouping) and `kmer` (τ≥1, pigeonhole filter + bounded Edlib). Both write the grouped matrix and scale to the full 1M-reference GTDB SSU set; see [the scaling note](../dev/grouped_mismapping_scaling.md). |
+| `modules/local/align_mismapping/` + `params.mismapping_method` / `align_tau` | Step 6: replaces `SIMULATE_READS` + `MAPSEQ_CLUSTER_MATRIX` + `MAPSEQ_SIM` + `BUILD_MISMAPPING` with indexed minimap2 + PAF parsing (11 tasks → 10) and short-circuits the skiver subworkflow. Both params are in the `MATRIX_KEY` hash and `provenance.json`. |
 
 ## Decisions, and what they rest on
 
-**Library: `edlib`** (Myers bit-parallel edit distance, global/`NW` mode), behind a
-**lossless k-mer prefilter** (q-gram lemma) with edlib's own `k=` early exit — 10-12x
-faster, byte-identical `M`. **minimap2 also ships** as `--align_backend minimap2`: run as
-the binary in its biocontainer, not through `mappy`, which exposes `-N` but not `-p` and
+**Current implementation: minimap2.** The reference set is indexed once, then minimap2
+runs all-vs-all and emits PAF `cg` CIGAR operations. The estimator re-scores those CIGAR
+columns using IUPAC overlap instead of trusting minimap2's ambiguity-as-mismatch `NM`.
+Earlier edlib-backend discussion below is retained as historical investigation only. The
+minimap2 binary runs in its biocontainer, not through `mappy`, which exposes `-N` but not `-p` and
 cannot reach the settings that matter. Its index is built once (`MINIMAP2_INDEX`) so large
 reference DBs are not re-indexed per run, and it produces an identical `M` here.
 Which preset is used matters more than `-p`/`-N`: `-x asm5` returns nothing past d=5 even
@@ -90,7 +93,7 @@ different *trained* error model lands (0.594 / 0.781). A hard tie cluster puts *
 zero** mass on a reference 10 bases away; mapseq occasionally puts a little there.
 
 **Update — this is a property of the reference measurement, not only of the kernel.**
-Given full distances (the k-mer filter supplies them on request), a tail *was* built and
+Given full distances (the candidate filter supplies them on request), a tail *was* built and
 tested: a smooth exponential one is the wrong shape (worse on every metric), while a
 small, tightly truncated one recovers most of the support-Jaccard gap against the
 flat-0.005 `M_sim`. It was **not shipped**, because against the *trained* error model's

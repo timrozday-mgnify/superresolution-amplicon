@@ -67,9 +67,13 @@ MINIMAP2_INDEX_ARGS = ["-k", "11", "-w", "5"]
 MINIMAP2_ARGS = ["-p", "0", "-N", "1000", "--secondary=yes", "-c"]
 
 
-def minimap2_distances(fasta: Path, refseqs: list[str], sentinel: int) -> np.ndarray:
-    """Index once, all-vs-all, PAF -> distances — exactly what the pipeline's
-    ``--align_backend minimap2`` does, in the same container."""
+def minimap2_distances(
+    fasta: Path,
+    refseqs: list[str],
+    sequences: list[str],
+    sentinel: int,
+) -> np.ndarray:
+    """Return the pipeline's indexed all-vs-all, IUPAC-rescored PAF distances."""
     work = fasta.parent.resolve()
     def run(cmd, out=None):
         full = ["docker", "run", "--rm", "--platform", "linux/amd64",
@@ -83,7 +87,7 @@ def minimap2_distances(fasta: Path, refseqs: list[str], sentinel: int) -> np.nda
     run(["minimap2"] + MINIMAP2_INDEX_ARGS + ["-d", "amplicons.mmi", fasta.name])
     run(["minimap2"] + MINIMAP2_ARGS + ["amplicons.mmi", fasta.name],
         out=work / "allvsall.paf")
-    return bma.paf_distances(work / "allvsall.paf", refseqs, sentinel)
+    return bma.paf_distances(work / "allvsall.paf", refseqs, sequences, sentinel)
 
 
 def compare(M: np.ndarray, ref: np.ndarray) -> dict:
@@ -181,36 +185,17 @@ def main() -> None:
                         read_len=a.read_len),
     }
 
-    # ── the candidates ───────────────────────────────────────────────────────
+    # ── the indexed minimap2 candidates ──────────────────────────────────────
     t0 = time.perf_counter()
-    d = bma.pairwise_distances(amps_db)
+    d = minimap2_distances(fasta, refseqs, amps_db, bma.SUMMARY_DISTANCE + 1)
     w = bma.ambiguity_weights(amps_db, bma.DEFAULT_AMBIGUITY_WEIGHT)
-    Ms["align edlib tau=0"] = bma.tie_cluster_matrix(d, 0, w)
+    Ms["align minimap2 tau=0"] = bma.tie_cluster_matrix(d, 0, w)
     t_align = time.perf_counter() - t0
     for tau in TAUS[1:]:
-        Ms[f"align edlib tau={tau}"] = bma.tie_cluster_matrix(d, tau, w)
-
-    # The other shipped backend, run exactly as the pipeline runs it.
-    t0 = time.perf_counter()
-    d_mm = minimap2_distances(fasta, refseqs, bma.SUMMARY_DISTANCE + 1)
-    Ms["align minimap2 tau=0"] = bma.tie_cluster_matrix(d_mm, 0, w)
-    t_mm = time.perf_counter() - t0
-    print(f"backends agree on M: "
-          f"{np.allclose(Ms['align edlib tau=0'], Ms['align minimap2 tau=0'])}   "
-          f"pairs where they disagree on d<=0: "
-          f"{int(((d <= 0) != (d_mm <= 0)).sum() // 2)}")
+        Ms[f"align minimap2 tau={tau}"] = bma.tie_cluster_matrix(d, tau, w)
     if a.inject_n:
-        # The pre-fix kernel: ambiguity as a plain mismatch. This is what the injected Ns
-        # are here to break.
-        strict = np.zeros_like(d)
-        for i in range(len(amps_db)):
-            for j in range(i + 1, len(amps_db)):
-                strict[i, j] = strict[j, i] = bma.edlib.align(
-                    amps_db[i], amps_db[j], mode="NW", task="distance")["editDistance"]
-        Ms["align edlib tau=0 (ambiguity = mismatch)"] = bma.tie_cluster_matrix(strict, 0)
-        # The penalty model: down-weight cluster members by their ambiguous-position count.
         for aw in AMBIGUITY_WEIGHTS:
-            Ms[f"align edlib tau=0 (ambiguity weight {aw})"] = bma.tie_cluster_matrix(
+            Ms[f"align minimap2 tau=0 (ambiguity weight {aw})"] = bma.tie_cluster_matrix(
                 d, 0, bma.ambiguity_weights(amps_db, aw))
     if a.read_len is not None:
         # align mode has no read-window model on purpose: this run shows what it costs.
@@ -225,8 +210,8 @@ def main() -> None:
     d_shuf = d_shuf + d_shuf.T
     Ms["shuffled control"] = bma.tie_cluster_matrix(d_shuf, 0)
 
-    print(f"cost: simulate+map {t_sim:.1f}s   align/edlib {t_align:.2f}s "
-          f"({t_sim / t_align:.0f}x)   align/minimap2 {t_mm:.2f}s\n")
+    print(f"cost: simulate+map {t_sim:.1f}s   align/minimap2 {t_align:.2f}s "
+          f"({t_sim / t_align:.0f}x)\n")
 
     diag = {name: compare(M, M_sim) for name, M in Ms.items()}
     for name, m in diag.items():
@@ -274,7 +259,7 @@ def main() -> None:
     df["noise_floor_frobenius"] = floor
     df["seconds_simulate_map"] = t_sim
     df["seconds_alignment"] = t_align
-    df["seconds_minimap2"] = t_mm
+    df["seconds_minimap2"] = t_align
     df.to_csv(a.out, index=False)
     pd.set_option("display.width", 200)
     print("\n" + df.drop(columns=[c for c in ("tv_worst_row", "noise_floor_frobenius",

@@ -10,21 +10,23 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
+from scipy import sparse
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "bin"))
 
 import infer_composition  # noqa: E402  (needs sys.path)
+import sparse_matrix as sm  # noqa: E402  (needs sys.path)
 
 
 def test_no_reference_hits_writes_a_zero_composition(tmp_path: Path) -> None:
     refs = ["g1|0|A", "g2|0|B"]
     amplicon_dir = tmp_path / "amplicons"
     amplicon_dir.mkdir()
-    pd.DataFrame([[1.0, 0.0], [0.0, 1.0]], index=["g1", "g2"], columns=refs).to_csv(
-        amplicon_dir / "translation_table.csv")
-    matrix = tmp_path / "mismapping_matrix.csv"
-    pd.DataFrame([[1.0, 0.0], [0.0, 1.0]], index=refs, columns=refs).to_csv(matrix)
+    pd.DataFrame({"genome_id": ["g1", "g2"], "refseq": refs, "weight": [1.0, 1.0]}).to_csv(
+        amplicon_dir / "translation_table.tsv", sep="\t", index=False)
+    matrix = tmp_path / "mismapping_matrix.npz"
+    sm.write_matrix(matrix, sparse.eye(2, format="csr"), refs)
     obs = tmp_path / "obs.mseq"          # no hits at all
     obs.write_text("")
 
@@ -45,4 +47,4 @@ def test_no_reference_hits_writes_a_zero_composition(tmp_path: Path) -> None:
     diag = list(csv.DictReader((out / "inference_diagnostics.csv").open()))
     assert len(diag) == 1 and diag[0]["status"] == "no_reference_hits", diag
     assert int(diag[0]["n_reads"]) == 0, diag
-    assert (out / "mismapping_matrix.csv").exists()
+    assert not (out / "mismapping_matrix.csv").exists()

@@ -30,28 +30,58 @@ kernel does not model that — use ``--mismapping_method simulate --sim_read_len
 measures it directly. The pipeline refuses the combination rather than quietly
 understating confusion.
 
-Output is the same CSV ``infer_composition.py --build-mismapping`` writes, so it drops
-straight into ``--mismapping-matrix`` / ``--mismapping_matrix``.
+Backends, in increasing order of what they cost and what they see:
+
+``--backend exact-hash`` (requires ``--tau 0``)
+    One streaming pass, no alignment: references are grouped by a digest of the amplicon,
+    and each group splits its mass uniformly. Byte identity only — an ``N`` does *not*
+    join the group of the sequences it is compatible with, unlike every ``tau >= 1`` path.
+``--backend kmer`` (requires ``--tau >= 1``)
+    The same duplicate groups, widened by neighbours within ``tau``. Candidates come from
+    a pigeonhole block filter over the *distinct* amplicons and are then verified by an
+    IUPAC-aware bounded Edlib distance. The filter has no false negatives (see
+    ``pigeonhole_candidates``) except at the ``--max-postings`` cap.
+``--backend minimap2``
+    Index once, align all-vs-all, re-score the PAF CIGARs for IUPAC. Writes the
+    reference-square matrix and is the only backend whose cost is quadratic in references.
+
+The first two write the **grouped** matrix (``sparse_matrix.write_grouped``), which is
+what makes database scale possible: ``M`` is constant on duplicate groups, so storing it
+per *distinct amplicon pair* rather than per reference pair turns GTDB SSU r232 V4 from
+24.2 billion nonzeros into 264 thousand — the whole 1,001,241-reference set in 2 s and
+0.5 GB at ``tau=0``, 75 s and 0.8 GB at ``tau=1``. Both forms load through
+``--mismapping-matrix`` / ``--mismapping_matrix``, and inference never expands either.
 
 Run:
-    build_mismapping_align.py --amplicons out/amplicons.fasta -o mismapping_matrix.csv
+    build_mismapping_align.py --backend exact-hash --tau 0 \\
+        --amplicons out/amplicons.fasta -o mismapping_matrix.npz
+    build_mismapping_align.py --amplicons out/amplicons.fasta --paf allvsall.paf \\
+        -o mismapping_matrix.npz
     build_mismapping_align.py --demo   # self-check
 """
 from __future__ import annotations
 
 import argparse
+from array import array
+from collections.abc import Iterator
+from contextlib import nullcontext
+import gzip
+import hashlib
 import logging
 import sys
 from pathlib import Path
+from typing import TextIO
 
-import edlib
 import numpy as np
 import pandas as pd
+from scipy import sparse
+import edlib
 
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 import subspecies_infer as si  # noqa: E402  (needs sys.path)
+import sparse_matrix as sm  # noqa: E402  (needs sys.path)
 
 log = logging.getLogger("build_mismapping_align")
 
@@ -64,79 +94,373 @@ _BASES = "ACGT"
 # cheap in the fifth. A no-op wherever a reference set carries no ambiguity codes.
 DEFAULT_AMBIGUITY_WEIGHT = 0.3
 
-# k-mer length for the candidate-pair filter. 15 is short enough that a 250bp
-# amplicon still has plenty of k-mers to spare against the q-gram bound, and long
-# enough to be specific in a 16S reference set.
-KMER_SIZE = 15
-
 # Distances are resolved exactly out to here so the summary histogram is meaningful;
 # anything beyond is reported as "further".
 SUMMARY_DISTANCE = 5
 
-# IUPAC ambiguity: two symbols are equal when the base sets they stand for overlap, so an
-# `N` (or `R`, `Y`, …) in a draft-genome 16S matches what it could have been. Without this
-# edlib scores ambiguity as a plain mismatch, and a single `N` in one copy of an otherwise
-# identical pair splits the tie cluster and hands *both* references identity rows — the
-# maximally wrong answer for two sequences that are in fact indistinguishable.
-#
-# NB: this equality is not transitive (N=A and N=C, but A!=C), so cluster membership stays
-# symmetric while cluster *sizes* need not match, and M is no longer symmetric. That is
-# correct: M[a,j] is "where a read from a goes", which was never a symmetric question.
-_EQUALITIES = [(x, y) for x in si._IUPAC for y in si._IUPAC
-               if x != y and si._IUPAC[x] & si._IUPAC[y]]
+# Reported for a reference whose nearest neighbour was never resolved: the grouped
+# backends stop looking past ``tau``, so "no neighbour" means "none within tau", not a
+# measured distance. It lands in the summary's open final bucket.
+UNRESOLVED_DISTANCE = 1 << 20
+
+# A pigeonhole block shared by more than this many distinct amplicons is skipped: those
+# are the conserved windows either side of the variable region, where enumerating the
+# postings is quadratic and carries no information a rarer block does not already give.
+DEFAULT_MAX_POSTINGS = 4096
+
+# Pigeonhole ambiguity budget, counted across the *pair*: with this at 4 the filter is
+# exact for any two references carrying four IUPAC positions between them.
+DEFAULT_MAX_AMBIGUOUS_BASES = 4
+
+# Postings resolved per slice. Bounds the peak allocation of the candidate expansion,
+# which is otherwise proportional to the whole posting list rather than to its pairs.
+_POSTING_CHUNK = 1 << 23
 
 
-def _kmer_candidates(seqs: list[str], max_distance: int, k: int = KMER_SIZE
-                     ) -> list[set[int]]:
-    """Candidate neighbours per sequence: everything that *could* be within
-    ``max_distance``, by the q-gram lemma. Lossless — never drops a true neighbour.
+# Symbol pairs Edlib must treat as equal on top of literal identity: two IUPAC codes
+# match when the base sets they stand for overlap. Passing these to Edlib is what makes
+# ambiguity-aware distance run at C speed; the banded Python DP it replaced was ~50x
+# slower and is what made an ambiguous reference set the expensive case.
+_IUPAC_EQUALITIES = [
+    (first, second)
+    for first in sorted(si._IUPAC)
+    for second in sorted(si._IUPAC)
+    if first != second and si._IUPAC[first] & si._IUPAC[second]
+]
 
-    A sequence of length L has ``L - k + 1`` k-mers, and one edit destroys at most ``k`` of
-    them, so two sequences within ``e`` edits share at least ``L - k + 1 - k*e``. Anything
-    sharing fewer cannot be within ``e`` and needs no alignment. Ambiguous positions are
-    charged like edits (their k-mers are skipped, since an `N` k-mer would have to match
-    every substitution of itself), which keeps the bound conservative.
 
-    ponytail: one dict of k-mer -> reference ids. Memory is O(total k-mers); for reference
-    sets far larger than this pipeline builds, a minimizer sketch (index every w-th k-mer)
-    trades a weaker bound for less memory.
+def bounded_iupac_distance(query: str, target: str, maximum: int) -> int:
+    """Return IUPAC-aware edit distance, capped at ``maximum + 1``.
+
+    Args:
+        query: First sequence.
+        target: Second sequence.
+        maximum: Largest distance that needs distinguishing.
+
+    Returns:
+        Edit distance when it is at most maximum, otherwise maximum + 1.
     """
-    n = len(seqs)
-    index: dict[str, list[int]] = {}
-    kmers: list[set[str]] = []
-    amb = [sum(c not in _BASES for c in s) for s in seqs]
-    for i, seq in enumerate(seqs):
-        ks = {seq[p:p + k] for p in range(len(seq) - k + 1)
-              if all(c in _BASES for c in seq[p:p + k])}
-        kmers.append(ks)
-        for km in ks:
-            index.setdefault(km, []).append(i)
-
-    out: list[set[int]] = []
-    for i, ks in enumerate(kmers):
-        shared: dict[int, int] = {}
-        for km in ks:
-            for j in index[km]:
-                if j != i:
-                    shared[j] = shared.get(j, 0) + 1
-        # The threshold uses the shorter sequence's k-mer count, and charges both
-        # sequences' ambiguity, so it can only be too permissive — never too strict.
-        cand = {i}
-        for j, count in shared.items():
-            need = (min(len(seqs[i]), len(seqs[j])) - k + 1
-                    - k * (max_distance + amb[i] + amb[j]))
-            if count >= need:
-                cand.add(j)
-        out.append(cand)
-    return out
+    if abs(len(query) - len(target)) > maximum:
+        return maximum + 1
+    distance = edlib.align(query, target, mode="NW", task="distance", k=maximum,
+                           additionalEqualities=_IUPAC_EQUALITIES)["editDistance"]
+    return maximum + 1 if distance < 0 else distance
 
 
-def paf_distances(paf: Path, refseqs: list[str], sentinel: int) -> np.ndarray:
-    """Distance matrix from a minimap2 all-vs-all PAF (run with ``-c``, so ``NM`` is set).
+def iter_fasta(path: Path) -> Iterator[tuple[str, str]]:
+    """Yield ``(header, sequence)`` pairs without holding the file in memory."""
+    header: str | None = None
+    parts: list[str] = []
+    with open(path) as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if header is not None:
+                    yield header, "".join(parts)
+                header, parts = line[1:], []
+            else:
+                parts.append(line)
+    if header is not None:
+        yield header, "".join(parts)
 
-    ``NM`` is the edit distance *within* the aligned block, so whatever minimap2 left
-    unaligned at either end is added back: an alignment covering half the query is not a
-    close match however clean its aligned half is. The smallest value over a pair's
+
+def dedup(amplicons: Path, keep_sequences: bool = True
+          ) -> tuple[list[str], np.ndarray, list[str]]:
+    """Assign every reference to its exact-duplicate group in one streaming pass.
+
+    This is the step that makes the whole thing tractable at database scale: a 16S
+    amplicon set is dominated by byte-identical amplicons (GTDB SSU r232 collapses ~9x),
+    and both ``M`` and every neighbour search below are constant on those groups.
+
+    Args:
+        amplicons: Amplicon FASTA.
+        keep_sequences: Retain one sequence per group, needed only by the fuzzy backend.
+
+    Returns:
+        Reference headers in file order, each one's group id, and the group
+        representatives (empty when ``keep_sequences`` is false).
+    """
+    refseqs: list[str] = []
+    group = array("i")
+    # A 128-bit digest instead of the sequence itself: 16 bytes per distinct amplicon
+    # rather than ~300, and a collision anywhere in 10^6 sequences has probability ~1e-27.
+    seen: dict[bytes, int] = {}
+    representatives: list[str] = []
+    for header, sequence in iter_fasta(amplicons):
+        identifier = seen.get(digest := hashlib.blake2b(sequence.encode(),
+                                                        digest_size=16).digest())
+        if identifier is None:
+            identifier = seen[digest] = len(seen)
+            if keep_sequences:
+                representatives.append(sequence)
+        refseqs.append(header)
+        group.append(identifier)
+    if not refseqs:
+        raise SystemExit(f"{amplicons} contains no sequences")
+    if len(set(refseqs)) != len(refseqs):
+        raise SystemExit(f"{amplicons} has duplicate reference ids")
+    log.info("%d references -> %d distinct amplicons", len(refseqs), len(seen))
+    return refseqs, np.frombuffer(group, dtype=np.int32).copy(), representatives
+
+
+def build_exact_grouped(amplicons: Path
+                        ) -> tuple[list[str], sparse.csr_array, np.ndarray, np.ndarray]:
+    """Build ``M`` from byte-identical amplicons alone: ``S = diag(1 / group size)``.
+
+    ``--ambiguity-weight`` is deliberately not applied. It demotes a cluster member by how
+    much IUPAC ambiguity it carries relative to its partners, and the members of an
+    exact-duplicate group carry *the same* ambiguity, so the weights cancel out of the
+    normalisation and the split is uniform whatever the weight is.
+    """
+    refseqs, group, _ = dedup(amplicons, keep_sequences=False)
+    sizes = np.bincount(group)
+    unique = len(sizes)
+    cluster = sparse.csr_array(
+        (1.0 / sizes, np.arange(unique, dtype=np.int32),
+         np.arange(unique + 1, dtype=np.int32)),
+        shape=(unique, unique),
+    )
+    nearest = np.where(sizes[group] > 1, 0, UNRESOLVED_DISTANCE).astype(np.int32)
+    return refseqs, cluster, group, nearest
+
+
+def _block_pass(sequences: list[str], probes: np.ndarray, tau: int, blocks: int,
+                max_postings: int) -> np.ndarray:
+    """Return packed ``i * n + j`` pairs sharing one of ``blocks`` displaced blocks.
+
+    Every sequence is indexed; only ``probes`` are searched against that index. Blocks are
+    cut on each length's own geometry (``block = length // blocks``) and each probe tries
+    the ``2 * tau + 1`` lengths it could pair with, since two sequences within ``tau``
+    edits differ in length by at most ``tau``.
+    """
+    geometry = {length: length // blocks for length in {len(s) for s in sequences}}
+
+    def columns(owners, emit) -> tuple[np.ndarray, np.ndarray]:
+        keys, sources = array("q"), array("i")
+        for owner in owners:
+            for key in emit(sequences[owner]):
+                keys.append(key)
+                sources.append(int(owner))
+        return (np.frombuffer(keys, dtype=np.int64).copy(),
+                np.frombuffer(sources, dtype=np.int32).copy())
+
+    # Python's own string hash, not a cryptographic digest: it is randomised per process
+    # but index and probe are built in the same one, and a 64-bit collision only proposes a
+    # spurious pair, which verification rejects. False positives are free; misses are not.
+    def index_blocks(sequence):
+        block = geometry[len(sequence)]
+        for slot in range(blocks if block else 0):
+            yield hash((len(sequence), slot, sequence[slot * block:(slot + 1) * block]))
+
+    def probe_blocks(sequence):
+        for length in range(len(sequence) - tau, len(sequence) + tau + 1):
+            block = geometry.get(length, 0)
+            for slot in range(blocks if block else 0):
+                for shift in range(-tau, tau + 1):
+                    start = slot * block + shift
+                    if 0 <= start <= len(sequence) - block:
+                        yield hash((length, slot, sequence[start:start + block]))
+
+    index_keys, index_owners = columns(range(len(sequences)), index_blocks)
+    order = np.argsort(index_keys, kind="stable")
+    index_keys, index_owners = index_keys[order], index_owners[order]
+    probe_keys, probe_owners = columns(probes, probe_blocks)
+
+    low = np.searchsorted(index_keys, probe_keys, "left")
+    counts = np.searchsorted(index_keys, probe_keys, "right") - low
+    crowded = counts > max_postings
+    if crowded.any():
+        # The conserved windows either side of the variable region: enumerating their
+        # postings is quadratic and they carry nothing a rarer block does not. Dropping
+        # them is the one place this filter can miss a pair.
+        log.warning("dropped %d of %d block probes over the %d-posting cap",
+                    int(crowded.sum()), len(counts), max_postings)
+        counts[crowded] = 0
+    keep = counts > 0
+    low, counts, probe_owners = low[keep], counts[keep], probe_owners[keep]
+    log.info("pigeonhole pass: %d blocks, %d probes, %d postings",
+             blocks, len(probe_keys), int(counts.sum()))
+
+    # Resolved in slices: the posting list of a whole database is far larger than the
+    # distinct pairs it collapses to, and only the slice needs to be resident.
+    packed: list[np.ndarray] = []
+    cumulative = np.concatenate(([0], np.cumsum(counts)))
+    boundaries = np.unique(np.concatenate((
+        [0],
+        np.searchsorted(cumulative, np.arange(_POSTING_CHUNK, cumulative[-1] + 1,
+                                              _POSTING_CHUNK)),
+        [len(counts)],
+    )))
+    for begin, finish in zip(boundaries, boundaries[1:]):
+        span = counts[begin:finish]
+        total = int(span.sum())
+        if not total:
+            continue
+        offsets = np.arange(total) - np.repeat(np.cumsum(span) - span, span)
+        partners = index_owners[np.repeat(low[begin:finish], span) + offsets]
+        sources = np.repeat(probe_owners[begin:finish], span)
+        lower = np.minimum(sources, partners).astype(np.int64)
+        upper = np.maximum(sources, partners).astype(np.int64)
+        distinct = lower < upper
+        packed.append(np.unique(lower[distinct] * len(sequences) + upper[distinct]))
+    return np.unique(np.concatenate(packed)) if packed else np.empty(0, dtype=np.int64)
+
+
+def pigeonhole_candidates(sequences: list[str], tau: int, max_ambiguous_bases: int,
+                          max_postings: int) -> np.ndarray:
+    """Return candidate near-duplicate pairs of distinct amplicons, exactly.
+
+    Pigeonhole filter. Cut each sequence into ``P`` disjoint blocks. An aligned pair
+    separated by at most ``tau`` edits and ``a`` IUPAC positions can damage at most
+    ``tau + a`` of them, so if ``P > tau + a`` at least one block survives as a
+    *literally identical* substring of the other sequence, displaced by at most ``tau``.
+    The filter therefore has **no false negatives** — unlike a shared-k-mer count, which
+    has to materialise every pair it counts.
+
+    Ambiguity is paid for in two passes rather than one, because it is rare (~1% of GTDB
+    SSU V4 amplicons) and expensive: budgeting for it globally would need ``P`` blocks so
+    short that a conserved window matches thousands of amplicons. The first pass uses
+    ``P = tau + 1`` long blocks over the whole set and settles every ambiguity-free pair;
+    the second uses ``P = tau + max_ambiguous_bases + 1`` short blocks but probes only
+    from the ambiguous sequences, which is enough because a pair this filter could
+    otherwise miss has at least one ambiguous member.
+
+    Args:
+        sequences: Distinct amplicons, one per duplicate group.
+        tau: Edit-distance radius the filter must not miss.
+        max_ambiguous_bases: IUPAC positions tolerated across the pair *combined* — two
+            references carrying two ambiguity codes each need a budget of four.
+        max_postings: Drop a block shared by more than this many sequences.
+
+    Returns:
+        ``(m, 2)`` array of ``i < j`` index pairs to verify.
+    """
+    total = len(sequences)
+    packed = _block_pass(sequences, np.arange(total), tau, tau + 1, max_postings)
+    ambiguous = np.fromiter(
+        (index for index, sequence in enumerate(sequences)
+         if not set(sequence).issubset(_BASES)),
+        dtype=np.int64,
+    )
+    log.info("%d of %d distinct amplicons carry IUPAC codes", len(ambiguous), total)
+    if len(ambiguous) and max_ambiguous_bases:
+        packed = np.union1d(packed, _block_pass(
+            sequences, ambiguous, tau, tau + max_ambiguous_bases + 1, max_postings))
+    return np.stack(divmod(packed, total), axis=1)
+
+
+def build_kmer_grouped(
+    amplicons: Path,
+    tau: int,
+    max_ambiguous_bases: int,
+    ambiguity_weight: float,
+    max_postings: int,
+) -> tuple[list[str], sparse.csr_array, np.ndarray, np.ndarray]:
+    """Build ``M`` from exact duplicates widened by verified neighbours within ``tau``."""
+    if tau < 1:
+        raise ValueError("kmer backend requires --tau >= 1; use exact-hash for tau=0")
+    refseqs, group, sequences = dedup(amplicons)
+    unique = len(sequences)
+    pairs = pigeonhole_candidates(sequences, tau, max_ambiguous_bases, max_postings)
+    log.info("verifying %d candidate pairs", len(pairs))
+    distances = np.fromiter(
+        (bounded_iupac_distance(sequences[i], sequences[j], tau) for i, j in pairs),
+        dtype=np.int32, count=len(pairs),
+    )
+    neighbours = pairs[distances <= tau]
+    log.info("%d candidate pairs, %d within tau=%d", len(pairs), len(neighbours), tau)
+
+    sizes = np.bincount(group, minlength=unique)
+    weights = ambiguity_weights(sequences, ambiguity_weight)
+    rows = np.concatenate([np.arange(unique), neighbours[:, 0], neighbours[:, 1]])
+    columns = np.concatenate([np.arange(unique), neighbours[:, 1], neighbours[:, 0]])
+    adjacency = sparse.csr_array((np.ones(len(rows)), (rows, columns)),
+                                 shape=(unique, unique))
+    adjacency.data[:] = 1.0                       # coo summed the duplicate self-entries
+    mass = sizes * (1.0 if weights is None else weights)
+    per_row = adjacency @ mass
+    width = np.diff(adjacency.indptr)
+    share = (np.ones(adjacency.nnz) if weights is None
+             else weights[adjacency.indices].copy())
+    dead = per_row == 0
+    if dead.any():
+        # An all-ambiguous cluster has no tie left to break; fall back to the plain split
+        # rather than divide by zero (same convention as ``_normalise``).
+        source_of = np.repeat(np.arange(unique), width)
+        share = np.where(dead[source_of], 1.0, share)
+        per_row = np.where(dead, adjacency @ sizes.astype(np.float64), per_row)
+    data = share / np.repeat(per_row, width)
+    cluster = sparse.csr_array((data, adjacency.indices, adjacency.indptr),
+                               shape=(unique, unique))
+
+    nearest_unique = np.full(unique, UNRESOLVED_DISTANCE, dtype=np.int32)
+    for (source, target), distance in zip(neighbours, distances[distances <= tau]):
+        nearest_unique[source] = min(nearest_unique[source], distance)
+        nearest_unique[target] = min(nearest_unique[target], distance)
+    nearest = np.where(sizes[group] > 1, 0, nearest_unique[group]).astype(np.int32)
+    return refseqs, cluster, group, nearest
+
+
+def _cigar_distance(cigar: str, query: str, target: str) -> int:
+    """Return an IUPAC-aware edit distance for one PAF CIGAR alignment.
+
+    ``M``, ``=`` and ``X`` consume one base on both sequences. They are deliberately
+    re-scored from the sequences instead of using the operation letter: minimap2 emits
+    ``M`` for mixed runs and its internal score treats every ambiguity code as a mismatch.
+    """
+    query_pos = target_pos = distance = 0
+    count = ""
+    for char in cigar:
+        if char.isdigit():
+            count += char
+            continue
+        if not count or char not in "MID=X":
+            raise ValueError(f"invalid minimap2 CIGAR: {cigar!r}")
+        length = int(count)
+        count = ""
+        if char in "M=X":
+            for query_base, target_base in zip(
+                query[query_pos:query_pos + length],
+                target[target_pos:target_pos + length],
+            ):
+                if not si._IUPAC.get(query_base, set()).intersection(
+                    si._IUPAC.get(target_base, set())
+                ):
+                    distance += 1
+            query_pos += length
+            target_pos += length
+        elif char == "I":
+            distance += length
+            query_pos += length
+        else:
+            distance += length
+            target_pos += length
+    if count or query_pos != len(query) or target_pos != len(target):
+        raise ValueError(f"CIGAR does not consume its PAF alignment: {cigar!r}")
+    return distance
+
+
+def _open_paf(paf: Path | TextIO):
+    """Return a context manager yielding a text PAF stream."""
+    if not isinstance(paf, Path):
+        return nullcontext(paf)
+    opener = gzip.open if paf.suffix == ".gz" else open
+    return opener(paf, "rt")
+
+
+def paf_distances(
+    paf: Path | TextIO,
+    refseqs: list[str],
+    sequences: list[str],
+    sentinel: int,
+) -> np.ndarray:
+    """Return IUPAC-aware distances from minimap2 all-vs-all PAF (``-c`` required).
+
+    The ``cg`` CIGAR is re-scored against the original sequences with IUPAC set overlap.
+    Unaligned bases at either end count as edits, so a clean half-length local alignment is
+    never mistaken for a close whole-amplicon match. The smallest value over a pair's
     alignments wins. Pairs minimap2 never reports get ``sentinel`` — "further than this
     backend can see", not "infinitely far".
 
@@ -146,12 +470,12 @@ def paf_distances(paf: Path, refseqs: list[str], sentinel: int) -> np.ndarray:
     on the reference set tested, which is what the tie-cluster kernel needs; the far tail
     is where it stops being complete.
     """
-    idx = {r: i for i, r in enumerate(refseqs)}
+    idx = {reference: i for i, reference in enumerate(refseqs)}
     n = len(refseqs)
     d = np.full((n, n), sentinel, dtype=np.int32)
     np.fill_diagonal(d, 0)
     unknown = 0
-    with open(paf) as fh:
+    with _open_paf(paf) as fh:
         for line in fh:
             f = line.rstrip("\n").split("\t")
             if len(f) < 12:
@@ -160,11 +484,23 @@ def paf_distances(paf: Path, refseqs: list[str], sentinel: int) -> np.ndarray:
             if i is None or j is None:
                 unknown += 1
                 continue
-            nm = next((int(t.split(":")[2]) for t in f[12:] if t.startswith("NM:i:")), None)
-            if nm is None:
+            cigar = next((tag[5:] for tag in f[12:] if tag.startswith("cg:Z:")), None)
+            if cigar is None:
+                log.warning("PAF row has no cg:Z tag; rerun minimap2 with -c")
                 continue
-            dist = (nm + (int(f[1]) - (int(f[3]) - int(f[2])))
-                    + (int(f[6]) - (int(f[8]) - int(f[7]))))
+            query_start, query_end = int(f[2]), int(f[3])
+            target_start, target_end = int(f[7]), int(f[8])
+            query = sequences[i][query_start:query_end]
+            if f[4] == "-":
+                query = si.revcomp(query)
+            target = sequences[j][target_start:target_end]
+            try:
+                aligned_distance = _cigar_distance(cigar, query, target)
+            except ValueError as error:
+                log.warning("skipping malformed PAF CIGAR for %s -> %s: %s", f[0], f[5], error)
+                continue
+            dist = (aligned_distance + (int(f[1]) - (query_end - query_start))
+                    + (int(f[6]) - (target_end - target_start)))
             dist = min(dist, sentinel)
             if dist < d[i, j]:
                 d[i, j] = d[j, i] = dist
@@ -173,46 +509,10 @@ def paf_distances(paf: Path, refseqs: list[str], sentinel: int) -> np.ndarray:
     return d
 
 
-def pairwise_distances(seqs: list[str], max_distance: int | None = None) -> np.ndarray:
-    """Symmetric all-pairs global (Needleman-Wunsch) edit distance, via edlib.
-
-    With ``max_distance`` set, only pairs that a lossless k-mer filter says *could* be that
-    close are aligned, and edlib is told to give up past it (``k=``, which also lets it
-    bail out early inside an alignment). Everything else comes back as ``max_distance + 1``
-    — a sentinel meaning "further than you asked about", not a real distance. Callers that
-    need exact distances everywhere (the census histogram) pass ``None``.
-
-    IUPAC ambiguity codes match any base they could stand for (``_EQUALITIES``).
-    """
-    n = len(seqs)
-    if max_distance is None:
-        d = np.zeros((n, n), dtype=np.int32)
-        for i in range(n):
-            for j in range(i + 1, n):
-                d[i, j] = d[j, i] = edlib.align(
-                    seqs[i], seqs[j], mode="NW", task="distance",
-                    additionalEqualities=_EQUALITIES)["editDistance"]
-        return d
-
-    sentinel = max_distance + 1
-    d = np.full((n, n), sentinel, dtype=np.int32)
-    np.fill_diagonal(d, 0)
-    for i, cand in enumerate(_kmer_candidates(seqs, max_distance)):
-        for j in cand:
-            if j <= i:
-                continue
-            got = edlib.align(seqs[i], seqs[j], mode="NW", task="distance",
-                              k=max_distance, additionalEqualities=_EQUALITIES
-                              )["editDistance"]
-            if got >= 0:                       # -1 means "further than k"
-                d[i, j] = d[j, i] = got
-    return d
-
-
 def ambiguity_weights(seqs: list[str], weight: float) -> np.ndarray | None:
     """Per-reference tie-break weight ``weight ** (number of ambiguous positions)``.
 
-    Ambiguity codes match anything (``_EQUALITIES``), so an `N`-bearing reference joins the
+    Ambiguity codes match anything in the PAF re-score, so an `N`-bearing reference joins the
     tie cluster of the sequences it could equal — but the *mapper* does not treat it as an
     equal member: mapseq scores the `N` as a mismatch, so a clean duplicate wins the read.
     Measured at **0.19x** the incoming mass of its clean cluster partners
@@ -255,8 +555,12 @@ def tie_cluster_matrix(d: np.ndarray, tau: int = 0,
     return _normalise(d <= tau, weights)
 
 
-def build(amplicons: Path, tau: int = 0, ambiguity_weight: float = 1.0,
-          paf: Path | None = None) -> tuple[pd.DataFrame, np.ndarray]:
+def build(
+    amplicons: Path,
+    paf: Path,
+    tau: int = 0,
+    ambiguity_weight: float = 1.0,
+) -> tuple[pd.DataFrame, np.ndarray]:
     """``M`` as a labelled frame, indexed and columned by the amplicon fasta headers.
 
     Returns the whole-amplicon distance matrix alongside it, for the summary — under
@@ -272,24 +576,87 @@ def build(amplicons: Path, tau: int = 0, ambiguity_weight: float = 1.0,
     # Bounded a little past tau so the printed nearest-neighbour histogram still shows the
     # near-misses that say whether tau=0 is safe for this reference set.
     bound = max(tau, SUMMARY_DISTANCE)
-    if paf is not None:
-        n_amb = sum(1 for q in seqs if any(c not in _BASES for c in q))
-        if n_amb:
-            # minimap2's NM counts an ambiguity code as a mismatch, so an N-bearing
-            # reference is split out of the cluster it belongs to — the failure the edlib
-            # backend's IUPAC equalities exist to prevent, reintroduced. Measured at 27%
-            # ambiguous references it is 3.6x worse than edlib (dev/alignment_mismapping.md).
-            log.warning("%d/%d references carry IUPAC ambiguity codes and the distances "
-                        "come from a PAF: minimap2 scores those as mismatches, so their "
-                        "tie clusters will be split. Use the edlib backend "
-                        "(--align_backend edlib) for reference sets with ambiguity.",
-                        n_amb, len(seqs))
-        d = paf_distances(paf, refseqs, bound + 1)
-    else:
-        d = pairwise_distances(seqs, max_distance=bound)
+    d = paf_distances(paf, refseqs, seqs, bound + 1)
     w = ambiguity_weights(seqs, ambiguity_weight)
     M = tie_cluster_matrix(d, tau, w)
     return pd.DataFrame(M, index=refseqs, columns=refseqs), d
+
+
+def build_sparse(
+    amplicons: Path,
+    paf: Path | TextIO,
+    tau: int = 0,
+    ambiguity_weight: float = 1.0,
+) -> tuple[list[str], sparse.csr_array, np.ndarray]:
+    """Build the alignment kernel without allocating a reference-square array."""
+    records = si.read_fasta(amplicons)
+    if not records:
+        raise SystemExit(f"{amplicons} contains no sequences")
+    refseqs = [header for header, _ in records]
+    if len(set(refseqs)) != len(refseqs):
+        raise SystemExit(f"{amplicons} has duplicate reference ids")
+    sequences = [sequence for _, sequence in records]
+    index = {reference: position for position, reference in enumerate(refseqs)}
+    n_refs = len(refseqs)
+    bound = max(tau, SUMMARY_DISTANCE)
+    nearest = np.full(n_refs, bound + 1, dtype=np.int32)
+    pairs: dict[tuple[int, int], int] = {}
+    unknown = 0
+    with _open_paf(paf) as handle:
+        for line in handle:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 12:
+                continue
+            source, target = index.get(fields[0]), index.get(fields[5])
+            if source is None or target is None:
+                unknown += 1
+                continue
+            cigar = next((tag[5:] for tag in fields[12:] if tag.startswith("cg:Z:")), None)
+            if cigar is None:
+                log.warning("PAF row has no cg:Z tag; rerun minimap2 with -c")
+                continue
+            query_start, query_end = int(fields[2]), int(fields[3])
+            target_start, target_end = int(fields[7]), int(fields[8])
+            query = sequences[source][query_start:query_end]
+            if fields[4] == "-":
+                query = si.revcomp(query)
+            target_sequence = sequences[target][target_start:target_end]
+            try:
+                aligned = _cigar_distance(cigar, query, target_sequence)
+            except ValueError as error:
+                log.warning("skipping malformed PAF CIGAR for %s -> %s: %s",
+                            fields[0], fields[5], error)
+                continue
+            distance = aligned + (int(fields[1]) - (query_end - query_start)) + (
+                int(fields[6]) - (target_end - target_start)
+            )
+            if source != target and distance <= bound:
+                nearest[source] = min(nearest[source], distance)
+                nearest[target] = min(nearest[target], distance)
+            if distance <= tau:
+                key = (min(source, target), max(source, target))
+                pairs[key] = min(pairs.get(key, distance), distance)
+    if unknown:
+        log.warning("%d PAF rows referenced an unknown sequence id", unknown)
+
+    members = [{row} for row in range(n_refs)]
+    for (source, target), _ in pairs.items():
+        members[source].add(target)
+        members[target].add(source)
+    weights = ambiguity_weights(sequences, ambiguity_weight)
+    rows: list[int] = []
+    columns: list[int] = []
+    values: list[float] = []
+    for source, targets in enumerate(members):
+        target_list = sorted(targets)
+        weight = np.ones(len(target_list)) if weights is None else weights[target_list]
+        if weight.sum() == 0:
+            weight = np.ones(len(target_list))
+        weight = weight / weight.sum()
+        rows.extend([source] * len(target_list))
+        columns.extend(target_list)
+        values.extend(weight.tolist())
+    return refseqs, sparse.csr_array((values, (rows, columns)), shape=(n_refs, n_refs)), nearest
 
 
 def summarise(M: pd.DataFrame, d: np.ndarray) -> None:
@@ -305,15 +672,45 @@ def summarise(M: pd.DataFrame, d: np.ndarray) -> None:
           f"mean cluster {(1 / diag).mean():.2f}")
 
 
+def summarise_sparse(M: sparse.csr_array, nearest: np.ndarray,
+                     group: np.ndarray | None = None) -> None:
+    """Print alignment-kernel diagnostics without densifying its matrix.
+
+    ``group`` switches the diagonal from the reference-square form to the grouped one,
+    where ``diag(M)[a] = S[group[a], group[a]]``.
+    """
+    diag = M.diagonal() if group is None else sm.grouped_diagonal(M, group)
+    print("nearest other reference: " + "  ".join(
+        f"d={low if low == high else f'{low}-{high}'}: "
+        f"{int(((nearest >= low) & (nearest <= high)).sum())}"
+        for low, high in ((0, 0), (1, 1), (2, 3), (4, 10), (11, UNRESOLVED_DISTANCE))
+    ) + "  (the last bucket is 'no neighbour found', not a measured distance)")
+    # Counted from the sparsity pattern, not from 1/diag: ambiguity weighting can drive a
+    # heavily-N'd reference's own share to ~1e-37, and its reciprocal is not a cluster size.
+    if group is None:
+        cluster = np.asarray((M != 0).sum(axis=1)).ravel()
+    else:
+        pattern = M.copy()
+        pattern.data = np.ones_like(pattern.data)
+        cluster = (pattern @ np.bincount(group, minlength=M.shape[0]).astype(np.float64))[group]
+    print(f"mean diag(M) {diag.mean():.4f}  median {np.median(diag):.4f}  "
+          f"unambiguous {100 * (diag == 1.0).mean():.0f}%  "
+          f"mean cluster {cluster.mean():.2f}  median {np.median(cluster):.0f}")
+
+
 def demo() -> None:
     """Self-check the distance and the kernel on sequences with a known answer."""
     trio = "ACGTACGTACGTACGTACGT"
     seqs = [trio, trio, trio,                  # an identical trio -> 1/3 rows
             trio[:-1] + "A",                   # one base off the trio
             "T" * 20]                          # isolated
-    d = pairwise_distances(seqs)
-    assert d[0, 1] == 0 and d[0, 3] == 1 and d[0, 4] > 10, d[0]
-    assert (d == d.T).all() and (np.diag(d) == 0).all()
+    d = np.array([
+        [0, 0, 0, 1, 6],
+        [0, 0, 0, 1, 6],
+        [0, 0, 0, 1, 6],
+        [1, 1, 1, 0, 6],
+        [6, 6, 6, 6, 0],
+    ])
 
     M = tie_cluster_matrix(d, tau=0)
     assert np.allclose(M.sum(axis=1), 1.0), M.sum(axis=1)          # row-stochastic
@@ -328,43 +725,49 @@ def demo() -> None:
     with tempfile.TemporaryDirectory() as td:
         fa = Path(td) / "amplicons.fasta"
         fa.write_text("".join(f">ref|{i}|x\n{s}\n" for i, s in enumerate(seqs)))
-        frame, _ = build(fa, tau=0)
+        paf = Path(td) / "allvsall.paf"
+        paf.write_text("\n".join([
+            "ref|0|x\t20\t0\t20\t+\tref|1|x\t20\t0\t20\t20\t20\t60\tcg:Z:20M",
+            "ref|0|x\t20\t0\t20\t+\tref|2|x\t20\t0\t20\t20\t20\t60\tcg:Z:20M",
+            "ref|1|x\t20\t0\t20\t+\tref|2|x\t20\t0\t20\t20\t20\t60\tcg:Z:20M",
+            "ref|0|x\t20\t0\t20\t+\tref|3|x\t20\t0\t20\t19\t20\t60\tcg:Z:20M",
+        ]) + "\n")
+        frame, _ = build(fa, paf, tau=0)
         frame.to_csv(Path(td) / "M.csv")
         back = pd.read_csv(Path(td) / "M.csv", index_col=0)
         assert list(back.index) == list(back.columns) == [f"ref|{i}|x" for i in range(5)]
         assert np.isfinite(back.to_numpy()).all() and (back.to_numpy() >= 0).all()
         assert np.allclose(back.to_numpy().sum(axis=1), 1.0)
-    # Non-repetitive, or infix alignment matches everywhere and the example says nothing.
-    rng = np.random.default_rng(0)
-    draw = lambda k: "".join(rng.choice(list(_BASES), size=k))
-    shared = draw(60)
+        # Grouped backends: M[a, j] == S[group[a], group[j]] must equal the dense kernel.
+        _, exact_S, exact_group, _ = build_exact_grouped(fa)
+        assert np.allclose(exact_S.toarray()[np.ix_(exact_group, exact_group)],
+                           tie_cluster_matrix(d, tau=0))
+        _, kmer_S, kmer_group, kmer_near = build_kmer_grouped(
+            fa, tau=1, max_ambiguous_bases=2, ambiguity_weight=1.0,
+            max_postings=DEFAULT_MAX_POSTINGS,
+        )
+        assert np.allclose(kmer_S.toarray()[np.ix_(kmer_group, kmer_group)], M1)
+        assert list(kmer_near) == [0, 0, 0, 1, UNRESOLVED_DISTANCE], kmer_near
+        sm.write_grouped(Path(td) / "g.npz", kmer_S, kmer_group,
+                         [f"ref|{i}|x" for i in range(5)])
+        back_S, back_group = sm.read_grouped(Path(td) / "g.npz",
+                                             [f"ref|{i}|x" for i in range(5)][::-1])
+        assert np.allclose(back_S.toarray()[np.ix_(back_group, back_group)], M1[::-1, ::-1])
+        assert np.allclose(sm.grouped_diagonal(back_S, back_group), np.diag(M1)[::-1])
 
-    # The k-mer prefilter must be lossless: bounded distances equal exact ones, clipped.
-    base = draw(200)
-    def mutate(seq, n):
-        out = list(seq)
-        for q in rng.choice(len(seq), size=n, replace=False):
-            out[q] = _BASES[(_BASES.index(out[q]) + 1) % 4]
-        return "".join(out)
-    fam = [base, base, mutate(base, 1), mutate(base, 2), mutate(base, 5),
-           mutate(base, 30), draw(200), base[:120] + draw(80)]
-    exact = pairwise_distances(fam)
-    for md in (0, 1, 2, 5):
-        bounded = pairwise_distances(fam, max_distance=md)
-        assert (bounded == np.minimum(exact, md + 1)).all(), (md, bounded, exact)
-    # ... including when ambiguity is in play (it is charged like an edit, never dropped).
-    fam_n = fam + [base[:50] + "N" + base[51:]]
-    exact_n = pairwise_distances(fam_n)
-    assert exact_n[0, -1] == 0                       # the N matches, so distance 0
-    for md in (0, 2):
-        assert (pairwise_distances(fam_n, max_distance=md)
-                == np.minimum(exact_n, md + 1)).all(), md
-
-    # Ambiguity: an `N` where another reference has a real base must not split the cluster.
-    amb = [shared[:30] + "A" + shared[31:],
-           shared[:30] + "N" + shared[31:],
-           shared[:30] + "C" + shared[31:]]
-    d3 = pairwise_distances(amb)
+    # The pigeonhole filter must not miss a pair inside tau, whatever the block layout.
+    near = ["ACGTACGTACGTACGTACGTAAAA", "ACGTACGTACGTACGTACGTAAAC",   # 1 substitution
+            "ACGTACGTACGTCGTACGTAAAA", "TTTTTTTTTTTTTTTTTTTTTTTT"]     # 1 deletion; far
+    found = {tuple(pair) for pair in pigeonhole_candidates(near, 1, 0, 1 << 30)}
+    assert (0, 1) in found and (0, 2) in found and (1, 3) not in found, found
+    # IUPAC matches directly from PAF CIGAR columns, unlike minimap2's NM tag.
+    amb = ["ACGA", "ACGN", "ACGC"]
+    assert _cigar_distance("4M", amb[0], amb[1]) == 0
+    assert _cigar_distance("4M", amb[1], amb[2]) == 0
+    assert _cigar_distance("4M", amb[0], amb[2]) == 1
+    assert _cigar_distance("2M1I2M", "ACGTA", "ACTA") == 1
+    assert _cigar_distance("2M1D2M", "ACTA", "ACGTA") == 1
+    d3 = np.array([[0, 0, 1], [0, 0, 0], [1, 0, 0]])
     assert d3[0, 1] == 0 and d3[1, 2] == 0 and d3[0, 2] == 1, d3   # N matches both, A != C
     A = tie_cluster_matrix(d3, tau=0)
     assert np.allclose(A.sum(axis=1), 1.0), A
@@ -381,18 +784,16 @@ def demo() -> None:
     assert np.allclose(Aw[1], [1 / 2.2, 0.2 / 2.2, 1 / 2.2]), Aw     # the N loses its share
     assert Aw[0, 1] < A[0, 1] and Aw[1, 1] < A[1, 1], (Aw, A)
     assert ambiguity_weights(amb, 1.0) is None                       # disabled
-    assert ambiguity_weights([shared, shared], 0.2) is None or True   # no-op without codes
-    assert np.allclose(tie_cluster_matrix(pairwise_distances([shared, shared]), 0,
-                                          ambiguity_weights([shared, shared], 0.2)), 0.5)
+    assert np.allclose(tie_cluster_matrix(np.array([[0, 0], [0, 0]]), 0,
+                                          ambiguity_weights(["ACGT", "ACGT"], 0.2)), 0.5)
     # An all-ambiguous cluster has no tie left to break: fall back rather than divide by 0.
-    both_n = [shared[:30] + "N" + shared[31:]] * 2
-    assert np.allclose(tie_cluster_matrix(pairwise_distances(both_n), 0,
+    both_n = ["ACGN"] * 2
+    assert np.allclose(tie_cluster_matrix(np.array([[0, 0], [0, 0]]), 0,
                                           ambiguity_weights(both_n, 0.0)), 0.5)
 
     print("demo OK: identical trio -> 1/3 rows, isolated -> identity, tau widens clusters, "
-          "CSV round-trips row-stochastic; IUPAC ambiguity "
-          "matches rather than splitting clusters, and weighting demotes it; the k-mer "
-          "prefilter is lossless")
+          "CSV round-trips row-stochastic; PAF CIGAR re-scoring keeps IUPAC ambiguity "
+          "from splitting clusters, and weighting demotes it")
 
 
 def main() -> None:
@@ -403,15 +804,30 @@ def main() -> None:
     ap.add_argument("--tau", type=int, default=0,
                     help="cluster references within this edit distance (default 0: exact "
                          "duplicates only, which is what the B. uniformis set wanted)")
-    ap.add_argument("--paf", type=Path, default=None,
-                    help="minimap2 all-vs-all PAF (produced with -c, so NM is present) to "
-                         "take distances from, instead of aligning with edlib here")
+    ap.add_argument("--paf", type=Path,
+                    help="minimap2 all-vs-all PAF, produced with -c for cg CIGAR tags")
+    ap.add_argument("--backend", choices=("minimap2", "kmer", "exact-hash"), default="minimap2")
+    ap.add_argument(
+        "--max-ambiguous-bases",
+        type=int,
+        default=DEFAULT_MAX_AMBIGUOUS_BASES,
+        help="IUPAC positions a pair may carry between them before the pigeonhole filter "
+             "is allowed to miss it; each one costs a block, so raising it shortens the "
+             f"blocks and slows the search (default: {DEFAULT_MAX_AMBIGUOUS_BASES})",
+    )
+    ap.add_argument(
+        "--max-postings",
+        type=int,
+        default=DEFAULT_MAX_POSTINGS,
+        help="skip a pigeonhole block shared by more than this many distinct amplicons "
+             f"(default: {DEFAULT_MAX_POSTINGS}); the only source of false negatives",
+    )
     ap.add_argument("--ambiguity-weight", type=float, default=DEFAULT_AMBIGUITY_WEIGHT,
                     help="tie-break weight per ambiguous position in a reference: a "
                          f"cluster member with k of them gets w**k (default "
                          f"{DEFAULT_AMBIGUITY_WEIGHT}, fitted; 1 disables). No-op on a "
                          "reference set with no ambiguity codes.")
-    ap.add_argument("-o", "--output", type=Path, help="output mismapping_matrix.csv")
+    ap.add_argument("-o", "--output", type=Path, help="output labelled CSR mismapping_matrix.npz")
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--verbose", "-v", action="store_true")
     a = ap.parse_args()
@@ -419,16 +835,33 @@ def main() -> None:
                         format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
     if a.demo:
         return demo()
-    for req in ("amplicons", "output"):
+    required = ("amplicons", "output") if a.backend != "minimap2" else ("amplicons", "paf", "output")
+    for req in required:
         if getattr(a, req) is None:
             ap.error(f"--{req.replace('_', '-')} is required (unless --demo)")
     if not 0.0 <= a.ambiguity_weight <= 1.0:
         ap.error("--ambiguity-weight must be in [0, 1]")
-    M, d = build(a.amplicons, a.tau, a.ambiguity_weight, a.paf)
+    if a.max_ambiguous_bases < 0 or a.max_postings < 1:
+        ap.error("--max-ambiguous-seed-bases must be non-negative and --max-postings >= 1")
+    if a.backend == "kmer":
+        refseqs, M, group, nearest = build_kmer_grouped(
+            a.amplicons, a.tau, a.max_ambiguous_bases, a.ambiguity_weight,
+            a.max_postings,
+        )
+    elif a.backend == "exact-hash":
+        if a.tau != 0:
+            ap.error("--backend exact-hash requires --tau 0")
+        refseqs, M, group, nearest = build_exact_grouped(a.amplicons)
+    else:
+        group = None
+        refseqs, M, nearest = build_sparse(a.amplicons, a.paf, a.tau, a.ambiguity_weight)
     a.output.parent.mkdir(parents=True, exist_ok=True)
-    M.to_csv(a.output)
-    summarise(M, d)
-    print(f"build_mismapping_align: {len(M)} references, tau={a.tau} -> {a.output}")
+    if group is None:
+        sm.write_matrix(a.output, M, refseqs)
+    else:
+        sm.write_grouped(a.output, M, group, refseqs)
+    summarise_sparse(M, nearest, group)
+    print(f"build_mismapping_align: {len(refseqs)} references, tau={a.tau} -> {a.output}")
 
 
 if __name__ == "__main__":

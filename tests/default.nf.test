@@ -82,18 +82,20 @@ nextflow_pipeline {
         then {
             assertAll(
                 { assert workflow.success },
-                // ALIGN_MISMAPPING replaces SIMULATE_READS + MAPSEQ_CLUSTER_MATRIX +
-                // MAPSEQ_SIM + BUILD_MISMAPPING: 11 - 4 + 1 = 8.
-                { assert workflow.trace.succeeded().size() == 8 },
+                // Indexed minimap2 + PAF parsing replace SIMULATE_READS +
+                // MAPSEQ_CLUSTER_MATRIX + MAPSEQ_SIM + BUILD_MISMAPPING: 11 - 4 + 3 = 10.
+                { assert workflow.trace.succeeded().size() == 10 },
                 { assert workflow.trace.tasks().every { !it.name.contains('SIMULATE') } },
                 { assert workflow.trace.tasks().every { !it.name.contains('SKIVER') } },
                 { assert workflow.trace.tasks().any { it.name.contains('ALIGN_MISMAPPING') } },
+                { assert workflow.trace.tasks().any { it.name.contains('MINIMAP2_INDEX') } },
+                { assert workflow.trace.tasks().any { it.name.contains('MINIMAP2_ALLVSALL') } },
                 { assert path("${params.outdir}/mismapping/groups.tsv").exists() }
             )
         }
     }
 
-    test("minimap2 backend indexes once, then aligns - stub") {
+    test("exact-hash builds M with no mapper at all - stub") {
         tag "stub"
         options "-stub"
         when {
@@ -101,17 +103,42 @@ nextflow_pipeline {
                 input             = "${projectDir}/assets/samplesheet.example.yml"
                 outdir            = "$outputDir"
                 mismapping_method = "align"
-                align_backend     = "minimap2"
+                align_backend     = "exact-hash"
+                align_tau         = 0
             }
         }
         then {
             assertAll(
                 { assert workflow.success },
-                // + MINIMAP2_INDEX + MINIMAP2_ALLVSALL on top of the align flow's 8.
-                { assert workflow.trace.succeeded().size() == 10 },
-                { assert workflow.trace.tasks().any { it.name.contains('MINIMAP2_INDEX') } },
-                { assert workflow.trace.tasks().any { it.name.contains('MINIMAP2_ALLVSALL') } },
-                { assert workflow.trace.tasks().every { !it.name.contains('SIMULATE') } }
+                // One GROUPED_MISMAPPING replaces MINIMAP2_INDEX + MINIMAP2_ALLVSALL +
+                // ALIGN_MISMAPPING: 10 - 2 = 8.
+                { assert workflow.trace.succeeded().size() == 8 },
+                { assert workflow.trace.tasks().any { it.name.contains('GROUPED_MISMAPPING') } },
+                { assert workflow.trace.tasks().every { !it.name.contains('MINIMAP2') } },
+                { assert workflow.trace.tasks().every { !it.name.contains('SIMULATE') } },
+                { assert path("${params.outdir}/mismapping/groups.tsv").exists() }
+            )
+        }
+    }
+
+    test("kmer widens the duplicate groups to tau >= 1 - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input             = "${projectDir}/assets/samplesheet.example.yml"
+                outdir            = "$outputDir"
+                mismapping_method = "align"
+                align_backend     = "kmer"
+                align_tau         = 1
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.succeeded().size() == 8 },
+                { assert workflow.trace.tasks().any { it.name.contains('GROUPED_MISMAPPING') } },
+                { assert workflow.trace.tasks().every { !it.name.contains('MINIMAP2') } }
             )
         }
     }
@@ -136,7 +163,7 @@ nextflow_pipeline {
                 { assert workflow.trace.tasks().every { !it.name.contains('SIMULATE') } },
                 { assert workflow.trace.tasks().every { !it.name.contains('SKIVER') } },
                 { assert path("${params.outdir}/mismapping/groups.tsv").exists() },
-                { assert !path("${params.outdir}/composition/demo/demo.mismapping_matrix.csv").exists() }
+                { assert !path("${params.outdir}/composition/demo/demo.mismapping_matrix.npz").exists() }
             )
         }
     }

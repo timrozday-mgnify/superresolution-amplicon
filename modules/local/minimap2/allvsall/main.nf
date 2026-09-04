@@ -1,5 +1,5 @@
 // All-vs-all alignment of the reference amplicons with minimap2, as an alternative source
-// of distances for ALIGN_MISMAPPING (params.align_backend = 'minimap2').
+// of distances for ALIGN_MISMAPPING.
 //
 // Run directly rather than through the `mappy` Python bindings: mappy exposes -N but not
 // -p, and the preset thresholds matter even more than either. The defaults

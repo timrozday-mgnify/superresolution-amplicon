@@ -8,7 +8,7 @@ process BUILD_MISMAPPING {
     tuple val(meta), path(amplicon_dir), path(sim_mseq)
 
     output:
-    tuple val(meta), path("${meta.id}.mismapping_matrix.csv"), emit: mismapping
+    tuple val(meta), path("${meta.id}.mismapping_matrix.npz"), emit: mismapping
     path "versions.yml",                                  emit: versions
 
     when:
@@ -25,7 +25,7 @@ process BUILD_MISMAPPING {
         -o out \\
         $args
 
-    cp out/mismapping_matrix.csv ${prefix}.mismapping_matrix.csv
+    cp out/mismapping_matrix.npz ${prefix}.mismapping_matrix.npz
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":
@@ -36,7 +36,7 @@ process BUILD_MISMAPPING {
     stub:
     def prefix = task.ext.prefix ?: "${meta.id}"
     """
-    echo ',ref|0|x' > ${prefix}.mismapping_matrix.csv
+    python -c "import numpy as np; np.savez_compressed('${prefix}.mismapping_matrix.npz', data=[1.0], indices=[0], indptr=[0, 1], shape=[1, 1], refseqs=['ref|0|x'])"
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":

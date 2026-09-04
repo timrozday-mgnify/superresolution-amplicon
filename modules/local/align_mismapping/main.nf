@@ -16,7 +16,7 @@ process ALIGN_MISMAPPING {
     tuple val(meta), path(amplicons), path(paf)
 
     output:
-    tuple val(meta), path("${meta.id}.mismapping_matrix.csv"), emit: mismapping
+    tuple val(meta), path("${meta.id}.mismapping_matrix.npz"), emit: mismapping
     path "versions.yml",                                       emit: versions
 
     when:
@@ -25,30 +25,27 @@ process ALIGN_MISMAPPING {
     script:
     def args = task.ext.args ?: ''
     def prefix = task.ext.prefix ?: "${meta.id}"
-    def paf_arg = paf.name == 'NO_PAF' ? '' : "--paf ${paf}"
     """
     build_mismapping_align.py \\
         --amplicons ${amplicons} \\
-        ${paf_arg} \\
-        -o ${prefix}.mismapping_matrix.csv \\
+        --paf ${paf} \\
+        -o ${prefix}.mismapping_matrix.npz \\
         $args
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":
         python: \$(python --version 2>&1 | sed 's/Python //')
-        edlib: \$(python -c 'from importlib.metadata import version; print(version("edlib"))')
     END_VERSIONS
     """
 
     stub:
     def prefix = task.ext.prefix ?: "${meta.id}"
     """
-    echo ',ref|0|x' > ${prefix}.mismapping_matrix.csv
+    python -c "import numpy as np; np.savez_compressed('${prefix}.mismapping_matrix.npz', data=[1.0], indices=[0], indptr=[0, 1], shape=[1, 1], refseqs=['ref|0|x'])"
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":
         python: stub
-        edlib: stub
     END_VERSIONS
     """
 }

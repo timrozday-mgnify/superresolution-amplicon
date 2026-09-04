@@ -2,8 +2,8 @@
 
 **Yes, on this reference set — and it is closer to the measurement than the measurement is
 to itself.** `‖M_align − M_sim‖_F = 0.430` against a reseed noise floor of `0.593`. The
-alignment kernel costs **0.011 s** where simulate+map costs 5.2 s (**460×**) and needs no
-mapper, no container and no error model.
+tie-cluster estimator removes read simulation, mapseq, and error-model training; the
+current implementation still runs indexed minimap2 to obtain the PAF alignments.
 
 Reproduce with `python dev/alignment_mismapping.py` (needs docker + torch/pyro, ~5 min).
 Raw numbers in `alignment_mismapping.csv`.
@@ -89,54 +89,69 @@ construction.
    path also removes: the `mapseq -mscluster` build, the container pull, and — under
    `--sim_error_model trained` — the entire skiver training subworkflow.
 
-## Align mode's error, by backend and condition
+## Current minimap2 characterization and remaining bias
 
-`align` builds `M` from **whole-reference** alignments only. Two backends produce those
-distances: `edlib` (in-process, lossless k-mer filter, IUPAC-aware) and `minimap2` (the
-binary in its biocontainer, index built once). Reproduce with
-`python dev/alignment_mismapping.py` and `--inject-n 0.25`.
+`align` now has one implementation: minimap2 indexes the whole reference set once, emits
+an all-vs-all PAF with `-c`, and the pipeline re-scores each `cg` CIGAR against the source
+sequences using IUPAC set overlap. This deliberately does **not** use PAF `NM`, because
+`NM` treats an ambiguity code as a mismatch. Reproduce the comparison with
+`python dev/alignment_mismapping.py`; use `--inject-n 0.25` to exercise ambiguity handling.
 
-| condition | candidate | ‖·−M_sim‖_F | systematic part | mean diag | TV med / max | support J | ρ |
-|---|---|---|---|---|---|---|---|
-| clean DB *(floor 0.604)* | reseed | 0.604 | 0.427 | 0.3087 | 0.060 / 0.127 | 0.709 | 0.833 |
-| clean DB | **align edlib** | **0.462** | **0.176** | 0.3086 | 0.050 / 0.113 | 0.590 | 0.780 |
-| clean DB | **align minimap2** | **0.462** | **0.176** | 0.3086 | 0.050 / 0.113 | 0.590 | 0.780 |
-| 27% ambiguous *(floor 0.536)* | reseed | 0.536 | 0.379 | – | – | – | – |
-| 27% ambiguous | **align edlib** | **1.421** | **1.406** | – | – | – | – |
-| 27% ambiguous | **align minimap2** | **5.104** | **5.097** | – | – | – | – |
-| 27% ambiguous | edlib, ambiguity = mismatch | 5.104 | 5.097 | – | – | – | – |
+The clean-reference result remains the relevant baseline. A fresh indexed-minimap2 run
+(81 amplicons; 300 simulated reads/reference) produced the following results:
 
-Downstream (clean DB), composition L1 against truth: naive observed 0.0229 / 0.0255,
-simulate+map 0.0177 / 0.0206, **align 0.0156 / 0.0191 on either backend**, shuffled control
-0.0524 / 0.0499. The confusable pair comes back at −0.0002 / +0.0002 and +0.0007 / −0.0018.
+| candidate | Frobenius vs simulate | systematic component | TV median / max | support J | off-diagonal ρ |
+|---|---:|---:|---:|---:|---:|
+| reseed simulate | 0.603 | 0.427 | 0.060 / 0.160 | 0.709 | 0.834 |
+| **minimap2 CIGAR, τ=0** | **0.474** | **0.207** | **0.050 / 0.097** | 0.592 | 0.781 |
+| minimap2 CIGAR, τ=1 | 2.112 | 2.068 | 0.060 / 0.817 | 0.651 | 0.812 |
+| minimap2 CIGAR, τ=2 | 2.216 | 2.175 | 0.060 / 0.824 | 0.654 | 0.812 |
 
-1. **On a clean reference set the two backends are indistinguishable** — identical to four
-   decimal places on every metric, because both resolve the same tie clusters. The choice
-   between them is cost and scaling, not accuracy.
-2. **On an ambiguous reference set they are not.** `align minimap2` scores **exactly** what
-   the pre-fix "ambiguity = mismatch" kernel scored (5.097): minimap2's `NM` counts an `N`
-   as a mismatch, so an `N`-bearing reference is split out of the cluster it belongs to.
-   The IUPAC handling that fixes this lives in edlib's `additionalEqualities` and has no
-   equivalent in a PAF. 68 pairs disagree on `d ≤ 0`. The estimator now warns when it is
-   given a PAF and the references carry ambiguity codes.
-3. **Cost at this size favours edlib**: 0.10 s vs 0.60 s at 81 references, the difference
-   being container startup. minimap2 wins only where indexing pays — see
-   [the backend benchmark](alignment_backend_benchmark.md).
-4. **Read windows are not modelled at all, on purpose.** A query shorter than the reference
-   sees a window of it and is confusable in ways whole-sequence distance cannot represent.
-   Rather than approximate it, `align` refuses `--sim_read_len` and the pipeline directs
-   short/unmerged reads to `simulate`, which measures it. Paired samples are merged into
-   whole-fragment queries first, so this is the exception rather than the norm.
+`τ=0` is below the 0.603 reseed floor. It also improved composition L1 in this run:
+0.0153 versus 0.0209 for flat-simulate correction and 0.0250 uncorrected under the trained
+generator; 0.0189 versus 0.0216 and 0.0245, respectively, at 1% flat error. Alignment took
+0.83 s versus 5.06 s for simulate+map (not including image-pull overhead).
 
-**Choosing a backend:** `edlib` unless the reference set is large enough that indexing
-pays; `edlib` regardless if it carries IUPAC ambiguity.
+The residual risks relative to `simulate` are explicit and measurable:
+
+1. **Heuristic candidate recall.** Unreported PAF pairs receive the bounded-distance
+   sentinel. Inspect support Jaccard and the per-row maximum TV in the harness; a fall in
+   either versus the reseed baseline means minimap2 missed a material neighbour.
+2. **Mapper tail.** A hard tie cluster assigns no mass to distant references while mapseq
+   occasionally does. The existing off-diagonal support and Spearman metrics isolate this
+   error; the tail experiments below show it is not stable enough to add as a fixed model.
+3. **Ambiguous-reference preference.** CIGAR re-scoring prevents false cluster splits, but
+   mapseq can still prefer a clean reference over an IUPAC-bearing alternative. The
+   `--align_ambiguity_weight` sweep characterizes that mass shift; compare it with the
+   ambiguity-injected simulate run before trusting an ambiguity-heavy database.
+4. **Read windows.** Whole-amplicon alignment cannot describe unmerged/short reads. Align
+   mode rejects `--sim_read_len`; use `simulate` for that scope.
+
+### Ambiguity stress test
+
+Injecting one `N` into 25% of database references while simulating reads from the original
+unambiguous sequences isolates ambiguity behaviour. With the default ambiguity weight
+(`w=0.3`), CIGAR re-scoring gives Frobenius 1.485, TV median/max 0.085/0.368, support
+Jaccard 0.697, and off-diagonal ρ 0.838, against a 0.591 reseed floor. That is a major
+improvement over the former `NM` parse (about 5.10 in the same stress scenario), but it is
+still materially biased relative to simulation.
+
+The remaining bias is not an alignment-distance error: mapseq gives an ambiguous reference
+less incoming mass than a clean member of the same tie cluster. Weighting changes the
+trade-off but does not eliminate it: `w=0.19` minimized matrix Frobenius (1.412), while
+`w=0` gave the best downstream L1 in this draw (0.105 trained / 0.077 flat-1%), despite a
+worse matrix Frobenius (1.725). Therefore a single global ambiguity weight is not robustly
+identifiable from this reference set. For ambiguity-heavy databases, prefer `simulate` or
+repair/remove ambiguous reference bases; treat `align_ambiguity_weight` as a sensitivity
+parameter, not a calibrated correction.
 
 ## IUPAC ambiguity in the references (`N`)
 
-Draft-genome 16S carries ambiguity codes. edlib scores them as plain mismatches by
-default, so a single `N` in one copy of an otherwise-identical pair splits the tie cluster
-and hands *both* references identity rows. `build_mismapping_align.py` now passes
-`additionalEqualities` so two symbols match when the base sets they stand for overlap.
+Draft-genome 16S carries ambiguity codes. minimap2's `NM` scores them as plain mismatches,
+so a single `N` in one copy of an otherwise-identical pair would split the tie cluster and
+hand both references identity rows. `build_mismapping_align.py` instead re-scores each PAF
+`cg` CIGAR column against the original sequences, matching two symbols whenever their base
+sets overlap.
 
 Probed by injecting one `N` at a random position into 22 of the 81 reference amplicons —
 **in the mapseq DB only**, with reads still simulated from the un-`N`'d sequences, since a
@@ -177,11 +192,9 @@ reference's ambiguity is an assembly artefact and the organism has a real base t
    optimum, and is a no-op on ambiguity-free sets. Details and the sweep:
    [ambiguity_weight_sweep.md](ambiguity_weight_sweep.md).
 
-**Practical reading:** the fix is necessary and removes a catastrophic failure mode, and
-the penalty model recovers much of what is left — but at best `‖·‖_F` is 1.35–1.88 against
-a ~0.58 floor. On a DB where a meaningful fraction of references carry ambiguity, `align`
-and `simulate` genuinely disagree: use `simulate`, or drop/repair the ambiguous
-references.
+**Practical reading:** CIGAR re-scoring removes the catastrophic ambiguity-as-mismatch
+failure mode. The remaining mapper preference must be re-measured after this change; until
+then, ambiguity-heavy databases should use `simulate` or be repaired before align mode.
 
 ## Does a low-identity tail help?
 

@@ -25,7 +25,7 @@ process INFER_COMPOSITION {
         --mismapping-matrix ${mismapping_matrix} \\
         --obs-mseq ${obs_mseq} \\
         --mismapping-group-id ${matrix_key} \\
-        --mismapping-matrix-path mismapping/${matrix_key}/mismapping_matrix.csv \\
+        --mismapping-matrix-path mismapping/${matrix_key}/mismapping_matrix.npz \\
         --sample-id ${prefix} \\
         --seed ${params.seed} \\
         -o out \\

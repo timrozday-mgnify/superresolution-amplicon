@@ -28,4 +28,16 @@ process PUBLISH_MISMAPPING {
         python: \$(python --version 2>&1 | sed 's/Python //')
     END_VERSIONS
     """
+
+    stub:
+    """
+    mkdir -p ${meta.matrix_key}
+    cp ${matrix} ${meta.matrix_key}/mismapping_matrix.npz
+    touch ${meta.matrix_key}.group.tsv
+
+    cat <<-END_VERSIONS > versions.yml
+    "${task.process}":
+        python: stub
+    END_VERSIONS
+    """
 }

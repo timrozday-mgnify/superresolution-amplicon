@@ -13,9 +13,12 @@ process MATRIX_KEY {
 
     script:
     def settings = [
-        mismapping_method: params.mismapping_method, align_tau: params.align_tau,
+        mismapping_method: params.mismapping_method, align_backend: params.align_backend,
+        align_tau: params.align_tau,
         align_ambiguity_weight: params.align_ambiguity_weight,
-        align_backend: params.align_backend, minimap2_args: params.minimap2_args,
+        max_ambiguous_bases: params.max_ambiguous_bases,
+        max_postings: params.max_postings,
+        minimap2_args: params.minimap2_args,
         minimap2_index_args: params.minimap2_index_args,
         minimap2_tag: params.minimap2_tag,
         sim_error_model: params.sim_error_model, sim_n_per_ref: params.sim_n_per_ref,
