@@ -37,6 +37,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy import sparse
 
 log = logging.getLogger("subspecies_infer")
 
@@ -195,10 +196,7 @@ def stage_amplicons(args) -> None:
     log.info("%d/%d entries amplifiable", len(refseqs), len(records))
 
     genomes = sorted(set(genomes_of))
-    T = np.zeros((len(genomes), len(refseqs)), dtype=np.float64)
-    g_idx = {g: i for i, g in enumerate(genomes)}
-    for j, g in enumerate(genomes_of):
-        T[g_idx[g], j] = 1.0
+    copies = Counter(genomes_of)
     # Rows sum to 1: the within-genome distribution of a genome's amplicon reads over
     # its 16S copies (uniform). This makes the latent theta the true *read-space* genome
     # composition (r_true genome-marginal = theta), directly comparable to the read-space
@@ -206,11 +204,13 @@ def stage_amplicons(args) -> None:
     # NB: copy-count (unnormalized) rows were tested on the B.uniformis V4 sweep and
     # OVERCORRECT — uni flips from ~18% under to ~150% over; the mismapping inversion
     # already recovers genome space, so the residual offset is leakage, not copy number.
-    T = T / T.sum(axis=1, keepdims=True)
-
     out = args.output_dir
     out.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(T, index=genomes, columns=refseqs).to_csv(out / "translation_table.csv")
+    pd.DataFrame({
+        "genome_id": genomes_of,
+        "refseq": refseqs,
+        "weight": [1.0 / copies[genome] for genome in genomes_of],
+    }).to_csv(out / "translation_table.tsv", sep="\t", index=False)
     pd.DataFrame(idx_rows).to_csv(out / "refseq_index.csv", index=False)
     with open(out / "amplicons.fasta", "w") as fh:
         for h, s in zip(refseqs, amplicons):
@@ -263,7 +263,7 @@ def observed_refseq_counts(mseq_paths, refseqs: list[str],
 
 
 def build_mismapping(sim_mseq_paths, refseqs: list[str],
-                     min_identity: float | None = None) -> np.ndarray:
+                     min_identity: float | None = None) -> sparse.csr_array:
     """``M[a,j]`` = fraction of reads simulated from reference ``a`` that mapseq assigns
     to reference ``j``; row-stochastic.
 
@@ -273,7 +273,7 @@ def build_mismapping(sim_mseq_paths, refseqs: list[str],
     """
     idx = {r: i for i, r in enumerate(refseqs)}
     n = len(refseqs)
-    counts = np.zeros((n, n), dtype=np.float64)
+    counts: Counter[tuple[int, int]] = Counter()
     unknown = 0
     for path in sim_mseq_paths:
         for query, hit in iter_mseq(path, min_identity):
@@ -282,20 +282,78 @@ def build_mismapping(sim_mseq_paths, refseqs: list[str],
             if a is None or j is None:
                 unknown += 1
                 continue
-            counts[a, j] += 1.0
+            counts[a, j] += 1
     if unknown:
         log.warning("%d simulated hits with an unrecognised source/target reference", unknown)
-    tot = counts.sum(axis=1)
-    empty = tot == 0
+    totals = np.zeros(n, dtype=np.float64)
+    for (source, _), count in counts.items():
+        totals[source] += count
+    empty = totals == 0
     if empty.any():
         log.warning("%d reference(s) had no mapped simulated read; using an identity row",
                     int(empty.sum()))
-        counts[empty] = np.eye(n)[empty]
-        tot = counts.sum(axis=1)
-    return counts / tot[:, None]
+        for source in np.flatnonzero(empty):
+            counts[source, source] = 1
+            totals[source] = 1.0
+    if not counts:
+        return sparse.eye(n, format="csr", dtype=np.float64)
+    rows, columns, values = zip(*(
+        (source, target, count / totals[source])
+        for (source, target), count in counts.items()
+    ))
+    return sparse.csr_array((values, (rows, columns)), shape=(n, n))
 
 
 # ── Pyro inference ────────────────────────────────────────────────────────────
+
+
+def _reference_distribution(theta, T):
+    """Return reference-space mass from dense legacy or compact translation data."""
+    if isinstance(T, tuple):
+        ref_genomes, ref_weights, _ = T
+        return theta[ref_genomes] * ref_weights
+    return theta @ T
+
+
+def _translation_genomes(T) -> int:
+    """Return the number of genomes represented by a translation input."""
+    return T[2] if isinstance(T, tuple) else T.shape[0]
+
+
+def _mismapping_dtype(M):
+    """Return the floating-point dtype of dense or sparse mis-mapping input."""
+    return M[0].dtype if isinstance(M, tuple) else M.dtype
+
+
+def _apply_mismapping(r_true, M, scale):
+    """Apply the scaled, clamped row-stochastic mis-mapping matrix without densifying it.
+
+    ``M`` is a dense tensor, a ``(sparse, diagonal)`` pair over references, or a
+    ``(sparse, diagonal, group)`` triple whose sparse factor is over the *distinct*
+    amplicons (see ``sparse_matrix.write_grouped``).
+    """
+    import torch
+
+    if not isinstance(M, tuple):
+        effective = (1.0 - scale) * torch.eye(M.shape[0], dtype=M.dtype) + scale * M
+        effective = torch.clamp(effective, min=0.0)
+        return r_true @ (effective / effective.sum(-1, keepdim=True))
+
+    matrix, diagonal, group = (M if len(M) == 3 else (*M, None))
+    diagonal_effective = torch.clamp(1.0 - scale + scale * diagonal, min=0.0)
+    row_sums = diagonal_effective + scale * (1.0 - diagonal)
+    scaled_mass = r_true * (scale / row_sums)
+    if group is None:
+        mapped = torch.sparse.mm(matrix.transpose(0, 1), scaled_mass[:, None]).squeeze(1)
+    else:
+        # Grouped form: M[a, j] == matrix[group[a], group[j]], so M^T x is a sum over
+        # duplicate groups, one sparse product over the *distinct* amplicons, and a
+        # scatter back. Never materialises the reference-square matrix.
+        pooled = torch.zeros(matrix.shape[0], dtype=matrix.dtype).index_add(
+            0, group, scaled_mass)
+        mapped = torch.sparse.mm(matrix.transpose(0, 1), pooled[:, None]).squeeze(1)[group]
+    correction = r_true * ((diagonal_effective - scale * diagonal) / row_sums)
+    return mapped + correction
 
 
 def composition_model(M, T, alpha, N, y_obs=None, likelihood="dirichlet_multinomial",
@@ -325,8 +383,8 @@ def composition_model(M, T, alpha, N, y_obs=None, likelihood="dirichlet_multinom
     import pyro.distributions as dist
     import torch
 
-    dt = M.dtype
-    G, Sdim = T.shape[0], M.shape[0]
+    dt = _mismapping_dtype(M)
+    G = _translation_genomes(T)
     theta = pyro.sample("theta", dist.Dirichlet(alpha * torch.ones(G, dtype=dt)))
 
     if use_presence:
@@ -348,19 +406,14 @@ def composition_model(M, T, alpha, N, y_obs=None, likelihood="dirichlet_multinom
         theta = theta / theta.sum()
     theta = pyro.deterministic("theta_eff", theta)
 
-    r_true = theta @ T
+    r_true = _reference_distribution(theta, T)
     r_true = r_true / r_true.sum()
 
     if use_mismapping:
         # Mis-mapping scale applied to M before it acts on r_true.
         s = pyro.sample("s", dist.LogNormal(torch.tensor(0.0, dtype=dt),
                                             torch.tensor(s_sigma, dtype=dt)))
-        M_eff = (1.0 - s) * torch.eye(Sdim, dtype=dt) + s * M
-        # A large s can push a diagonal negative for very confusable refs; keep M_eff
-        # a valid stochastic matrix. ponytail: clamp+renorm only bites in s's upper tail.
-        M_eff = torch.clamp(M_eff, min=0.0)
-        M_eff = M_eff / M_eff.sum(-1, keepdim=True)
-        r_obs = r_true @ M_eff
+        r_obs = _apply_mismapping(r_true, M, s)
         r_obs = r_obs / r_obs.sum()
     else:
         r_obs = r_true
@@ -428,7 +481,7 @@ def _fit(mode, M, T, alpha, N, y_obs, likelihood, theta_init, args, desc=""):
     p_prior = getattr(args, "presence_prior", DEFAULT_PRESENCE_PRIOR)
     p_temp = getattr(args, "presence_temp", DEFAULT_PRESENCE_TEMP)
     show = getattr(args, "progress", True)
-    G = T.shape[0]
+    G = _translation_genomes(T)
     mk = {"y_obs": y_obs, "likelihood": likelihood, "use_mismapping": use_mm,
           "use_presence": use_presence, "presence_prior": p_prior, "presence_temp": p_temp}
 
@@ -436,9 +489,9 @@ def _fit(mode, M, T, alpha, N, y_obs, likelihood, theta_init, args, desc=""):
     pyro.clear_param_store()
     init = {"theta": theta_init}
     if use_mm:
-        init["s"] = torch.tensor(1.0, dtype=M.dtype)
+        init["s"] = torch.tensor(1.0, dtype=_mismapping_dtype(M))
     if likelihood == "dirichlet_multinomial":
-        init["conc_frac"] = torch.tensor(3.0, dtype=M.dtype)  # ~exp(od_loc), prior median
+        init["conc_frac"] = torch.tensor(3.0, dtype=_mismapping_dtype(M))  # ~exp(od_loc), prior median
 
     def _summ(samples):
         mean = samples.mean(0)
@@ -482,7 +535,7 @@ def _fit(mode, M, T, alpha, N, y_obs, likelihood, theta_init, args, desc=""):
     guide.append(guide_cls(poutine.block(composition_model, hide=["z"]),
                            init_loc_fn=init_to_value(values=init)))
     if use_presence:
-        guide.append(_presence_guide(G, p_temp, M.dtype))
+        guide.append(_presence_guide(G, p_temp, _mismapping_dtype(M)))
     svi = SVI(composition_model, guide, Adam({"lr": args.lr}), Trace_ELBO())
     log.debug("%s %s: %d SVI steps (lr=%g)", desc, mode.upper(), args.steps, args.lr)
     losses = []
@@ -563,10 +616,10 @@ def demo_amplicons() -> None:
             db_fasta=db, fwd_primer=DEFAULT_FWD_PRIMER, rev_primer=DEFAULT_REV_PRIMER,
             primer_mismatches=2, output_dir=td / "out")
         stage_amplicons(args)
-        T = pd.read_csv(td / "out" / "translation_table.csv", index_col=0)
-        assert list(T.index) == ["gA", "gB"] and list(T.columns) == headers, T
-        assert np.allclose(T.to_numpy().sum(1), 1.0), T          # rows sum to 1
-        assert np.allclose(T.loc["gA"].to_numpy(), [0.5, 0.5, 0.0]), T
+        T = pd.read_csv(td / "out" / "translation_table.tsv", sep="\t")
+        assert T["refseq"].tolist() == headers, T
+        assert np.allclose(T.groupby("genome_id")["weight"].sum(), 1.0), T
+        assert np.allclose(T.loc[T["genome_id"] == "gA", "weight"], [0.5, 0.5]), T
         tax = (td / "out" / "amplicons.tax").read_text().splitlines()
         assert tax[0].startswith("#cutoff:") and len(tax) == 3 + len(headers), tax
         assert tax[3] == "gA|0|x\tBacteria;gA;gA|0|x", tax[3]
@@ -582,11 +635,12 @@ def demo_amplicons() -> None:
             for i, (src, hit) in enumerate(rows):
                 fh.write(f"{src}:{i}\t{hit}\t500\t0.99\n")
         M = build_mismapping([mseq], headers)
-        assert np.allclose(M.sum(1), 1.0), M
-        assert np.allclose(M[0], [0.7, 0.3, 0.0]), M
-        assert np.allclose(np.diag(M)[1:], 1.0), M
+        assert np.allclose(M.sum(axis=1), 1.0), M
+        assert np.allclose(M.toarray()[0], [0.7, 0.3, 0.0]), M
+        assert np.allclose(M.diagonal()[1:], 1.0), M
         # identity threshold drops everything -> identity rows, not a crash
-        assert np.allclose(build_mismapping([mseq], headers, min_identity=1.5), np.eye(3))
+        assert np.allclose(build_mismapping([mseq], headers, min_identity=1.5).toarray(),
+                           np.eye(3))
         counts = observed_refseq_counts([mseq], headers)
         assert counts["gA|1|y"] == 13 and counts["gB|0|z"] == 10, counts
     print("demo amplicons: OK")

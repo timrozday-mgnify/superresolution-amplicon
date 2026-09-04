@@ -19,7 +19,7 @@ the confidence in the presence call, not in the abundance.
         --sample-id S1 --mode vi -o out/
 
 To pre-compute a reusable matrix, omit ``--obs-mseq`` and use
-``--build-mismapping``.  Later inference can use that CSV through
+``--build-mismapping``. Later inference can use the labelled CSR ``.npz`` through
 ``--mismapping-matrix`` instead of ``--sim-mseq``.
 """
 from __future__ import annotations
@@ -32,12 +32,14 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+from scipy import sparse
 
 _HERE = Path(__file__).resolve().parent
 import sys
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 import subspecies_infer as si  # noqa: E402  (needs sys.path)
+import sparse_matrix as sm  # noqa: E402  (needs sys.path)
 
 log = logging.getLogger("infer_composition")
 
@@ -52,10 +54,22 @@ def _fit_args(a) -> SimpleNamespace:
     )
 
 
-def _mismapping_matrix(a, refseqs: list[str]) -> np.ndarray:
-    """Return a measured or pre-computed mis-mapping matrix in reference order."""
-    if a.mismapping_matrix is None:
+def _mismapping_matrix(a, refseqs: list[str]):
+    """Return a measured or pre-computed mis-mapping matrix in reference order.
+
+    Either a reference-square CSR, or the grouped ``(S, group)`` pair that the
+    duplicate-collapsing backends write for database-scale reference sets.
+    """
+    if getattr(a, "mismapping_matrix", None) is None:
         return si.build_mismapping(a.sim_mseq, refseqs, a.min_identity)
+
+    if a.mismapping_matrix.suffix == ".npz":
+        try:
+            if sm.is_grouped(a.mismapping_matrix):
+                return sm.read_grouped(a.mismapping_matrix, refseqs)
+            return sm.read_matrix(a.mismapping_matrix, refseqs)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
 
     matrix = pd.read_csv(a.mismapping_matrix, index_col=0)
     if matrix.index.has_duplicates or matrix.columns.has_duplicates:
@@ -63,7 +77,7 @@ def _mismapping_matrix(a, refseqs: list[str]) -> np.ndarray:
     if set(matrix.index) != set(refseqs) or set(matrix.columns) != set(refseqs):
         raise SystemExit(
             f"mis-mapping matrix {a.mismapping_matrix} must have exactly the reference IDs "
-            "in translation_table.csv as both rows and columns"
+            "in the translation table as both rows and columns"
         )
     matrix = matrix.loc[refseqs, refseqs]
     try:
@@ -74,27 +88,65 @@ def _mismapping_matrix(a, refseqs: list[str]) -> np.ndarray:
         raise SystemExit(f"mis-mapping matrix {a.mismapping_matrix} must contain finite, non-negative values")
     if not np.allclose(values.sum(axis=1), 1.0, rtol=1e-6, atol=1e-8):
         raise SystemExit(f"mis-mapping matrix {a.mismapping_matrix} must be row-stochastic")
-    return values
+    return sparse.csr_array(values)
+
+
+def _translation(amplicon_dir: Path):
+    """Return compact genome-to-reference weights, with CSV support for old bundles."""
+    compact = amplicon_dir / "translation_table.tsv"
+    if compact.exists():
+        table = pd.read_csv(compact, sep="\t")
+        required = {"genome_id", "refseq", "weight"}
+        if set(table.columns) != required or table["refseq"].duplicated().any():
+            raise SystemExit(f"invalid compact translation table {compact}")
+        genomes = sorted(table["genome_id"].unique())
+        genome_index = {genome: index for index, genome in enumerate(genomes)}
+        refs = table["refseq"].tolist()
+        return genomes, refs, (
+            np.asarray([genome_index[genome] for genome in table["genome_id"]], dtype=np.int64),
+            table["weight"].to_numpy(dtype=np.float64),
+            len(genomes),
+        )
+    legacy = pd.read_csv(amplicon_dir / "translation_table.csv", index_col=0)
+    return list(legacy.index), list(legacy.columns), legacy.to_numpy(dtype=np.float64)
 
 
 def run(a) -> None:
     import torch
 
-    T_df = pd.read_csv(a.amplicon_dir / "translation_table.csv", index_col=0)
-    genomes = list(T_df.index)
-    refseqs = list(T_df.columns)
-    T = torch.tensor(T_df.to_numpy(), dtype=torch.float64)
+    genomes, refseqs, translation = _translation(a.amplicon_dir)
+    if isinstance(translation, tuple):
+        T = (
+            torch.tensor(translation[0], dtype=torch.long),
+            torch.tensor(translation[1], dtype=torch.float64),
+            translation[2],
+        )
+    else:
+        T = torch.tensor(translation, dtype=torch.float64)
     g_of_ref = np.array([genomes.index(si.genome_of_header(r)) for r in refseqs])
 
     # M is either measured from simulated mapseq output or loaded from a prior run.
-    M_np = _mismapping_matrix(a, refseqs)
-    M = torch.tensor(M_np, dtype=torch.float64)
+    loaded = _mismapping_matrix(a, refseqs)
+    M_sparse, group = loaded if isinstance(loaded, tuple) else (loaded, None)
+    coo = torch.sparse_coo_tensor(
+        torch.tensor(np.vstack(M_sparse.nonzero()), dtype=torch.long),
+        torch.tensor(M_sparse.data, dtype=torch.float64),
+        size=M_sparse.shape,
+    ).coalesce()
+    if group is None:
+        M = (coo, torch.tensor(M_sparse.diagonal(), dtype=torch.float64))
+    else:
+        M = (coo,
+             torch.tensor(sm.grouped_diagonal(M_sparse, group), dtype=torch.float64),
+             torch.tensor(group, dtype=torch.long))
 
-    if a.build_mismapping:
+    if getattr(a, "build_mismapping", False):
         a.output_dir.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame(M_np, index=refseqs, columns=refseqs).to_csv(
-            a.output_dir / "mismapping_matrix.csv"
-        )
+        out = a.output_dir / "mismapping_matrix.npz"
+        if group is None:
+            sm.write_matrix(out, M_sparse, refseqs)
+        else:
+            sm.write_grouped(out, M_sparse, group, refseqs)
         print(f"mismapping: {len(refseqs)} references -> {a.output_dir}")
         return
 
@@ -140,7 +192,6 @@ def run(a) -> None:
 
     out = a.output_dir
     out.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(M_np, index=refseqs, columns=refseqs).to_csv(out / "mismapping_matrix.csv")
     comp = pd.DataFrame([{
         "sample": a.sample_id, "genome_id": g,
         "observed_rel_abundance": float(theta_obs[i]),
@@ -154,9 +205,9 @@ def run(a) -> None:
         "use_mismapping": not a.no_mismapping, "min_identity": a.min_identity,
         "use_presence": not a.no_presence, "presence_prior": a.presence_prior,
         "presence_temp": a.presence_temp,
-        "mismapping_group_id": a.mismapping_group_id,
-        "mismapping_matrix_path": a.mismapping_matrix_path,
-        "n_reads": int(total), "mean_diagonal": float(np.diag(M_np).mean()),
+        "mismapping_group_id": getattr(a, "mismapping_group_id", None),
+        "mismapping_matrix_path": getattr(a, "mismapping_matrix_path", None),
+        "n_reads": int(total), "mean_diagonal": sm.matrix_diagonal_mean(M_sparse),
         "status": "no_reference_hits" if no_hits else "ok",
         **{k: json.dumps(v) for k, v in diag.items()},
     }]).to_csv(out / "inference_diagnostics.csv", index=False)
@@ -205,8 +256,11 @@ def demo() -> None:
         td = Path(td)
         amp = td / "amp"
         amp.mkdir()
-        pd.DataFrame(T.numpy(), index=["uni", "strain2"], columns=refs).to_csv(
-            amp / "translation_table.csv")
+        pd.DataFrame({
+            "genome_id": ["uni", "strain2", "strain2"],
+            "refseq": refs,
+            "weight": [1.0, 0.5, 0.5],
+        }).to_csv(amp / "translation_table.tsv", sep="\t", index=False)
         # Simulated reads: identical refs 0/1 split 50:50, ref 2 self-hits.
         with open(td / "sim.mseq", "w") as fh:
             for a_i, hits in enumerate([[0, 1], [0, 1], [2]]):
@@ -227,8 +281,7 @@ def demo() -> None:
         assert abs(got.loc["uni", "inferred_mean"] - 0.05) < 0.03, got
         assert got.loc["uni", "observed_rel_abundance"] > 0.2, got   # naive is wrong
         assert got["presence_prob"].isna().all(), got                # no call when gate off
-        Mio = pd.read_csv(td / "out" / "mismapping_matrix.csv", index_col=0)
-        assert np.allclose(Mio.loc[refs[0]].to_numpy(), [0.5, 0.5, 0.0]), Mio
+        assert not (td / "out" / "mismapping_matrix.npz").exists()
 
         # Same sample with the gate on. This is the *worst* case for a presence call:
         # uni's only amplicon is byte-identical to a copy of strain2, so "uni present at
@@ -259,13 +312,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--amplicon-dir", type=Path,
-                    help="dir with translation_table.csv (from `subspecies_infer.py amplicons`)")
+                    help="dir with translation_table.tsv (from `subspecies_infer.py amplicons`)")
     ap.add_argument("--sim-mseq", type=Path, nargs="+",
                     help="mapseq output for simulated reads (required unless --mismapping-matrix is used)")
     ap.add_argument("--mismapping-matrix", type=Path,
                     help="pre-computed row-stochastic CSV matrix; skips simulated-read mapping")
     ap.add_argument("--build-mismapping", action="store_true",
-                    help="write mismapping_matrix.csv from --sim-mseq and exit")
+                    help="write labelled CSR mismapping_matrix.npz from --sim-mseq and exit")
     ap.add_argument("--obs-mseq", type=Path, nargs="+",
                     help="mapseq output for this sample's real reads")
     ap.add_argument("--min-identity", type=float, default=None,

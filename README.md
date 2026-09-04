@@ -12,7 +12,10 @@ pipeline:
    naive flat per-mutation-type one that needs no training at all; the confusion structure
    turns out to be insensitive to it ([why](dev/error_rate_sensitivity.md)). Set
    `--sim_error_model trained` to train one from the reads instead (reference-free, via
-   [skiver](https://github.com/timrozday-mgnify/skiver)).
+   [skiver](https://github.com/timrozday-mgnify/skiver)). `--mismapping_method align`
+   replaces this whole stage with one pass of reference-to-reference alignment — no
+   mapper, no error model, ~460x cheaper, and on the reference set it was checked against
+   indistinguishable from the measurement ([evidence](dev/alignment_mismapping.md)).
 3. **Maps the real reads** with mapseq to get the observed per-reference counts.
 4. **Infers the true genome composition** with a Bayesian model (Pyro) that inverts the
    mis-mapping to recover latent genome abundances from the observed read signal.
@@ -72,7 +75,8 @@ YAML list of samples (or a map with `samples:`). Per sample:
 |-----|----------|-------------|
 | `id` | yes | Unique sample id (output routing). |
 | `reads` | yes\* | fastq path or list of paths. |
-| `fastq_1` / `fastq_2` | yes\* | Alternative to `reads` (paired-end). |
+| `fastq_1` / `fastq_2` | yes\* | Alternative to `reads` (paired-end). Supplying `fastq_2` marks the sample paired: R1/R2 are **merged into one query per fragment** before mapping, so each query spans the amplicon like the references do. |
+| `paired` | no | `true` to merge a two-file `reads` list as R1/R2. Not inferred: two files could equally be two single-end runs. |
 | `platform` | no | `hq-illumina` \| `lq-illumina` \| `ont` \| `pacbio` (default `hq-illumina`). Sets the skiver error-model context + report notebook. |
 | `references` | no | Per-sample reference fasta; overrides `--references`. |
 | `error_model` | no | Path to a pre-trained `.pt` model; **skips training** for this sample. |
@@ -164,7 +168,24 @@ Reference amplicons (in-silico PCR):
 | `--primer_mismatches` | `3` | Allowed primer mismatches. |
 | `--trim_primers` | `true` | Trim primers off observed reads before mapping. Set `false` if reads are already primer-trimmed. |
 
-Mis-mapping (simulate reads → map with mapseq):
+Mis-mapping — how `M` is built:
+
+| param | default | description |
+|-------|---------|-------------|
+| `--mismapping_method` | `simulate` | `simulate` (sample errored reads from every reference and map them with the same mapper the real reads go through — `M` is *measured*) or `align` (indexed minimap2 reference-to-reference alignment, with PAF distances re-scored for IUPAC — no read simulation, mapseq, or error model). |
+| `--align_tau` | `0` | `align` only: cluster references within this edit distance. `0` (exact duplicate amplicons) beat every larger value tested; `tau > 0` was decisively worse, not softer. |
+| `--align_backend` | `minimap2` | `align` only: `minimap2` runs all-vs-all alignment and writes a reference-square matrix — fine to a few thousand references. `exact-hash` (requires `--align_tau 0`) groups byte-identical amplicons in one streaming pass. `kmer` (requires `--align_tau >= 1`) widens those groups with a pigeonhole block filter over the *distinct* amplicons, verified by an IUPAC-aware bounded edit distance. The last two write the **grouped** matrix and are the database-scale path: the full 1,001,241-reference GTDB SSU r232 V4 set takes 2 s / 0.5 GB at `exact-hash`, 75 s / 0.8 GB at `kmer --align_tau 1`, and 195 s / 1.3 GB at `--align_tau 2`. |
+| `--max_ambiguous_bases` / `--max_postings` | `4` / `4096` | `kmer` only. `max_ambiguous_bases` is how many IUPAC positions a pair may carry *between them* before the filter is allowed to miss it; each one costs a block, so raising it shortens the blocks and widens the search. `max_postings` skips a block shared by more than that many distinct amplicons — the conserved windows either side of the variable region, which are quadratic to enumerate. It is the filter's only source of false negatives, and it is not reached on GTDB SSU at either tau. |
+| `--minimap2_args` | `-p 0 -N 1000 --secondary=yes -c` | `align` only: minimap2 mapping flags. The reference set is indexed once, then aligned all-vs-all. No preset or score-ratio filter retains near-identical hits; `-c` supplies CIGAR. The parser re-scores CIGAR columns with IUPAC overlap rather than trusting `NM`. `-k`/`-w` are rejected here — they belong to the index. |
+| `--minimap2_index_args` | `-k 11 -w 5` | `align` only: minimap2 index flags. Small minimizers, because presets like `asm5` discard everything past ~5% divergence. |
+| `--align_ambiguity_weight` | `0.3` | `align` only: a cluster member carrying `k` IUPAC ambiguity codes takes `w**k` of a uniform share, since mapseq scores an `N` as a mismatch and prefers a clean duplicate. No-op on reference sets without ambiguity codes; `1` disables. The real penalty varies (0.18–0.97), so this is a compromise — see [the sweep](dev/ambiguity_weight_sweep.md). |
+
+| `--min_pair_overlap` | `20` | Paired samples: shortest mate overlap accepted when merging R1/R2. Unmergeable pairs are dropped and counted; past 20% the run warns that the fragments do not cover the amplicon, and `--mismapping_method simulate --sim_read_len` is the right choice for that sample. |
+| `--sim_read_len` | – | Reads are this long, i.e. shorter than the amplicon (unmerged / short reads). **`simulate` only** — `align` builds `M` from whole-reference alignments and refuses this combination rather than understating confusion. Unset = reads span the whole amplicon, correct for merged reads. |
+
+The remaining `simulate` settings below (everything except `--mismapping_matrix`) are
+ignored under `--mismapping_method align`, including `--sim_error_model trained` — nothing
+simulates reads, so nothing needs an error model and the skiver subworkflow never runs.
 
 | param | default | description |
 |-------|---------|-------------|
@@ -175,20 +196,51 @@ Mis-mapping (simulate reads → map with mapseq):
 | `--flat_ins_rate` | `0.0005` | Flat model: per-base insertion probability. |
 | `--flat_del_rate` | `0.0005` | Flat model: per-base deletion probability. |
 | `--sim_n_per_ref` | `500` | Simulated reads per reference (sampling depth for `M`). |
-| `--sim_read_len` | – | Draw substrings of this length; unset simulates the whole amplicon (correct for merged reads). |
-| `--mismapping_matrix` | – | A previously generated `mismapping_matrix.csv` for the same amplicon reference set. Skips read simulation and simulated-read mapseq; the CSV is checked against the current reference IDs before inference. |
+| `--mismapping_matrix` | – | A previously generated `mismapping_matrix.npz` for the same amplicon reference set. Skips read simulation and simulated-read mapseq. Either form is accepted: the labelled compressed CSR, or the grouped form; legacy CSV matrices remain readable. |
 
 The pipeline fingerprints extracted amplicons and builds each compatible matrix once
 per run. Canonical reusable matrices are published under `mismapping/<matrix-key>/`:
 
 ```bash
 nextflow run main.nf --input samples.yml --references refs.fasta \
-  --mismapping_matrix results/mismapping/<matrix-key>/mismapping_matrix.csv
+  --mismapping_matrix results/mismapping/<matrix-key>/mismapping_matrix.npz
 ```
 
 Each bundle also contains its reference sidecars and `provenance.json`. The matrix is
-tied to the extracted amplicon sequences, simulator, and mapseq settings; reuse it
-only with the same reference set and mapper configuration.
+tied to the extracted amplicon sequences, the mis-mapping method and its settings, and
+the mapseq settings; reuse it only with the same reference set and configuration. A
+matrix built by `align` and one built by `simulate` get different keys, so they are never
+silently interchanged.
+
+For a matrix outside Nextflow, run minimap2 with an index first, then pass its PAF:
+
+```bash
+minimap2 -k 11 -w 5 -d amplicons.mmi sample_amplicons/amplicons.fasta
+minimap2 -p 0 -N 1000 --secondary=yes -c amplicons.mmi sample_amplicons/amplicons.fasta > allvsall.paf
+bin/build_mismapping_align.py --amplicons sample_amplicons/amplicons.fasta --paf allvsall.paf \
+  -o mismapping_matrix.npz
+```
+
+The grouped backends need no mapper and no PAF:
+
+```bash
+bin/build_mismapping_align.py --backend exact-hash --tau 0 \
+  --amplicons sample_amplicons/amplicons.fasta -o mismapping_matrix.npz
+bin/build_mismapping_align.py --backend kmer --tau 1 \
+  --amplicons sample_amplicons/amplicons.fasta -o mismapping_matrix.npz
+```
+
+### The grouped matrix
+
+A tie-cluster `M` is constant on exact-duplicate groups — two references with the same
+amplicon are interchangeable — so `M[a, j] = S[group[a], group[j]]` for an `S` over the
+*distinct* amplicons. The reference-square CSR stores one entry per reference pair inside
+a cluster, i.e. the sum of the squared group sizes. On GTDB SSU V4 that is 24.2 billion
+nonzeros (~290 GB) for 1,001,241 references; the grouped form is 86,557 x 86,557 with
+~264k nonzeros, and the file is 11 MB. Row-stochasticity becomes
+`sum_b S[a, b] * size[b] == 1`, and `r_true @ M` becomes a sum over duplicate groups, one
+sparse product, and a scatter back — so inference never materialises the square matrix
+either. `sparse_matrix.is_grouped` tells the two apart; consumers accept both.
 
 For a simulation-only pre-computation outside Nextflow, use the inference utility's
 matrix-build mode:
@@ -274,14 +326,14 @@ results/
   amplicons/<id>_amplicons/
     amplicons.fasta                  extracted reference amplicons (mapseq DB)
     amplicons.tax                    mapseq taxonomy sidecar
-    translation_table.csv            genome->reference table T
+    translation_table.tsv            compact genome->reference table T
     refseq_index.csv                 per-reference amplifiability
   mapseq/<id>/
     <id>.obs.mseq.gz                 mapseq classification of the real reads
   mismapping/
     groups.tsv                       index of canonical matrix bundles
     <matrix-key>/
-      mismapping_matrix.csv          measured reference->reference mis-mapping M
+      mismapping_matrix.npz          reference->reference mis-mapping M (CSR or grouped)
       provenance.json                 simulator, mapper, and member-sample metadata
       samples.tsv                     samples consuming this matrix
       reference/                      amplicons + mapseq/inference sidecars
@@ -296,6 +348,40 @@ results/
 `inferred_mean`, `inferred_lo`/`inferred_hi` (5–95% credible interval for `vi`/`nuts`),
 and `presence_prob` (posterior probability the genome is present; empty when
 `--infer_presence false`). Call a genome present at `presence_prob >= 0.5`.
+
+## Benchmarking
+
+This pipeline is driven as a nested run by
+[synthetic-metagenomic-benchmark-pipeline](https://github.com/timrozday-mgnify/synthetic-metagenomic-benchmark-pipeline)
+(`profilers: [sr_amplicon]`), which generates synthetic reads with a known truth and
+scores the result. The interface it depends on — keep these stable:
+
+| direction | contract |
+|-----------|----------|
+| in | `--input` YAML samplesheet of `{id, reads, platform, references}` rows; `references` is one combined FASTA with `genome\|n\|orig` headers. |
+| in | `--fwd_primer` / `--rev_primer`, so the reference amplicons are cut from the same region the reads were amplified from. |
+| in | `--mismapping_matrix <file>`, a matrix built by an earlier run of this pipeline. All three forms load: labelled CSR `.npz`, grouped `.npz`, legacy dense `.csv`. |
+| in | `--infer_presence`, `--infer_presence_prior`, `--infer_presence_temp`. |
+| out | `composition/<id>/<id>.inferred_composition.csv`, with `genome_id` and `inferred_mean` — the columns the benchmark's `normalize_sr_profile.py` reads. |
+| out | exactly one `mismapping/<matrix-key>/mismapping_matrix.npz` per run, with `provenance.json` beside it. The benchmark lifts both, and it requires the run to publish **one** bundle. |
+| out | a sample whose reads hit no reference is an all-zero composition with `status=no_reference_hits`, not a failure. |
+
+Because the benchmark builds the matrix once per reference set and then supplies it to
+every sample, **the mis-mapping mode is a property of the matrix-build run only**. The
+modes worth comparing:
+
+| `--mismapping_method` | `--align_backend` | `--align_tau` | what it costs |
+|---|---|---|---|
+| `simulate` | – | – | Reads simulated from every reference and mapped with mapseq. The measurement; the most expensive. |
+| `align` | `minimap2` | `0` | All-vs-all alignment. Reference-square matrix; quadratic in references. |
+| `align` | `exact-hash` | `0` | Byte-identical amplicons grouped. One streaming pass. |
+| `align` | `kmer` | `>= 1` | Those groups widened by verified neighbours within `tau`. |
+
+The benchmark exposes each of these as `--sr_amplicon_mismapping_method`,
+`--sr_amplicon_align_backend` and `--sr_amplicon_align_tau`, with
+`--sr_amplicon_matrix_args` for the remaining flags
+(`--align_ambiguity_weight`, `--max_ambiguous_bases`, `--max_postings`,
+`--sim_n_per_ref`, …). See its README for how to sweep them.
 
 ## Containers
 
@@ -370,3 +456,17 @@ Regenerate the fixture with `python tests/data/generate_fixture.py`.
   to mapseq — a model of an aligner is no substitute for the aligner. The simulate →
   map → tally structure mirrors `superresolution-shotgun`
   (`bin/simulate_chunk_reads.py` + `shotgun_infer.py::build_mismapping`).
+- `--mismapping_method align` is a deliberate, bounded exception to that rule, and not a
+  return to modelling the aligner's scoring. It rests on a measured finding: in a 16S
+  amplicon reference set the confusion is *redundancy* — 73 of the 81 references in the
+  B. uniformis set are byte-identical over the amplicon — so `M` is a property of the
+  references, not of the aligner, and any mapper must produce it
+  ([census](dev/amplicon_distance_census.md)). It is validated *against* the measurement
+  rather than trusted a priori ([equivalence study](dev/alignment_mismapping.md)), and it
+  stays opt-in: a reference set whose members differ by one or two bases is exactly where
+  a distance-only `M` is expected to miss, and that case has not been tested.
+  [docs/alignment_mismapping_plan.md](docs/alignment_mismapping_plan.md) records the
+  design and, in full, its limitations and biases — read it before using `align` on a
+  reference set unlike that one, on high-error long reads, or on a reference set carrying
+  many IUPAC ambiguity codes (mapseq penalises `N`-bearing references in a way a
+  distance-based `M` cannot express — use `simulate` there).

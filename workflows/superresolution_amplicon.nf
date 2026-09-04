@@ -1,7 +1,8 @@
 //
-// superresolution-amplicon: extract the reference amplicons, measure reference-to-
-// reference mis-mapping by simulating reads and mapping them with the same mapper the
-// real reads go through (mapseq), and infer the true genome composition.
+// superresolution-amplicon: extract the reference amplicons, establish reference-to-
+// reference mis-mapping — by simulating reads and mapping them with the same mapper the
+// real reads go through (mapseq), or by aligning the reference amplicons to each other
+// (params.mismapping_method) — and infer the true genome composition.
 //
 include { TRAIN_ERROR_MODEL    } from '../subworkflows/local/train_error_model/main'
 include { EXTRACT_AMPLICONS    } from '../modules/local/extract_amplicons/main'
@@ -11,6 +12,10 @@ include { MAPSEQ as MAPSEQ_SIM } from '../modules/local/mapseq/map/main'
 include { MAPSEQ as MAPSEQ_OBS } from '../modules/local/mapseq/map/main'
 include { SIMULATE_READS       } from '../modules/local/simulate_reads/main'
 include { BUILD_MISMAPPING     } from '../modules/local/build_mismapping/main'
+include { ALIGN_MISMAPPING     } from '../modules/local/align_mismapping/main'
+include { GROUPED_MISMAPPING   } from '../modules/local/grouped_mismapping/main'
+include { MINIMAP2_INDEX       } from '../modules/local/minimap2/index/main'
+include { MINIMAP2_ALLVSALL    } from '../modules/local/minimap2/allvsall/main'
 include { MATRIX_KEY            } from '../modules/local/matrix_key/main'
 include { PUBLISH_MISMAPPING    } from '../modules/local/publish_mismapping/main'
 include { POOL_TRAINING_READS   } from '../modules/local/pool_training_reads/main'
@@ -28,8 +33,40 @@ workflow SUPERRESOLUTION_AMPLICON {
 
     // Error model: only the read simulator uses it, so the whole skiver training
     // subworkflow is skipped under the flat model. [ id, model_pt ] either way.
+    if (!(params.mismapping_method in ['simulate', 'align'])) {
+        error "--mismapping_method must be 'simulate' or 'align'"
+    }
+    if (!(params.align_backend in ['minimap2', 'exact-hash', 'kmer'])) {
+        error "--align_backend must be 'minimap2', 'exact-hash' or 'kmer'"
+    }
+    // `as int`: a --align_tau on the command line arrives as a String, and comparing that
+    // to a number silently misjudges every backend check below.
+    if (params.align_backend == 'kmer' && (params.align_tau as int) < 1) {
+        error "--align_backend kmer requires --align_tau >= 1; use exact-hash for tau=0"
+    }
+    if (params.align_backend == 'exact-hash' && (params.align_tau as int) != 0) {
+        error "--align_backend exact-hash requires --align_tau 0; use kmer for tau >= 1"
+    }
+    if (params.minimap2_args =~ /(^|\s)-[kw]\b/) {
+        // Silently ignored: with a prebuilt .mmi target, minimap2 takes -k/-w from the
+        // index. Putting them here would look like they applied when they did not.
+        error "-k/-w belong in --minimap2_index_args, not --minimap2_args"
+    }
+    if (params.mismapping_method == 'align' && params.sim_read_len) {
+        // Whole-reference distances cannot see what a short read cannot see, and quietly
+        // understating confusion is worse than refusing.
+        error "--mismapping_method align builds M from whole-reference alignments and " +
+              "cannot model --sim_read_len windows. Use --mismapping_method simulate for " +
+              "reads shorter than the amplicon, or merge pairs so queries span it."
+    }
+
     if (params.mismapping_matrix) {
         ch_model = ch_reads.map { meta, reads -> [ meta.id, file(params.mismapping_matrix, checkIfExists: true), 'supplied' ] }
+    }
+    else if (params.mismapping_method == 'align') {
+        // M comes from reference-to-reference alignment: no reads are simulated, so no
+        // error model is needed and the skiver training subworkflow never runs.
+        ch_model = ch_reads.map { meta, reads -> [ meta.id, file("${projectDir}/assets/NO_MODEL"), 'align' ] }
     }
     else if (params.sim_error_model == 'flat') {
         ch_model = ch_reads.map { meta, reads -> [ meta.id, file("${projectDir}/assets/NO_MODEL"), 'flat' ] }
@@ -101,7 +138,14 @@ workflow SUPERRESOLUTION_AMPLICON {
             def source = params.mismapping_matrix ? 'supplied' : 'generated'
             def provenance = [
                 matrix_key: key, reference_sha256: representative[4], model_scope: scope,
-                source: source, sim_error_model: params.sim_error_model,
+                source: source, mismapping_method: params.mismapping_method,
+                align_backend: params.align_backend, align_tau: params.align_tau,
+                align_ambiguity_weight: params.align_ambiguity_weight,
+                max_ambiguous_bases: params.max_ambiguous_bases,
+                max_postings: params.max_postings,
+                minimap2_args: params.minimap2_args,
+                minimap2_index_args: params.minimap2_index_args,
+                sim_error_model: params.sim_error_model,
                 sim_n_per_ref: params.sim_n_per_ref, sim_read_len: params.sim_read_len,
                 flat_sub_rate: params.flat_sub_rate, flat_ins_rate: params.flat_ins_rate,
                 flat_del_rate: params.flat_del_rate, mapseq_args: params.mapseq_args,
@@ -115,6 +159,40 @@ workflow SUPERRESOLUTION_AMPLICON {
 
     if (params.mismapping_matrix) {
         ch_bundle_in = ch_matrix_groups.map { meta, d, supplied_matrix -> [ meta, d, supplied_matrix ] }
+    }
+    else if (params.mismapping_method == 'align') {
+        // One alignment of the reference amplicons against themselves replaces the whole
+        // simulate -> cluster -> map -> tally chain.
+        ch_align_refs = ch_matrix_groups.map { meta, d, model -> [ meta, d.resolve('amplicons.fasta') ] }
+        // Index once, then align against it — the reference set is the target of its own
+        // all-vs-all, so without this every run re-indexes the whole DB.
+        if (params.align_backend in ['kmer', 'exact-hash']) {
+            GROUPED_MISMAPPING(ch_align_refs)
+            ch_versions = ch_versions.mix(GROUPED_MISMAPPING.out.versions)
+            ch_bundle_in = GROUPED_MISMAPPING.out.mismapping
+                .map { meta, matrix -> [ meta.id, meta, matrix ] }
+                .join(ch_matrix_groups.map { meta, d, model -> [ meta.id, d ] })
+                .map { id, meta, matrix, d -> [ meta, d, matrix ] }
+        }
+        else {
+        MINIMAP2_INDEX(ch_align_refs)
+        MINIMAP2_ALLVSALL(ch_align_refs
+            .map { meta, fasta -> [ meta.id, meta, fasta ] }
+            .join(MINIMAP2_INDEX.out.index.map { meta, mmi -> [ meta.id, mmi ] })
+            .map { id, meta, fasta, mmi -> [ meta, fasta, mmi ] })
+        ch_versions = ch_versions.mix(MINIMAP2_INDEX.out.versions)
+                                 .mix(MINIMAP2_ALLVSALL.out.versions)
+        ch_align_in = ch_align_refs
+            .map { meta, fasta -> [ meta.id, meta, fasta ] }
+            .join(MINIMAP2_ALLVSALL.out.paf.map { meta, paf -> [ meta.id, paf ] })
+            .map { id, meta, fasta, paf -> [ meta, fasta, paf ] }
+        ALIGN_MISMAPPING(ch_align_in)
+        ch_versions = ch_versions.mix(ALIGN_MISMAPPING.out.versions)
+        ch_bundle_in = ALIGN_MISMAPPING.out.mismapping
+            .map { meta, matrix -> [ meta.id, meta, matrix ] }
+            .join(ch_matrix_groups.map { meta, d, model -> [ meta.id, d ] })
+            .map { id, meta, matrix, d -> [ meta, d, matrix ] }
+        }
     }
     else {
         // The representative's amplicon directory is sufficient for the common matrix.
@@ -147,7 +225,7 @@ workflow SUPERRESOLUTION_AMPLICON {
     )
     ch_mismapping = PUBLISH_MISMAPPING.out.bundle
         .flatMap { meta, bundle -> meta.members.collect { member ->
-            [ member.id, bundle.resolve('mismapping_matrix.csv'), meta.matrix_key ]
+            [ member.id, bundle.resolve('mismapping_matrix.npz'), meta.matrix_key ]
         } }
 
     // Real reads -> fasta -> mapseq -> the observed per-reference counts.

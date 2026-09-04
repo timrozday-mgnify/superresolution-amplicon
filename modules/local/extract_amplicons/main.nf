@@ -15,7 +15,7 @@ process EXTRACT_AMPLICONS {
     tuple val(meta), path("${meta.id}_amplicons"), emit: dir
     tuple val(meta), path("${meta.id}_amplicons/amplicons.fasta"),
                      path("${meta.id}_amplicons/amplicons.tax"),         emit: refs
-    tuple val(meta), path("${meta.id}_amplicons/translation_table.csv"), emit: translation
+    tuple val(meta), path("${meta.id}_amplicons/translation_table.tsv"), emit: translation
     path "versions.yml",                                                 emit: versions
 
     when:
@@ -44,7 +44,7 @@ process EXTRACT_AMPLICONS {
     cd ${prefix}_amplicons
     printf '>%s\\nACGTACGTACGT\\n' "\$REF_ID" > amplicons.fasta
     printf '#cutoff: 0.00:0.08\\n#name: refdb\\n#levels: Kingdom Genome Copy\\n%s\\tBacteria;ref;%s\\n' "\$REF_ID" "\$REF_ID" > amplicons.tax
-    printf ',%s\\nref,1.0\\n' "\$REF_ID" > translation_table.csv
+    printf 'genome_id\\trefseq\\tweight\\nref\\t%s\\t1.0\\n' "\$REF_ID" > translation_table.tsv
     printf 'refseq,genome,amplicon_len,amplifiable\\n%s,ref,12,True\\n' "\$REF_ID" > refseq_index.csv
     cd ..
 

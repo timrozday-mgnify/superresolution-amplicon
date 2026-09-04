@@ -47,6 +47,102 @@ nextflow_pipeline {
         }
     }
 
+    test("paired samples merge their mates into one query - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input  = "${projectDir}/tests/data/samplesheet.paired.yml"
+                outdir = "$outputDir"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.succeeded().size() == 11 },
+                { assert workflow.trace.tasks().any { it.name.contains('READS_TO_FASTA') } },
+                { assert path("${params.outdir}/mapseq/paired_demo/paired_demo.obs.mseq.gz").exists() }
+            )
+        }
+    }
+
+    test("alignment-built M replaces the whole simulation flow - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input             = "${projectDir}/assets/samplesheet.example.yml"
+                outdir            = "$outputDir"
+                mismapping_method = "align"
+                // Even asking for a trained model must not train one: nothing simulates
+                // reads, so nothing needs an error model.
+                sim_error_model   = "trained"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                // Indexed minimap2 + PAF parsing replace SIMULATE_READS +
+                // MAPSEQ_CLUSTER_MATRIX + MAPSEQ_SIM + BUILD_MISMAPPING: 11 - 4 + 3 = 10.
+                { assert workflow.trace.succeeded().size() == 10 },
+                { assert workflow.trace.tasks().every { !it.name.contains('SIMULATE') } },
+                { assert workflow.trace.tasks().every { !it.name.contains('SKIVER') } },
+                { assert workflow.trace.tasks().any { it.name.contains('ALIGN_MISMAPPING') } },
+                { assert workflow.trace.tasks().any { it.name.contains('MINIMAP2_INDEX') } },
+                { assert workflow.trace.tasks().any { it.name.contains('MINIMAP2_ALLVSALL') } },
+                { assert path("${params.outdir}/mismapping/groups.tsv").exists() }
+            )
+        }
+    }
+
+    test("exact-hash builds M with no mapper at all - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input             = "${projectDir}/assets/samplesheet.example.yml"
+                outdir            = "$outputDir"
+                mismapping_method = "align"
+                align_backend     = "exact-hash"
+                align_tau         = 0
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                // One GROUPED_MISMAPPING replaces MINIMAP2_INDEX + MINIMAP2_ALLVSALL +
+                // ALIGN_MISMAPPING: 10 - 2 = 8.
+                { assert workflow.trace.succeeded().size() == 8 },
+                { assert workflow.trace.tasks().any { it.name.contains('GROUPED_MISMAPPING') } },
+                { assert workflow.trace.tasks().every { !it.name.contains('MINIMAP2') } },
+                { assert workflow.trace.tasks().every { !it.name.contains('SIMULATE') } },
+                { assert path("${params.outdir}/mismapping/groups.tsv").exists() }
+            )
+        }
+    }
+
+    test("kmer widens the duplicate groups to tau >= 1 - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input             = "${projectDir}/assets/samplesheet.example.yml"
+                outdir            = "$outputDir"
+                mismapping_method = "align"
+                align_backend     = "kmer"
+                align_tau         = 1
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.succeeded().size() == 8 },
+                { assert workflow.trace.tasks().any { it.name.contains('GROUPED_MISMAPPING') } },
+                { assert workflow.trace.tasks().every { !it.name.contains('MINIMAP2') } }
+            )
+        }
+    }
+
     test("pre-computed mis-mapping matrix skips its simulation flow - stub") {
         tag "stub"
         options "-stub"
@@ -67,7 +163,7 @@ nextflow_pipeline {
                 { assert workflow.trace.tasks().every { !it.name.contains('SIMULATE') } },
                 { assert workflow.trace.tasks().every { !it.name.contains('SKIVER') } },
                 { assert path("${params.outdir}/mismapping/groups.tsv").exists() },
-                { assert !path("${params.outdir}/composition/demo/demo.mismapping_matrix.csv").exists() }
+                { assert !path("${params.outdir}/composition/demo/demo.mismapping_matrix.npz").exists() }
             )
         }
     }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Build a MAPseq reference FASTA and taxonomy sidecar from a genome YAML file.
+"""Build a MAPseq reference FASTA and taxonomy sidecar from genome FASTAs.
 
 The input YAML must contain a ``genomes`` list. Each entry supplies a genome ``id``,
 semicolon-delimited ``taxonomy``, and source ``fasta`` path. Each source FASTA record is
@@ -8,6 +8,11 @@ matching record in ``<output-prefix>.tax``.
 
 Example:
     build_mapseq_database.py --input genomes.yml --output-prefix db/references
+
+The ``--ssu-fasta`` form accepts GTDB SSU FASTA headers such as
+``RS_GCF_002517985.1~NZ_NOCN01000152.1 d__Bacteria;...;s__Escherichia coli``.
+The text before ``~`` is the genome ID and the semicolon-delimited text after the
+first whitespace is its taxonomy. Bracketed source annotations are ignored.
 """
 from __future__ import annotations
 
@@ -41,7 +46,7 @@ def iter_fasta(path: Path) -> Iterator[tuple[str, str]]:
         path: FASTA file to parse.
 
     Yields:
-        Tuples of the first header token and uppercased sequence.
+        Tuples of the complete header text and uppercased sequence.
 
     Raises:
         ValueError: If the FASTA structure, header, or sequence is invalid.
@@ -65,7 +70,7 @@ def iter_fasta(path: Path) -> Iterator[tuple[str, str]]:
                 header_text = text[1:].strip()
                 if not header_text:
                     raise ValueError(f"{path}:{line_number}: FASTA header is empty")
-                header = header_text.split()[0]
+                header = header_text
                 sequence_parts = []
             elif header is None:
                 raise ValueError(
@@ -166,6 +171,32 @@ def parse_genomes(input_path: Path) -> list[Genome]:
     return genomes
 
 
+def parse_gtdb_ssu_header(header: str) -> tuple[str, str, tuple[str, ...]]:
+    """Return genome ID, source ID, and taxonomy from a GTDB SSU FASTA header.
+
+    Args:
+        header: Complete FASTA header without its leading ``>``.
+
+    Returns:
+        Genome identifier, source sequence identifier, and taxonomy lineage.
+
+    Raises:
+        ValueError: If header does not contain the expected source ID and taxonomy.
+    """
+    source_id, separator, remainder = header.partition(" ")
+    if not separator or not remainder.strip():
+        raise ValueError(f"GTDB SSU header has no taxonomy: {header!r}")
+    genome_id, tilde, _ = source_id.partition("~")
+    if not tilde or not genome_id:
+        raise ValueError(
+            "GTDB SSU source ID must have '<genome_id>~<contig_id>' form: "
+            f"{source_id!r}"
+        )
+    taxonomy_text = remainder.split(" [", maxsplit=1)[0].strip()
+    taxonomy = parse_taxonomy(taxonomy_text, 1)
+    return genome_id, source_id, taxonomy
+
+
 def output_paths(prefix: Path) -> tuple[Path, Path]:
     """Return output FASTA and taxonomy paths for a prefix."""
     return Path(f"{prefix}.fasta"), Path(f"{prefix}.tax")
@@ -204,7 +235,7 @@ def build_database(genomes: Sequence[Genome], output_prefix: Path) -> tuple[Path
     fasta_path, tax_path = output_paths(output_prefix)
     fasta_path.parent.mkdir(parents=True, exist_ok=True)
     max_taxonomy_depth = max(len(genome.taxonomy) for genome in genomes)
-    levels = [f"Taxonomy_{index}" for index in range(1, max_taxonomy_depth + 1)] + ['Subspecies']
+    levels = [f"Taxonomy_{index}" for index in range(1, max_taxonomy_depth + 1)] + ["Genome"]
     fasta_temp = _temporary_path(fasta_path.parent, ".fasta")
     tax_temp = _temporary_path(tax_path.parent, ".tax")
     seen_references: set[str] = set()
@@ -221,7 +252,8 @@ def build_database(genomes: Sequence[Genome], output_prefix: Path) -> tuple[Path
                     max_taxonomy_depth - len(genome.taxonomy)
                 )
                 for copy_index, (source_header, sequence) in enumerate(iter_fasta(genome.fasta)):
-                    reference_id = f"{genome.identifier}|{copy_index}|{source_header}"
+                    source_id = source_header.split()[0]
+                    reference_id = f"{genome.identifier}|{copy_index}|{source_id}"
                     if reference_id in seen_references:
                         raise ValueError(f"duplicate generated reference ID: {reference_id!r}")
                     seen_references.add(reference_id)
@@ -229,6 +261,64 @@ def build_database(genomes: Sequence[Genome], output_prefix: Path) -> tuple[Path
                     taxonomy = ";".join((*padded_taxonomy, genome.identifier))
                     tax_handle.write(f"{reference_id}\t{taxonomy}\n")
                     record_count += 1
+        fasta_temp.replace(fasta_path)
+        tax_temp.replace(tax_path)
+        complete = True
+    finally:
+        if not complete:
+            fasta_temp.unlink(missing_ok=True)
+            tax_temp.unlink(missing_ok=True)
+    return fasta_path, tax_path, record_count
+
+
+def build_gtdb_ssu_database(source_fasta: Path, output_prefix: Path) -> tuple[Path, Path, int]:
+    """Build a MAPseq database from a GTDB SSU FASTA.
+
+    Args:
+        source_fasta: Plain-text or gzip-compressed GTDB SSU FASTA.
+        output_prefix: Prefix for the generated FASTA and taxonomy files.
+
+    Returns:
+        Output FASTA path, taxonomy path, and number of reference records written.
+
+    Raises:
+        ValueError: If a header is malformed or generated reference IDs collide.
+    """
+    fasta_path, tax_path = output_paths(output_prefix)
+    fasta_path.parent.mkdir(parents=True, exist_ok=True)
+    fasta_temp = _temporary_path(fasta_path.parent, ".fasta")
+    tax_temp = _temporary_path(tax_path.parent, ".tax")
+    genome_copy_counts: dict[str, int] = {}
+    seen_references: set[str] = set()
+    record_count = 0
+    taxonomy_depth: int | None = None
+    complete = False
+
+    try:
+        with fasta_temp.open("w") as fasta_handle, tax_temp.open("w") as tax_handle:
+            for header, sequence in iter_fasta(source_fasta):
+                genome_id, source_id, taxonomy = parse_gtdb_ssu_header(header)
+                if taxonomy_depth is None:
+                    taxonomy_depth = len(taxonomy)
+                    levels = [f"Taxonomy_{index}" for index in range(1, taxonomy_depth + 1)]
+                    tax_handle.write(taxonomy_cutoffs(taxonomy_depth + 1))
+                    tax_handle.write(_TAX_NAME)
+                    tax_handle.write(f"#levels: {' '.join([*levels, 'Genome'])}\n")
+                elif len(taxonomy) != taxonomy_depth:
+                    raise ValueError(
+                        f"inconsistent taxonomy depth in {source_fasta}: {header!r}"
+                    )
+                copy_index = genome_copy_counts.get(genome_id, 0)
+                genome_copy_counts[genome_id] = copy_index + 1
+                reference_id = f"{genome_id}|{copy_index}|{source_id}"
+                if reference_id in seen_references:
+                    raise ValueError(f"duplicate generated reference ID: {reference_id!r}")
+                seen_references.add(reference_id)
+                fasta_handle.write(f">{reference_id}\n{sequence}\n")
+                tax_handle.write(f"{reference_id}\t{';'.join((*taxonomy, genome_id))}\n")
+                record_count += 1
+        if taxonomy_depth is None:
+            raise ValueError(f"{source_fasta}: FASTA contains no records")
         fasta_temp.replace(fasta_path)
         tax_temp.replace(tax_path)
         complete = True
@@ -288,9 +378,31 @@ def demo() -> None:
             "demo FASTA headers or sequences are wrong",
         )
         tax_lines = tax_path.read_text().splitlines()
-        _require(tax_lines[2] == "#levels: Taxonomy_1 Taxonomy_2 Taxonomy_3 Copy", "bad levels")
-        _require(tax_lines[3].endswith("Bacteria;Alpha;unclassified;alpha|0|alpha"), "bad padding")
-        _require(tax_lines[5].endswith("Bacteria;Beta;Species;beta|0|beta"), "bad taxonomy")
+        _require(tax_lines[2] == "#levels: Taxonomy_1 Taxonomy_2 Taxonomy_3 Genome", "bad levels")
+        _require(tax_lines[3].endswith("Bacteria;Alpha;unclassified;alpha"), "bad padding")
+        _require(tax_lines[5].endswith("Bacteria;Beta;Species;beta"), "bad taxonomy")
+
+        (root / "gtdb_ssu.fasta").write_text(
+            ">RS_GCF_000001.1~contig_1 d__Bacteria;p__Example;s__Example one "
+            "[location=1..100]\nACGT\n"
+            ">RS_GCF_000001.1~contig_2 d__Bacteria;p__Example;s__Example one "
+            "[location=2..101]\nTGCA\n"
+        )
+        ssu_fasta, ssu_tax, ssu_count = build_gtdb_ssu_database(
+            root / "gtdb_ssu.fasta", root / "gtdb_database"
+        )
+        _require(ssu_count == 2, "GTDB SSU demo wrote the wrong record count")
+        _require(
+            ssu_fasta.read_text().splitlines()[0]
+            == ">RS_GCF_000001.1|0|RS_GCF_000001.1~contig_1",
+            "GTDB SSU demo did not use the genome ID before '~'",
+        )
+        _require(
+            ssu_tax.read_text().splitlines()[3].endswith(
+                "d__Bacteria;p__Example;s__Example one;RS_GCF_000001.1"
+            ),
+            "GTDB SSU demo did not preserve taxonomy",
+        )
 
         (root / "duplicate.yml").write_text(
             "genomes:\n- id: alpha\n  taxonomy: Bacteria\n  fasta: alpha.fasta\n"
@@ -320,6 +432,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, help="YAML file containing a genomes list")
     parser.add_argument(
+        "--ssu-fasta",
+        type=Path,
+        help="GTDB SSU FASTA whose headers encode genome IDs and taxonomy",
+    )
+    parser.add_argument(
         "-o",
         "--output-prefix",
         type=Path,
@@ -330,11 +447,16 @@ def main() -> None:
     if arguments.demo:
         demo()
         return
-    if arguments.input is None or arguments.output_prefix is None:
-        parser.error("--input and --output-prefix are required unless --demo is used")
+    if arguments.output_prefix is None or (arguments.input is None) == (arguments.ssu_fasta is None):
+        parser.error("provide exactly one of --input or --ssu-fasta, plus --output-prefix")
     try:
-        genomes = parse_genomes(arguments.input)
-        fasta_path, tax_path, record_count = build_database(genomes, arguments.output_prefix)
+        if arguments.ssu_fasta is not None:
+            fasta_path, tax_path, record_count = build_gtdb_ssu_database(
+                arguments.ssu_fasta, arguments.output_prefix
+            )
+        else:
+            genomes = parse_genomes(arguments.input)
+            fasta_path, tax_path, record_count = build_database(genomes, arguments.output_prefix)
     except ValueError as exc:
         parser.error(str(exc))
     print(f"mapseq database: {record_count} references -> {fasta_path}, {tax_path}")

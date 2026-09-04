@@ -1,31 +1,32 @@
-process BUILD_MISMAPPING {
+// Build M by collapsing exact-duplicate amplicons, optionally widened to tau >= 1 by a
+// pigeonhole block filter and a bounded IUPAC edit distance. Writes the grouped matrix,
+// which stores one entry per *distinct* amplicon pair instead of per reference pair.
+process GROUPED_MISMAPPING {
     tag "$meta.id"
     label 'process_medium'
 
     container "ghcr.io/timrozday-mgnify/sra-skiver:${params.sra_skiver_tag}"
 
     input:
-    tuple val(meta), path(amplicon_dir), path(sim_mseq)
+    tuple val(meta), path(amplicons)
 
     output:
     tuple val(meta), path("${meta.id}.mismapping_matrix.npz"), emit: mismapping
-    path "versions.yml",                                  emit: versions
-
-    when:
-    task.ext.when == null || task.ext.when
+    path "versions.yml",                                       emit: versions
 
     script:
     def args = task.ext.args ?: ''
     def prefix = task.ext.prefix ?: "${meta.id}"
     """
-    infer_composition.py \\
-        --amplicon-dir ${amplicon_dir} \\
-        --sim-mseq ${sim_mseq} \\
-        --build-mismapping \\
-        -o out \\
+    build_mismapping_align.py \\
+        --backend ${params.align_backend} \\
+        --amplicons ${amplicons} \\
+        --tau ${params.align_tau} \\
+        --max-ambiguous-bases ${params.max_ambiguous_bases} \\
+        --max-postings ${params.max_postings} \\
+        --ambiguity-weight ${params.align_ambiguity_weight} \\
+        -o ${prefix}.mismapping_matrix.npz \\
         $args
-
-    cp out/mismapping_matrix.npz ${prefix}.mismapping_matrix.npz
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":

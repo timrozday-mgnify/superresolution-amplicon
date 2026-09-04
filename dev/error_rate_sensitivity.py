@@ -91,14 +91,18 @@ def make_generator(spec, rng):
 
 
 def build_M(spec, refseqs, amps, work: Path, fasta: Path, tax: Path, seed: int,
-            tag: str | None = None) -> np.ndarray:
-    """Simulate N_PER_REF reads per reference under ``spec``, map, tally -> M."""
+            tag: str | None = None, read_len: int | None = None) -> np.ndarray:
+    """Simulate N_PER_REF reads per reference under ``spec``, map, tally -> M.
+
+    ``read_len`` draws a uniform window of the source amplicon instead of the whole thing
+    (unmerged / short reads), exactly as the pipeline's ``--sim_read_len`` does."""
     rng = np.random.default_rng(seed)
     mutate = make_generator(spec, rng)
     tag = f"sim_{tag or spec}".replace(".", "p")
     reads = []
     for header, seq in zip(refseqs, amps):
-        recs = [(f"{header}:{i}", seq, True) for i in range(N_PER_REF)]
+        recs = [(f"{header}:{i}", sim.draw_fragment(seq, read_len, rng), True)
+                for i in range(N_PER_REF)]
         reads.extend(mutate(recs))
     write_reads(work / f"{tag}.fasta", reads)
     mapseq(work / f"{tag}.fasta", fasta, tax, work / f"{tag}.mseq")
@@ -106,13 +110,14 @@ def build_M(spec, refseqs, amps, work: Path, fasta: Path, tax: Path, seed: int,
 
 
 def build_observed(spec, refseqs, amps, r_true, work: Path, fasta: Path, tax: Path,
-                   seed: int) -> np.ndarray:
+                   seed: int, read_len: int | None = None) -> np.ndarray:
     """Sample N_OBS_READS reads from the true composition under ``spec``, map, count."""
     rng = np.random.default_rng(seed)
     mutate = make_generator(spec, rng)
     tag = f"obs_{spec}".replace(".", "p")
     src = rng.choice(len(refseqs), size=N_OBS_READS, p=r_true)
-    recs = [(f"obs{i}", amps[j], True) for i, j in enumerate(src)]
+    recs = [(f"obs{i}", sim.draw_fragment(amps[j], read_len, rng), True)
+            for i, j in enumerate(src)]
     write_reads(work / f"{tag}.fasta", mutate(recs))
     mapseq(work / f"{tag}.fasta", fasta, tax, work / f"{tag}.mseq")
     counts = si.observed_refseq_counts([work / f"{tag}.mseq"], refseqs)

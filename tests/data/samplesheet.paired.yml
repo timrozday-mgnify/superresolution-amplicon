@@ -1,0 +1,7 @@
+# Paired-end: fastq_1 + fastq_2 sets meta.paired, so READS_TO_FASTA merges each pair into
+# one whole-fragment query before mapping.
+- id: paired_demo
+  fastq_1: tests/data/sample_R1.fastq.gz
+  fastq_2: tests/data/sample_R2.fastq.gz
+  platform: hq-illumina
+  references: tests/data/refs.fasta
