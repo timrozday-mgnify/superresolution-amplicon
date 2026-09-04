@@ -37,7 +37,10 @@ process GROUPED_MISMAPPING {
     stub:
     def prefix = task.ext.prefix ?: "${meta.id}"
     """
-    python -c "import numpy as np; np.savez_compressed('${prefix}.mismapping_matrix.npz', format='grouped', data=[1.0], indices=[0], indptr=[0, 1], shape=[1, 1], group=[0], refseqs=np.frombuffer(b'ref|0|x', dtype=np.uint8))"
+    # An empty file, not a real .npz: a stub run never reads the matrix (the
+    # publish stub copies it, the inference stub writes a fixed CSV), and building
+    # one needs numpy, which a bare CI runner has no reason to carry.
+    touch ${prefix}.mismapping_matrix.npz
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":
