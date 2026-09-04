@@ -7,6 +7,8 @@
 #               one of: hq-illumina | lq-illumina | ont | pacbio  (default: hq-illumina)
 #   references  optional. Per-sample reference fasta; overrides --references.
 #   error_model optional. Path to a pre-trained .pt model; skips training for this sample.
+#   mseq        optional. A mapseq classification of these reads against THIS reference
+#               set (a previous run's mapseq/<id>/<id>.obs.mseq.gz); skips read mapping.
 #
 # Reference fasta headers MUST encode genome membership as `genome|index|orig`
 # (the part before the first '|' is the genome id). Multiple entries with the same

@@ -17,7 +17,8 @@ workflow {
     }
 
     // YAML samplesheet: a list of sample entries, each:
-    //   id, reads (or fastq_1[/fastq_2]), platform, references (optional), error_model (optional)
+    //   id, reads (or fastq_1[/fastq_2]), platform, references (optional),
+    //   error_model (optional), mseq (optional)
     def loaded = new org.yaml.snakeyaml.Yaml().load(file(params.input, checkIfExists: true).text)
     def rows = (loaded instanceof Map) ? loaded.samples : loaded
     if (!(rows instanceof List)) {
@@ -58,6 +59,10 @@ workflow {
             error_model: (row.error_model ? resolveFile(row.error_model.toString()) :
                           (params.error_model ? resolveFile(params.error_model.toString()) : null)),
         ]
+        // A precomputed mapseq classification of THIS sample's reads against THIS
+        // reference set: supplying it skips READS_TO_FASTA + MAPSEQ_OBS. Added only when
+        // present so the mapping tasks of runs that don't use it keep their cached hash.
+        if (row.mseq) meta.mseq = resolveFile(row.mseq.toString())
         [ meta, reads ]
     }
 

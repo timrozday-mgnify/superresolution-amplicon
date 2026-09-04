@@ -1,0 +1,7 @@
+# `mseq:` supplies a previous run's mapseq classification of these reads against this
+# same reference set, so READS_TO_FASTA + MAPSEQ_OBS are skipped.
+- id: demo
+  reads: tests/data/sample.fastq.gz
+  platform: hq-illumina
+  references: tests/data/refs.fasta
+  mseq: tests/data/supplied.obs.mseq.gz

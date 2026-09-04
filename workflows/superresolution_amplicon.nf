@@ -229,7 +229,22 @@ workflow SUPERRESOLUTION_AMPLICON {
         } }
 
     // Real reads -> fasta -> mapseq -> the observed per-reference counts.
-    READS_TO_FASTA(ch_reads)
+    // A sample carrying `mseq:` in the samplesheet supplies that classification instead
+    // and skips both steps — mapping the same reads against the same reference set is by
+    // far the most expensive part of a run, so a parameter sweep over the mis-mapping or
+    // inference knobs should do it once. The supplied file must have been produced
+    // against THIS reference set (its reference ids are matched to the extracted
+    // amplicons) and bakes in the read-preparation settings it was made with
+    // (--obs_max_reads, --trim_primers, --min_pair_overlap): those params no longer
+    // apply to that sample.
+    ch_reads
+        .branch { meta, reads ->
+            supplied: meta.mseq
+            map:      true
+        }
+        .set { ch_obs }
+
+    READS_TO_FASTA(ch_obs.map)
     ch_versions = ch_versions.mix(READS_TO_FASTA.out.versions)
 
     MAPSEQ_OBS(READS_TO_FASTA.out.reads
@@ -238,11 +253,15 @@ workflow SUPERRESOLUTION_AMPLICON {
         .map { id, meta, reads, fasta, tax, mscluster -> [ meta, reads, fasta, tax, mscluster ] })
     ch_versions = ch_versions.mix(MAPSEQ_OBS.out.versions)
 
+    ch_obs_mseq = MAPSEQ_OBS.out.mseq
+        .map { meta, mseq -> [ meta.id, mseq ] }
+        .mix(ch_obs.supplied.map { meta, reads -> [ meta.id, meta.mseq ] })
+
     // INFER_COMPOSITION: amplicon dir + canonical matrix + observed mseq, joined by id.
     ch_infer_in = EXTRACT_AMPLICONS.out.dir
         .map { meta, d -> [ meta.id, meta, d ] }
         .join(ch_mismapping)
-        .join(MAPSEQ_OBS.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
+        .join(ch_obs_mseq)
         .map { id, meta, d, matrix, matrix_key, obs -> [ meta, d, matrix, obs, matrix_key ] }
     INFER_COMPOSITION(ch_infer_in)
     ch_versions = ch_versions.mix(INFER_COMPOSITION.out.versions)
