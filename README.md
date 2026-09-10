@@ -272,6 +272,7 @@ Composition inference (Pyro):
 | `--infer_presence` | `true` | Per-genome Bernoulli presence/absence gate. Not supported with `--infer_mode nuts`. |
 | `--infer_presence_prior` | `0.01` | Prior probability a genome is present — the sparsity regulariser. |
 | `--infer_presence_temp` | `1.0` | Concrete relaxation temperature for the gate. Below ~1 the gate barely moves off its initialisation and no prior can sparsify it. |
+| `--infer_prune` | `true` | Fit only the genomes the sample's reads can reach — those owning an observed reference, or one byte-identical to it — instead of the whole reference set. Pruned genomes are still reported, at zero. Against a database-scale set this is most of the per-sample cost; set `false` to fit everything. |
 
 > **Presence/absence.** Abundance and presence are different questions. `theta` is a
 > Dirichlet, so every genome in the reference DB gets *some* mass and the output can
