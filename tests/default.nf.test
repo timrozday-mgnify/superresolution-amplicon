@@ -167,6 +167,53 @@ nextflow_pipeline {
         }
     }
 
+    test("the distance decay can be measured and fitted instead of guessed - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input             = "${projectDir}/assets/samplesheet.example.yml"
+                outdir            = "$outputDir"
+                mismapping_method = "align"
+                align_backend     = "kmer"
+                align_tau         = 1
+                // Measured off the flat error model at build time, then fitted per
+                // sample at inference — neither needs a number chosen by hand, and
+                // neither trains anything.
+                align_distance_decay = "auto"
+                infer_distance_decay = true
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.succeeded().size() == 8 },
+                { assert workflow.trace.tasks().every { !it.name.contains('SKIVER') } },
+                { assert workflow.trace.tasks().any { it.name.contains('GROUPED_MISMAPPING') } }
+            )
+        }
+    }
+
+    test("fitting the decay needs a matrix that recorded its distances - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input             = "${projectDir}/assets/samplesheet.example.yml"
+                outdir            = "$outputDir"
+                mismapping_method = "simulate"
+                infer_distance_decay = true
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.failed },
+                { assert workflow.stdout.any { it.contains('--infer_distance_decay needs') }
+                         || workflow.errorReport.contains('--infer_distance_decay needs') }
+            )
+        }
+    }
+
     test("pre-computed mis-mapping matrix skips its simulation flow - stub") {
         tag "stub"
         options "-stub"

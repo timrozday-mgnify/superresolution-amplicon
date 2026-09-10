@@ -8,7 +8,7 @@ process GROUPED_MISMAPPING {
     container "ghcr.io/timrozday-mgnify/sra-skiver:${params.sra_skiver_tag}"
 
     input:
-    tuple val(meta), path(amplicons)
+    tuple val(meta), path(amplicons), path(decay_model)
 
     output:
     tuple val(meta), path("${meta.id}.mismapping_matrix.npz"), emit: mismapping
@@ -17,12 +17,20 @@ process GROUPED_MISMAPPING {
     script:
     def args = task.ext.args ?: ''
     def prefix = task.ext.prefix ?: "${meta.id}"
+    // Only read for --distance-decay auto; the placeholder means "measure the flat rates".
+    def model_arg = decay_model.name == 'NO_MODEL' ? '' : "--error-model trained --model-pt ${decay_model}"
     """
+    export SKIVER_SCRIPTS=\${SKIVER_SCRIPTS:-/opt/skiver/scripts}
+
     build_mismapping_align.py \\
         --backend ${params.align_backend} \\
         --amplicons ${amplicons} \\
         --tau ${params.align_tau} \\
         --distance-decay ${params.align_distance_decay} \\
+        --sub-rate ${params.flat_sub_rate} \\
+        --ins-rate ${params.flat_ins_rate} \\
+        --del-rate ${params.flat_del_rate} \\
+        ${model_arg} \\
         --max-ambiguous-bases ${params.max_ambiguous_bases} \\
         --max-postings ${params.max_postings} \\
         --ambiguity-weight ${params.align_ambiguity_weight} \\

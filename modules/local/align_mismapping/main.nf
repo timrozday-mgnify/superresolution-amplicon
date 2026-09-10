@@ -13,7 +13,7 @@ process ALIGN_MISMAPPING {
     container "ghcr.io/timrozday-mgnify/sra-skiver:${params.sra_skiver_tag}"
 
     input:
-    tuple val(meta), path(amplicons), path(paf)
+    tuple val(meta), path(amplicons), path(paf), path(decay_model)
 
     output:
     tuple val(meta), path("${meta.id}.mismapping_matrix.npz"), emit: mismapping
@@ -25,10 +25,15 @@ process ALIGN_MISMAPPING {
     script:
     def args = task.ext.args ?: ''
     def prefix = task.ext.prefix ?: "${meta.id}"
+    // Only read for --distance-decay auto; the placeholder means "measure the flat rates".
+    def model_arg = decay_model.name == 'NO_MODEL' ? '' : "--error-model trained --model-pt ${decay_model}"
     """
+    export SKIVER_SCRIPTS=\${SKIVER_SCRIPTS:-/opt/skiver/scripts}
+
     build_mismapping_align.py \\
         --amplicons ${amplicons} \\
         --paf ${paf} \\
+        ${model_arg} \\
         -o ${prefix}.mismapping_matrix.npz \\
         $args
 

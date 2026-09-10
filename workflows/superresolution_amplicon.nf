@@ -47,17 +47,36 @@ workflow SUPERRESOLUTION_AMPLICON {
     if (params.align_backend == 'exact-hash' && (params.align_tau as int) != 0) {
         error "--align_backend exact-hash requires --align_tau 0; use kmer for tau >= 1"
     }
-    if (!((params.align_distance_decay as double) >= 0.0
-          && (params.align_distance_decay as double) <= 1.0)) {
-        error "--align_distance_decay must be in [0, 1]"
+    def auto_decay = params.align_distance_decay.toString() == 'auto'
+    if (!auto_decay && !((params.align_distance_decay as double) >= 0.0
+                         && (params.align_distance_decay as double) <= 1.0)) {
+        error "--align_distance_decay must be in [0, 1], or 'auto'"
     }
-    if ((params.align_tau as int) >= 1 && (params.align_distance_decay as double) == 1.0) {
+    if (params.align_decay_model && !auto_decay) {
+        error "--align_decay_model is only read by --align_distance_decay auto"
+    }
+    if (params.infer_distance_decay) {
+        // The latent needs the distances behind the matrix's nonzeros, and needs them to
+        // differ within a row. Only a tau >= 1 alignment build has either.
+        if (params.mismapping_method != 'align' || (params.align_tau as int) < 1) {
+            error "--infer_distance_decay needs --mismapping_method align at " +
+                  "--align_tau >= 1: no other matrix records the distance behind each " +
+                  "nonzero, and at tau 0 every distance is 0 and c cancels."
+        }
+        if (params.mismapping_matrix) {
+            log.warn "--infer_distance_decay with a supplied --mismapping_matrix: it will " +
+                     "be refused unless that matrix was built with distance strata."
+        }
+    }
+    if ((params.align_tau as int) >= 1 && !auto_decay && !params.infer_distance_decay
+        && (params.align_distance_decay as double) == 1.0) {
         // Not an error: it is the behaviour every matrix built before the knob existed
         // has, so a rerun of one must still be possible.
         log.warn "--align_tau ${params.align_tau} with --align_distance_decay 1 treats a " +
                  "reference within tau as an exact duplicate, which overstates confusion " +
                  "between references a base or two apart. Set --align_distance_decay to " +
-                 "about the per-base error rate."
+                 "about the per-base error rate, or 'auto' to measure it, or set " +
+                 "--infer_distance_decay to fit it per sample."
     }
     if (params.minimap2_args =~ /(^|\s)-[kw]\b/) {
         // Silently ignored: with a prebuilt .mmi target, minimap2 takes -k/-w from the
@@ -153,6 +172,7 @@ workflow SUPERRESOLUTION_AMPLICON {
                 source: source, mismapping_method: params.mismapping_method,
                 align_backend: params.align_backend, align_tau: params.align_tau,
                 align_distance_decay: params.align_distance_decay,
+                align_decay_model: params.align_decay_model,
                 align_ambiguity_weight: params.align_ambiguity_weight,
                 max_ambiguous_bases: params.max_ambiguous_bases,
                 max_postings: params.max_postings,
@@ -176,7 +196,13 @@ workflow SUPERRESOLUTION_AMPLICON {
     else if (params.mismapping_method == 'align') {
         // One alignment of the reference amplicons against themselves replaces the whole
         // simulate -> cluster -> map -> tally chain.
-        ch_align_refs = ch_matrix_groups.map { meta, d, model -> [ meta, d.resolve('amplicons.fasta') ] }
+        // Only read by '--align_distance_decay auto'; the placeholder keeps the input
+        // slot filled and means "measure the flat rates instead". This is a *pre-trained*
+        // model — align mode still never runs the skiver training subworkflow.
+        ch_decay_model = file(params.align_decay_model ?: "${projectDir}/assets/NO_MODEL",
+                              checkIfExists: true)
+        ch_align_refs = ch_matrix_groups.map { meta, d, model ->
+            [ meta, d.resolve('amplicons.fasta'), ch_decay_model ] }
         // Index once, then align against it — the reference set is the target of its own
         // all-vs-all, so without this every run re-indexes the whole DB.
         if (params.align_backend in ['kmer', 'exact-hash']) {
@@ -188,17 +214,18 @@ workflow SUPERRESOLUTION_AMPLICON {
                 .map { id, meta, matrix, d -> [ meta, d, matrix ] }
         }
         else {
-        MINIMAP2_INDEX(ch_align_refs)
-        MINIMAP2_ALLVSALL(ch_align_refs
+        ch_minimap2_refs = ch_align_refs.map { meta, fasta, model -> [ meta, fasta ] }
+        MINIMAP2_INDEX(ch_minimap2_refs)
+        MINIMAP2_ALLVSALL(ch_minimap2_refs
             .map { meta, fasta -> [ meta.id, meta, fasta ] }
             .join(MINIMAP2_INDEX.out.index.map { meta, mmi -> [ meta.id, mmi ] })
             .map { id, meta, fasta, mmi -> [ meta, fasta, mmi ] })
         ch_versions = ch_versions.mix(MINIMAP2_INDEX.out.versions)
                                  .mix(MINIMAP2_ALLVSALL.out.versions)
         ch_align_in = ch_align_refs
-            .map { meta, fasta -> [ meta.id, meta, fasta ] }
+            .map { meta, fasta, model -> [ meta.id, meta, fasta, model ] }
             .join(MINIMAP2_ALLVSALL.out.paf.map { meta, paf -> [ meta.id, paf ] })
-            .map { id, meta, fasta, paf -> [ meta, fasta, paf ] }
+            .map { id, meta, fasta, model, paf -> [ meta, fasta, paf, model ] }
         ALIGN_MISMAPPING(ch_align_in)
         ch_versions = ch_versions.mix(ALIGN_MISMAPPING.out.versions)
         ch_bundle_in = ALIGN_MISMAPPING.out.mismapping

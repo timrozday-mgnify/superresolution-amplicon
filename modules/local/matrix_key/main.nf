@@ -16,6 +16,7 @@ process MATRIX_KEY {
         mismapping_method: params.mismapping_method, align_backend: params.align_backend,
         align_tau: params.align_tau,
         align_distance_decay: params.align_distance_decay,
+        align_decay_model: params.align_decay_model,
         align_ambiguity_weight: params.align_ambiguity_weight,
         max_ambiguous_bases: params.max_ambiguous_bases,
         max_postings: params.max_postings,

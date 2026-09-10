@@ -368,8 +368,14 @@ def build_kmer_grouped(
     ambiguity_weight: float,
     max_postings: int,
     distance_decay: float = 1.0,
-) -> tuple[list[str], sparse.csr_array, np.ndarray, np.ndarray]:
-    """Build ``M`` from exact duplicates widened by verified neighbours within ``tau``."""
+) -> tuple[list[str], sparse.csr_array, np.ndarray, np.ndarray, sparse.csr_array]:
+    """Build ``M`` from exact duplicates widened by verified neighbours within ``tau``.
+
+    Returns the **distance strata** alongside the kernel: ``d(a, j)`` on the same sparsity
+    pattern, which is what lets inference re-decay ``M`` at another ``c`` without the
+    sequences (``sparse_matrix``'s module docstring). ``build_exact_grouped`` has no
+    counterpart because every distance there is 0 and ``c`` cancels.
+    """
     if tau < 1:
         raise ValueError("kmer backend requires --tau >= 1; use exact-hash for tau=0")
     refseqs, group, sequences = dedup(amplicons)
@@ -387,13 +393,20 @@ def build_kmer_grouped(
     weights = ambiguity_weights(sequences, ambiguity_weight)
     # ``adjacency`` carries the distance decay, so it is the membership matrix
     # ``tie_cluster_matrix`` normalises densely, not a 0/1 pattern.
-    edge = np.float64(distance_decay) ** distances[distances <= tau].astype(np.float64)
+    verified = distances[distances <= tau].astype(np.float64)
+    edge = np.float64(distance_decay) ** verified
     rows = np.concatenate([np.arange(unique), neighbours[:, 0], neighbours[:, 1]])
     columns = np.concatenate([np.arange(unique), neighbours[:, 1], neighbours[:, 0]])
     adjacency = sparse.csr_array(
         (np.concatenate([np.ones(unique), edge, edge]), (rows, columns)),
         shape=(unique, unique))
     adjacency.setdiag(1.0)                        # coo summed the duplicate self-entries
+    # Same COO structure, so the same pattern: ``d + 1`` (0 would be structural).
+    strata = sparse.csr_array(
+        (np.concatenate([np.ones(unique), verified + 1.0, verified + 1.0]), (rows, columns)),
+        shape=(unique, unique))
+    strata.setdiag(1.0)
+    strata.data -= 1.0
     mass = sizes * (1.0 if weights is None else weights)
     per_row = adjacency @ mass
     width = np.diff(adjacency.indptr)
@@ -415,7 +428,7 @@ def build_kmer_grouped(
         nearest_unique[source] = min(nearest_unique[source], distance)
         nearest_unique[target] = min(nearest_unique[target], distance)
     nearest = np.where(sizes[group] > 1, 0, nearest_unique[group]).astype(np.int32)
-    return refseqs, cluster, group, nearest
+    return refseqs, cluster, group, nearest, strata
 
 
 def _cigar_distance(cigar: str, query: str, target: str) -> int:
@@ -524,6 +537,36 @@ def paf_distances(
     return d
 
 
+def measure_error_rate(error_model: str = "flat", model_pt: Path | None = None,
+                       sub_rate: float = 0.005, ins_rate: float = 0.0005,
+                       del_rate: float = 0.0005, length: int = 1000, n: int = 200,
+                       seed: int = 0) -> float:
+    """Mean per-base edit rate of a sequencing-error model, measured by sampling it.
+
+    ``--distance-decay auto`` is this number. Reaching a distance-1 reference costs one
+    error at the one position that separates them, so the decay is on the order of the
+    per-base error rate — measuring it beats asserting it, and it is the only way to get a
+    number out of a *trained* skiver model, whose rate is context-dependent and not a
+    parameter anyone can read off.
+
+    Measured rather than summed from the flat rates so both models go through one path:
+    at the pipeline's defaults (0.005/0.0005/0.0005) this returns ~0.006, against the
+    0.007 fitted by matching the simulate+map matrix on the two-strain B. uniformis set.
+    """
+    import simulate_amplicon_reads as sim   # local: pulls in skiver for a trained model
+
+    rng = np.random.default_rng(seed)
+    sequence = "".join(rng.choice(list(_BASES), size=length))
+    reads = sim.sampler(error_model, model_pt, sub_rate, ins_rate, del_rate)(
+        [(str(i), sequence, True) for i in range(n)], rng)
+    edits = sum(edlib.align(read, sequence, mode="NW", task="distance")["editDistance"]
+                for _, read in reads)
+    rate = edits / float(n * length)
+    log.info("measured per-base error rate %.5f (%s model, %d x %dbp)",
+             rate, error_model, n, length)
+    return rate
+
+
 def ambiguity_weights(seqs: list[str], weight: float) -> np.ndarray | None:
     """Per-reference tie-break weight ``weight ** (number of ambiguous positions)``.
 
@@ -608,8 +651,11 @@ def build_sparse(
     tau: int = 0,
     ambiguity_weight: float = 1.0,
     distance_decay: float = 1.0,
-) -> tuple[list[str], sparse.csr_array, np.ndarray]:
-    """Build the alignment kernel without allocating a reference-square array."""
+) -> tuple[list[str], sparse.csr_array, np.ndarray, sparse.csr_array]:
+    """Build the alignment kernel without allocating a reference-square array.
+
+    Returns the row-stochastic matrix and its distance strata (see ``build_kmer_grouped``).
+    """
     records = si.read_fasta(amplicons)
     if not records:
         raise SystemExit(f"{amplicons} contains no sequences")
@@ -668,17 +714,25 @@ def build_sparse(
     rows: list[int] = []
     columns: list[int] = []
     values: list[float] = []
+    strata: list[float] = []
     for source, targets in enumerate(members):
         target_list = sorted(targets)
-        decayed = np.float64(distance_decay) ** np.array(
-            [targets[target] for target in target_list], dtype=np.float64)
+        edits = np.array([targets[target] for target in target_list], dtype=np.float64)
+        decayed = np.float64(distance_decay) ** edits
         weight = decayed if weights is None else decayed * weights[target_list]
         if weight.sum() == 0:
             weight = decayed
         rows.extend([source] * len(target_list))
         columns.extend(target_list)
-        values.extend(weight.tolist())
-    return refseqs, sparse.csr_array((values, (rows, columns)), shape=(n_refs, n_refs)), nearest
+        values.extend((weight / weight.sum()).tolist())
+        strata.extend(edits.tolist())
+    shape = (n_refs, n_refs)
+    # ``d + 1`` through the COO constructor, then back: a 0 in the data of a matrix being
+    # assembled is an invitation to lose the entry, and the strata must keep M's pattern.
+    distances = sparse.csr_array((np.asarray(strata) + 1.0, (rows, columns)), shape=shape)
+    distances.data -= 1.0
+    return (refseqs, sparse.csr_array((values, (rows, columns)), shape=shape), nearest,
+            distances)
 
 
 def summarise(M: pd.DataFrame, d: np.ndarray) -> None:
@@ -772,14 +826,14 @@ def demo() -> None:
         _, exact_S, exact_group, _ = build_exact_grouped(fa)
         assert np.allclose(exact_S.toarray()[np.ix_(exact_group, exact_group)],
                            tie_cluster_matrix(d, tau=0))
-        _, kmer_S, kmer_group, kmer_near = build_kmer_grouped(
+        _, kmer_S, kmer_group, kmer_near, _ = build_kmer_grouped(
             fa, tau=1, max_ambiguous_bases=2, ambiguity_weight=1.0,
             max_postings=DEFAULT_MAX_POSTINGS,
         )
         assert np.allclose(kmer_S.toarray()[np.ix_(kmer_group, kmer_group)], M1)
         assert list(kmer_near) == [0, 0, 0, 1, UNRESOLVED_DISTANCE], kmer_near
         # ... and all three backends agree under decay too, not just at c = 1.
-        _, decay_S, decay_group, _ = build_kmer_grouped(
+        _, decay_S, decay_group, _, decay_d = build_kmer_grouped(
             fa, tau=1, max_ambiguous_bases=2, ambiguity_weight=1.0,
             max_postings=DEFAULT_MAX_POSTINGS, distance_decay=0.01,
         )
@@ -789,12 +843,42 @@ def demo() -> None:
         decay_frame = build(fa, paf, tau=1, distance_decay=0.01)[0].to_numpy()
         assert np.allclose(decay_frame.sum(axis=1), 1.0), decay_frame
         assert decay_frame[3, 3] > 0.98 and decay_frame[0, 3] < 0.01, decay_frame
-        sm.write_grouped(Path(td) / "g.npz", kmer_S, kmer_group,
-                         [f"ref|{i}|x" for i in range(5)])
-        back_S, back_group = sm.read_grouped(Path(td) / "g.npz",
-                                             [f"ref|{i}|x" for i in range(5)][::-1])
+        # The PAF path writes a row-stochastic matrix, which sparse_matrix.read_matrix
+        # is entitled to insist on; its strata carry the distances behind each nonzero.
+        _, paf_M, _, paf_d = build_sparse(fa, paf, tau=1, distance_decay=0.01)
+        assert np.allclose(paf_M.toarray(), decay_frame), paf_M.toarray()
+        assert np.array_equal(paf_d.toarray() != 0, np.array(
+            [[0, 0, 0, 1, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0],
+             [1, 0, 0, 0, 0], [0, 0, 0, 0, 0]], dtype=bool)), paf_d.toarray()
+
+        # The strata contract: re-decaying a built matrix to another c reproduces the
+        # matrix that c would have been built with — which is the whole basis of
+        # ``infer_composition.py --infer-distance-decay`` fitting c against one build.
+        sizes = np.bincount(decay_group, minlength=decay_S.shape[0]).astype(np.float64)
+        redecayed = decay_S.toarray() * (1.0 / 0.01) ** decay_d.toarray()
+        redecayed /= (redecayed @ sizes)[:, None]
+        assert np.allclose(redecayed[np.ix_(decay_group, decay_group)], M1), redecayed
+
+        refs = [f"ref|{i}|x" for i in range(5)]
+        sm.write_grouped(Path(td) / "g.npz", kmer_S, kmer_group, refs)
+        back_S, back_group = sm.read_grouped(Path(td) / "g.npz", refs[::-1])
         assert np.allclose(back_S.toarray()[np.ix_(back_group, back_group)], M1[::-1, ::-1])
         assert np.allclose(sm.grouped_diagonal(back_S, back_group), np.diag(M1)[::-1])
+        # Strata survive the round trip, on the kernel's own (unpermuted) order.
+        sm.write_grouped(Path(td) / "d.npz", decay_S, decay_group, refs,
+                         (decay_d, 0.01))
+        _, _, strata = sm.read_grouped(Path(td) / "d.npz", refs[::-1], strata=True)
+        assert np.allclose(strata[0].toarray(), decay_d.toarray()) and strata[1] == 0.01
+        assert sm.read_grouped(Path(td) / "g.npz", refs, strata=True)[2] is None
+        sm.write_matrix(Path(td) / "s.npz", paf_M, refs, (paf_d, 0.01))
+        back_M, back_strata = sm.read_matrix(Path(td) / "s.npz", refs[::-1], strata=True)
+        assert np.allclose(back_M.toarray(), paf_M.toarray()[::-1, ::-1])
+        assert np.allclose(back_strata[0].toarray(), paf_d.toarray()[::-1, ::-1])
+
+    # `--distance-decay auto`: the flat model's measured rate is its three rates back.
+    assert abs(measure_error_rate("flat", sub_rate=0.01, ins_rate=0.0, del_rate=0.0)
+               - 0.01) < 0.002
+    assert measure_error_rate("flat", sub_rate=0.0, ins_rate=0.0, del_rate=0.0) == 0.0
 
     # The pigeonhole filter must not miss a pair inside tau, whatever the block layout.
     near = ["ACGTACGTACGTACGTACGTAAAA", "ACGTACGTACGTACGTACGTAAAC",   # 1 substitution
@@ -864,13 +948,29 @@ def main() -> None:
         help="skip a pigeonhole block shared by more than this many distinct amplicons "
              f"(default: {DEFAULT_MAX_POSTINGS}); the only source of false negatives",
     )
-    ap.add_argument("--distance-decay", type=float, default=1.0,
+    ap.add_argument("--distance-decay", default="1.0",
                     help="discount a cluster member by this factor per edit of distance: "
                          "M[a, j] proportional to c ** d(a, j). A no-op at --tau 0 (every "
                          "member is at distance 0). At --tau >= 1 the default of 1 makes a "
                          "reference one edit away as likely as an exact duplicate, which "
                          "overstates confusion by orders of magnitude; set it to about the "
-                         "per-base error rate (~0.007 measured at 0.5%% flat error).")
+                         "per-base error rate (~0.007 measured at 0.5%% flat error), or "
+                         "'auto' to measure that rate off the error model below instead "
+                         "of guessing it.")
+    ap.add_argument("--error-model", choices=("flat", "trained"), default="flat",
+                    help="'--distance-decay auto' only: which sequencing-error model to "
+                         "measure. 'trained' needs --model-pt (a skiver model.pt) and the "
+                         "skiver library; 'flat' uses the three rates below and needs "
+                         "neither.")
+    ap.add_argument("--model-pt", type=Path,
+                    help="trained skiver error model (.pt) for '--distance-decay auto "
+                         "--error-model trained'")
+    ap.add_argument("--sub-rate", type=float, default=0.005,
+                    help="flat error model: per-base substitution probability")
+    ap.add_argument("--ins-rate", type=float, default=0.0005,
+                    help="flat error model: per-base insertion probability")
+    ap.add_argument("--del-rate", type=float, default=0.0005,
+                    help="flat error model: per-base deletion probability")
     ap.add_argument("--ambiguity-weight", type=float, default=DEFAULT_AMBIGUITY_WEIGHT,
                     help="tie-break weight per ambiguous position in a reference: a "
                          f"cluster member with k of them gets w**k (default "
@@ -890,6 +990,19 @@ def main() -> None:
             ap.error(f"--{req.replace('_', '-')} is required (unless --demo)")
     if not 0.0 <= a.ambiguity_weight <= 1.0:
         ap.error("--ambiguity-weight must be in [0, 1]")
+    if a.distance_decay == "auto":
+        if a.error_model == "trained" and a.model_pt is None:
+            ap.error("--distance-decay auto --error-model trained needs --model-pt")
+        a.distance_decay = measure_error_rate(a.error_model, a.model_pt, a.sub_rate,
+                                              a.ins_rate, a.del_rate)
+        if a.distance_decay <= 0.0:
+            ap.error("--distance-decay auto measured a zero error rate; set it explicitly")
+        log.info("--distance-decay auto -> %.5f", a.distance_decay)
+    else:
+        try:
+            a.distance_decay = float(a.distance_decay)
+        except ValueError:
+            ap.error("--distance-decay must be a number or 'auto'")
     if not 0.0 <= a.distance_decay <= 1.0:
         ap.error("--distance-decay must be in [0, 1]")
     if a.tau >= 1 and a.distance_decay == 1.0:
@@ -899,8 +1012,9 @@ def main() -> None:
                     "per-base error rate.", a.tau)
     if a.max_ambiguous_bases < 0 or a.max_postings < 1:
         ap.error("--max-ambiguous-seed-bases must be non-negative and --max-postings >= 1")
+    distances = None
     if a.backend == "kmer":
-        refseqs, M, group, nearest = build_kmer_grouped(
+        refseqs, M, group, nearest, distances = build_kmer_grouped(
             a.amplicons, a.tau, a.max_ambiguous_bases, a.ambiguity_weight,
             a.max_postings, a.distance_decay,
         )
@@ -910,13 +1024,16 @@ def main() -> None:
         refseqs, M, group, nearest = build_exact_grouped(a.amplicons)
     else:
         group = None
-        refseqs, M, nearest = build_sparse(a.amplicons, a.paf, a.tau, a.ambiguity_weight,
-                                           a.distance_decay)
+        refseqs, M, nearest, distances = build_sparse(
+            a.amplicons, a.paf, a.tau, a.ambiguity_weight, a.distance_decay)
+    # Strata only where they can be used: at tau 0 every distance is 0 and re-decaying is
+    # a no-op, and at decay 0 the ratio c/c0 they are rebuilt through is undefined.
+    strata = None if a.tau < 1 or a.distance_decay <= 0.0 else (distances, a.distance_decay)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     if group is None:
-        sm.write_matrix(a.output, M, refseqs)
+        sm.write_matrix(a.output, M, refseqs, strata)
     else:
-        sm.write_grouped(a.output, M, group, refseqs)
+        sm.write_grouped(a.output, M, group, refseqs, strata)
     summarise_sparse(M, nearest, group)
     print(f"build_mismapping_align: {len(refseqs)} references, tau={a.tau}, "
           f"decay={a.distance_decay} -> {a.output}")
