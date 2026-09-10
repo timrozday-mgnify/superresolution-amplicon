@@ -22,6 +22,7 @@ process GROUPED_MISMAPPING {
         --backend ${params.align_backend} \\
         --amplicons ${amplicons} \\
         --tau ${params.align_tau} \\
+        --distance-decay ${params.align_distance_decay} \\
         --max-ambiguous-bases ${params.max_ambiguous_bases} \\
         --max-postings ${params.max_postings} \\
         --ambiguity-weight ${params.align_ambiguity_weight} \\

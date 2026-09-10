@@ -47,6 +47,18 @@ workflow SUPERRESOLUTION_AMPLICON {
     if (params.align_backend == 'exact-hash' && (params.align_tau as int) != 0) {
         error "--align_backend exact-hash requires --align_tau 0; use kmer for tau >= 1"
     }
+    if (!((params.align_distance_decay as double) >= 0.0
+          && (params.align_distance_decay as double) <= 1.0)) {
+        error "--align_distance_decay must be in [0, 1]"
+    }
+    if ((params.align_tau as int) >= 1 && (params.align_distance_decay as double) == 1.0) {
+        // Not an error: it is the behaviour every matrix built before the knob existed
+        // has, so a rerun of one must still be possible.
+        log.warn "--align_tau ${params.align_tau} with --align_distance_decay 1 treats a " +
+                 "reference within tau as an exact duplicate, which overstates confusion " +
+                 "between references a base or two apart. Set --align_distance_decay to " +
+                 "about the per-base error rate."
+    }
     if (params.minimap2_args =~ /(^|\s)-[kw]\b/) {
         // Silently ignored: with a prebuilt .mmi target, minimap2 takes -k/-w from the
         // index. Putting them here would look like they applied when they did not.
@@ -140,6 +152,7 @@ workflow SUPERRESOLUTION_AMPLICON {
                 matrix_key: key, reference_sha256: representative[4], model_scope: scope,
                 source: source, mismapping_method: params.mismapping_method,
                 align_backend: params.align_backend, align_tau: params.align_tau,
+                align_distance_decay: params.align_distance_decay,
                 align_ambiguity_weight: params.align_ambiguity_weight,
                 max_ambiguous_bases: params.max_ambiguous_bases,
                 max_postings: params.max_postings,

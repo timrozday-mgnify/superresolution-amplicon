@@ -5,11 +5,21 @@ The cheap alternative to the simulate-reads-and-map measurement: instead of samp
 errored reads from every reference and running them through mapseq, align the reference
 amplicons to each other and read ``M`` straight off the distances.
 
-The kernel is the *tie cluster*: a read from reference ``a`` is assigned uniformly over
-the references within ``--tau`` edit operations of ``a`` (``a`` itself included, at
-distance 0), so
+The kernel is the *tie cluster*: a read from reference ``a`` is assigned over the
+references within ``--tau`` edit operations of ``a`` (``a`` itself included, at
+distance 0), in proportion to ``--distance-decay ** d(a, j)``, so
 
-    M[a, j] = 1 / |cluster(a)|   if d(a, j) <= tau, else 0
+    M[a, j] proportional to c ** d(a, j)   if d(a, j) <= tau, else 0
+
+with ``c = 1`` (the default) giving the uniform split. ``c = 1`` is right at ``tau = 0``,
+where every cluster member is at distance 0 and the decay cancels, and wrong at any
+larger tau: a reference one edit away is *not* as likely as an exact duplicate. Reaching
+it costs one sequencing error at that exact position, so ``c`` is on the order of the
+per-base error rate. Measured on the benchmark's two-strain B. uniformis V4 set (two
+exact-duplicate clusters 1 edit apart, 0.5% flat error): the simulate+map matrix leaks
+0.010 of a row across the gap, which ``c ~= 0.007`` reproduces and ``c = 1`` overstates
+by 60x (M[a, j] = 0.2 against a measured 0.002-0.006). Leaving ``c = 1`` at ``tau >= 1``
+is warned about, not refused.
 
 A reference with no neighbour inside ``tau`` gets an identity row — ``r_true`` passes
 through uncorrected, the same convention ``subspecies_infer.build_mismapping`` uses for a
@@ -357,6 +367,7 @@ def build_kmer_grouped(
     max_ambiguous_bases: int,
     ambiguity_weight: float,
     max_postings: int,
+    distance_decay: float = 1.0,
 ) -> tuple[list[str], sparse.csr_array, np.ndarray, np.ndarray]:
     """Build ``M`` from exact duplicates widened by verified neighbours within ``tau``."""
     if tau < 1:
@@ -374,22 +385,26 @@ def build_kmer_grouped(
 
     sizes = np.bincount(group, minlength=unique)
     weights = ambiguity_weights(sequences, ambiguity_weight)
+    # ``adjacency`` carries the distance decay, so it is the membership matrix
+    # ``tie_cluster_matrix`` normalises densely, not a 0/1 pattern.
+    edge = np.float64(distance_decay) ** distances[distances <= tau].astype(np.float64)
     rows = np.concatenate([np.arange(unique), neighbours[:, 0], neighbours[:, 1]])
     columns = np.concatenate([np.arange(unique), neighbours[:, 1], neighbours[:, 0]])
-    adjacency = sparse.csr_array((np.ones(len(rows)), (rows, columns)),
-                                 shape=(unique, unique))
-    adjacency.data[:] = 1.0                       # coo summed the duplicate self-entries
+    adjacency = sparse.csr_array(
+        (np.concatenate([np.ones(unique), edge, edge]), (rows, columns)),
+        shape=(unique, unique))
+    adjacency.setdiag(1.0)                        # coo summed the duplicate self-entries
     mass = sizes * (1.0 if weights is None else weights)
     per_row = adjacency @ mass
     width = np.diff(adjacency.indptr)
-    share = (np.ones(adjacency.nnz) if weights is None
-             else weights[adjacency.indices].copy())
+    share = (adjacency.data if weights is None
+             else adjacency.data * weights[adjacency.indices])
     dead = per_row == 0
     if dead.any():
         # An all-ambiguous cluster has no tie left to break; fall back to the plain split
         # rather than divide by zero (same convention as ``_normalise``).
         source_of = np.repeat(np.arange(unique), width)
-        share = np.where(dead[source_of], 1.0, share)
+        share = np.where(dead[source_of], adjacency.data, share)
         per_row = np.where(dead, adjacency @ sizes.astype(np.float64), per_row)
     data = share / np.repeat(per_row, width)
     cluster = sparse.csr_array((data, adjacency.indices, adjacency.indptr),
@@ -529,7 +544,7 @@ def ambiguity_weights(seqs: list[str], weight: float) -> np.ndarray | None:
 
 
 def _normalise(member: np.ndarray, weights: np.ndarray | None) -> np.ndarray:
-    """Row-normalise a boolean membership matrix, weighted if given.
+    """Row-normalise a membership matrix (boolean, or decayed by distance), weighted if given.
 
     A cluster whose members are *all* weighted to zero (every member ambiguous) would
     otherwise divide by zero; it falls back to the unweighted split, since the penalty is
@@ -545,14 +560,18 @@ def _normalise(member: np.ndarray, weights: np.ndarray | None) -> np.ndarray:
 
 
 def tie_cluster_matrix(d: np.ndarray, tau: int = 0,
-                       weights: np.ndarray | None = None) -> np.ndarray:
+                       weights: np.ndarray | None = None,
+                       decay: float = 1.0) -> np.ndarray:
     """Row-stochastic ``M`` from a distance matrix: split over each tie cluster.
 
     Self-distance is 0, so every cluster contains its own reference and no row is ever
     empty; an isolated reference gets the identity row for free. ``weights`` (see
-    ``ambiguity_weights``) splits a cluster unevenly instead of uniformly.
+    ``ambiguity_weights``) splits a cluster unevenly instead of uniformly, and ``decay``
+    (see the module docstring) discounts a member by ``decay ** d``, which is a no-op at
+    ``tau = 0`` and the difference between a useful and a harmful ``tau >= 1``.
     """
-    return _normalise(d <= tau, weights)
+    member = np.where(d <= tau, np.float64(decay) ** np.minimum(d, tau), 0.0)
+    return _normalise(member, weights)
 
 
 def build(
@@ -560,6 +579,7 @@ def build(
     paf: Path,
     tau: int = 0,
     ambiguity_weight: float = 1.0,
+    distance_decay: float = 1.0,
 ) -> tuple[pd.DataFrame, np.ndarray]:
     """``M`` as a labelled frame, indexed and columned by the amplicon fasta headers.
 
@@ -578,7 +598,7 @@ def build(
     bound = max(tau, SUMMARY_DISTANCE)
     d = paf_distances(paf, refseqs, seqs, bound + 1)
     w = ambiguity_weights(seqs, ambiguity_weight)
-    M = tie_cluster_matrix(d, tau, w)
+    M = tie_cluster_matrix(d, tau, w, distance_decay)
     return pd.DataFrame(M, index=refseqs, columns=refseqs), d
 
 
@@ -587,6 +607,7 @@ def build_sparse(
     paf: Path | TextIO,
     tau: int = 0,
     ambiguity_weight: float = 1.0,
+    distance_decay: float = 1.0,
 ) -> tuple[list[str], sparse.csr_array, np.ndarray]:
     """Build the alignment kernel without allocating a reference-square array."""
     records = si.read_fasta(amplicons)
@@ -639,20 +660,21 @@ def build_sparse(
     if unknown:
         log.warning("%d PAF rows referenced an unknown sequence id", unknown)
 
-    members = [{row} for row in range(n_refs)]
-    for (source, target), _ in pairs.items():
-        members[source].add(target)
-        members[target].add(source)
+    members: list[dict[int, int]] = [{row: 0} for row in range(n_refs)]
+    for (source, target), distance in pairs.items():
+        members[source][target] = distance
+        members[target][source] = distance
     weights = ambiguity_weights(sequences, ambiguity_weight)
     rows: list[int] = []
     columns: list[int] = []
     values: list[float] = []
     for source, targets in enumerate(members):
         target_list = sorted(targets)
-        weight = np.ones(len(target_list)) if weights is None else weights[target_list]
+        decayed = np.float64(distance_decay) ** np.array(
+            [targets[target] for target in target_list], dtype=np.float64)
+        weight = decayed if weights is None else decayed * weights[target_list]
         if weight.sum() == 0:
-            weight = np.ones(len(target_list))
-        weight = weight / weight.sum()
+            weight = decayed
         rows.extend([source] * len(target_list))
         columns.extend(target_list)
         values.extend(weight.tolist())
@@ -720,6 +742,14 @@ def demo() -> None:
     assert np.allclose(np.diag(M1)[:4], 1 / 4), np.diag(M1)        # tau pulls #3 in
     assert np.allclose(M1[4], np.eye(5)[4])                        # still isolated
 
+    # Distance decay: the distance-1 neighbour is no longer an equal cluster member.
+    Md = tie_cluster_matrix(d, tau=1, decay=0.01)
+    assert np.allclose(Md.sum(axis=1), 1.0), Md.sum(axis=1)        # still row-stochastic
+    assert np.allclose(Md[:3], tie_cluster_matrix(d, tau=0)[:3], atol=4e-3), Md
+    assert Md[0, 3] < M1[0, 3] / 30 and Md[3, 3] > 0.95, Md        # #3 keeps its own mass
+    assert np.allclose(tie_cluster_matrix(d, tau=0, decay=0.01),
+                       tie_cluster_matrix(d, tau=0))               # no-op at tau=0
+
     # End to end through a fasta, and the invariants infer_composition.py checks on load.
     import tempfile
     with tempfile.TemporaryDirectory() as td:
@@ -748,6 +778,17 @@ def demo() -> None:
         )
         assert np.allclose(kmer_S.toarray()[np.ix_(kmer_group, kmer_group)], M1)
         assert list(kmer_near) == [0, 0, 0, 1, UNRESOLVED_DISTANCE], kmer_near
+        # ... and all three backends agree under decay too, not just at c = 1.
+        _, decay_S, decay_group, _ = build_kmer_grouped(
+            fa, tau=1, max_ambiguous_bases=2, ambiguity_weight=1.0,
+            max_postings=DEFAULT_MAX_POSTINGS, distance_decay=0.01,
+        )
+        assert np.allclose(decay_S.toarray()[np.ix_(decay_group, decay_group)], Md)
+        # The PAF path, on the pairs this PAF actually reports (it omits 1-3 and 2-3, so
+        # its clusters are smaller than the hand-written ``d`` above).
+        decay_frame = build(fa, paf, tau=1, distance_decay=0.01)[0].to_numpy()
+        assert np.allclose(decay_frame.sum(axis=1), 1.0), decay_frame
+        assert decay_frame[3, 3] > 0.98 and decay_frame[0, 3] < 0.01, decay_frame
         sm.write_grouped(Path(td) / "g.npz", kmer_S, kmer_group,
                          [f"ref|{i}|x" for i in range(5)])
         back_S, back_group = sm.read_grouped(Path(td) / "g.npz",
@@ -791,7 +832,8 @@ def demo() -> None:
     assert np.allclose(tie_cluster_matrix(np.array([[0, 0], [0, 0]]), 0,
                                           ambiguity_weights(both_n, 0.0)), 0.5)
 
-    print("demo OK: identical trio -> 1/3 rows, isolated -> identity, tau widens clusters, "
+    print("demo OK: identical trio -> 1/3 rows, isolated -> identity, tau widens clusters "
+          "and distance decay discounts what it pulls in, "
           "CSV round-trips row-stochastic; PAF CIGAR re-scoring keeps IUPAC ambiguity "
           "from splitting clusters, and weighting demotes it")
 
@@ -822,6 +864,13 @@ def main() -> None:
         help="skip a pigeonhole block shared by more than this many distinct amplicons "
              f"(default: {DEFAULT_MAX_POSTINGS}); the only source of false negatives",
     )
+    ap.add_argument("--distance-decay", type=float, default=1.0,
+                    help="discount a cluster member by this factor per edit of distance: "
+                         "M[a, j] proportional to c ** d(a, j). A no-op at --tau 0 (every "
+                         "member is at distance 0). At --tau >= 1 the default of 1 makes a "
+                         "reference one edit away as likely as an exact duplicate, which "
+                         "overstates confusion by orders of magnitude; set it to about the "
+                         "per-base error rate (~0.007 measured at 0.5%% flat error).")
     ap.add_argument("--ambiguity-weight", type=float, default=DEFAULT_AMBIGUITY_WEIGHT,
                     help="tie-break weight per ambiguous position in a reference: a "
                          f"cluster member with k of them gets w**k (default "
@@ -841,12 +890,19 @@ def main() -> None:
             ap.error(f"--{req.replace('_', '-')} is required (unless --demo)")
     if not 0.0 <= a.ambiguity_weight <= 1.0:
         ap.error("--ambiguity-weight must be in [0, 1]")
+    if not 0.0 <= a.distance_decay <= 1.0:
+        ap.error("--distance-decay must be in [0, 1]")
+    if a.tau >= 1 and a.distance_decay == 1.0:
+        log.warning("--tau %d with --distance-decay 1: every reference within tau is "
+                    "treated as an exact duplicate, which overstates confusion between "
+                    "references a base or two apart. Set --distance-decay to about the "
+                    "per-base error rate.", a.tau)
     if a.max_ambiguous_bases < 0 or a.max_postings < 1:
         ap.error("--max-ambiguous-seed-bases must be non-negative and --max-postings >= 1")
     if a.backend == "kmer":
         refseqs, M, group, nearest = build_kmer_grouped(
             a.amplicons, a.tau, a.max_ambiguous_bases, a.ambiguity_weight,
-            a.max_postings,
+            a.max_postings, a.distance_decay,
         )
     elif a.backend == "exact-hash":
         if a.tau != 0:
@@ -854,14 +910,16 @@ def main() -> None:
         refseqs, M, group, nearest = build_exact_grouped(a.amplicons)
     else:
         group = None
-        refseqs, M, nearest = build_sparse(a.amplicons, a.paf, a.tau, a.ambiguity_weight)
+        refseqs, M, nearest = build_sparse(a.amplicons, a.paf, a.tau, a.ambiguity_weight,
+                                           a.distance_decay)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     if group is None:
         sm.write_matrix(a.output, M, refseqs)
     else:
         sm.write_grouped(a.output, M, group, refseqs)
     summarise_sparse(M, nearest, group)
-    print(f"build_mismapping_align: {len(refseqs)} references, tau={a.tau} -> {a.output}")
+    print(f"build_mismapping_align: {len(refseqs)} references, tau={a.tau}, "
+          f"decay={a.distance_decay} -> {a.output}")
 
 
 if __name__ == "__main__":

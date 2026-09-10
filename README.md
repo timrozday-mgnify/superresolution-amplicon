@@ -174,7 +174,8 @@ Mis-mapping — how `M` is built:
 | param | default | description |
 |-------|---------|-------------|
 | `--mismapping_method` | `simulate` | `simulate` (sample errored reads from every reference and map them with the same mapper the real reads go through — `M` is *measured*) or `align` (indexed minimap2 reference-to-reference alignment, with PAF distances re-scored for IUPAC — no read simulation, mapseq, or error model). |
-| `--align_tau` | `0` | `align` only: cluster references within this edit distance. `0` (exact duplicate amplicons) beat every larger value tested; `tau > 0` was decisively worse, not softer. |
+| `--align_tau` | `0` | `align` only: cluster references within this edit distance. `0` (exact duplicate amplicons) beat every larger value tested until `--align_distance_decay` existed; with a decay set, `tau >= 1` is finally softer rather than worse. |
+| `--align_distance_decay` | `1.0` | `align` only: a cluster member `d` edits away takes `c**d` of a uniform share. A no-op at `--align_tau 0` (every member is at distance 0), and the whole story at larger `tau`: `c = 1` treats a reference one edit away as an exact duplicate, which is why `tau > 0` used to lose. On the benchmark's two-strain *B. uniformis* V4 set — two exact-duplicate clusters one edit apart, 0.5% flat error — `c = 1` puts `0.2` of a row where the `simulate` measurement puts `0.002`–`0.006`; `c = 0.007` reproduces it, and at that value `kmer --align_tau 1` fits the measured matrix slightly *better* than `exact-hash` does (mean row L1 0.079 vs 0.080). Reaching a distance-1 reference costs one sequencing error at that position, so set `c` to about the per-base error rate. Left at `1` with `tau >= 1` the run warns rather than fails, so a pre-existing matrix stays reproducible. |
 | `--align_backend` | `minimap2` | `align` only: `minimap2` runs all-vs-all alignment and writes a reference-square matrix — fine to a few thousand references. `exact-hash` (requires `--align_tau 0`) groups byte-identical amplicons in one streaming pass. `kmer` (requires `--align_tau >= 1`) widens those groups with a pigeonhole block filter over the *distinct* amplicons, verified by an IUPAC-aware bounded edit distance. The last two write the **grouped** matrix and are the database-scale path: the full 1,001,241-reference GTDB SSU r232 V4 set takes 2 s / 0.5 GB at `exact-hash`, 75 s / 0.8 GB at `kmer --align_tau 1`, and 195 s / 1.3 GB at `--align_tau 2`. |
 | `--max_ambiguous_bases` / `--max_postings` | `4` / `4096` | `kmer` only. `max_ambiguous_bases` is how many IUPAC positions a pair may carry *between them* before the filter is allowed to miss it; each one costs a block, so raising it shortens the blocks and widens the search. `max_postings` skips a block shared by more than that many distinct amplicons — the conserved windows either side of the variable region, which are quadratic to enumerate. It is the filter's only source of false negatives, and it is not reached on GTDB SSU at either tau. |
 | `--minimap2_args` | `-p 0 -N 1000 --secondary=yes -c` | `align` only: minimap2 mapping flags. The reference set is indexed once, then aligned all-vs-all. No preset or score-ratio filter retains near-identical hits; `-c` supplies CIGAR. The parser re-scores CIGAR columns with IUPAC overlap rather than trusting `NM`. `-k`/`-w` are rejected here — they belong to the index. |
@@ -376,13 +377,13 @@ modes worth comparing:
 | `simulate` | – | – | Reads simulated from every reference and mapped with mapseq. The measurement; the most expensive. |
 | `align` | `minimap2` | `0` | All-vs-all alignment. Reference-square matrix; quadratic in references. |
 | `align` | `exact-hash` | `0` | Byte-identical amplicons grouped. One streaming pass. |
-| `align` | `kmer` | `>= 1` | Those groups widened by verified neighbours within `tau`. |
+| `align` | `kmer` | `>= 1` | Those groups widened by verified neighbours within `tau`, each discounted by `--align_distance_decay ** d`. Leave the decay at `1` and this mode understates how well the mapper separates near-identical references. |
 
 The benchmark exposes each of these as `--sr_amplicon_mismapping_method`,
 `--sr_amplicon_align_backend` and `--sr_amplicon_align_tau`, with
 `--sr_amplicon_matrix_args` for the remaining flags
-(`--align_ambiguity_weight`, `--max_ambiguous_bases`, `--max_postings`,
-`--sim_n_per_ref`, …). See its README for how to sweep them.
+(`--align_distance_decay`, `--align_ambiguity_weight`, `--max_ambiguous_bases`,
+`--max_postings`, `--sim_n_per_ref`, …). See its README for how to sweep them.
 
 ## Containers
 
