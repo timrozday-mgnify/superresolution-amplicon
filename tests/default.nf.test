@@ -154,6 +154,7 @@ nextflow_pipeline {
                 mismapping_method = "align"
                 align_backend     = "kmer"
                 align_tau         = 1
+                align_distance_decay = 0.007
             }
         }
         then {
