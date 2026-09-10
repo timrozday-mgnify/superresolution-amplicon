@@ -123,7 +123,10 @@ def run(a) -> None:
         )
     else:
         T = torch.tensor(translation, dtype=torch.float64)
-    g_of_ref = np.array([genomes.index(si.genome_of_header(r)) for r in refseqs])
+    # dict, not genomes.index(): a linear scan per reference is O(n_refs x n_genomes),
+    # which at database scale (GTDB SSU: ~1e5 of each) costs hours before inference starts.
+    genome_index = {genome: index for index, genome in enumerate(genomes)}
+    g_of_ref = np.array([genome_index[si.genome_of_header(r)] for r in refseqs])
 
     # M is either measured from simulated mapseq output or loaded from a prior run.
     loaded = _mismapping_matrix(a, refseqs)
