@@ -53,7 +53,7 @@ def _dense(tau: int, weight: float, literal: bool = False) -> np.ndarray:
 def test_grouped_matches_the_dense_tie_cluster(tmp_path: Path, tau: int, weight: float) -> None:
     fasta = _fasta(tmp_path)
     if tau:
-        _, cluster, group, _ = bma.build_kmer_grouped(fasta, tau, 4, weight, 1 << 30)
+        _, cluster, group, _, _ = bma.build_kmer_grouped(fasta, tau, 4, weight, 1 << 30)
     else:
         _, cluster, group, _ = bma.build_exact_grouped(fasta)
     expanded = cluster.toarray()[np.ix_(group, group)]
@@ -63,7 +63,7 @@ def test_grouped_matches_the_dense_tie_cluster(tmp_path: Path, tau: int, weight:
 
 def test_round_trip_reorders_and_rejects_a_foreign_reference_set(tmp_path: Path) -> None:
     refs = [f"r{i}" for i in range(len(SEQUENCES))]
-    _, cluster, group, _ = bma.build_kmer_grouped(_fasta(tmp_path), 1, 4, 1.0, 1 << 30)
+    _, cluster, group, _, _ = bma.build_kmer_grouped(_fasta(tmp_path), 1, 4, 1.0, 1 << 30)
     path = tmp_path / "m.npz"
     sm.write_grouped(path, cluster, group, refs)
     assert sm.is_grouped(path)
@@ -158,7 +158,7 @@ def test_end_to_end_from_reference_fasta_to_composition(tmp_path: Path) -> None:
     for backend, tau in (("exact-hash", 0), ("kmer", 1)):
         matrix = tmp_path / f"{backend}.npz"
         if tau:
-            refs, cluster, group, _ = bma.build_kmer_grouped(
+            refs, cluster, group, _, _ = bma.build_kmer_grouped(
                 amplicon_dir / "amplicons.fasta", tau, 4, 0.3, 4096)
         else:
             refs, cluster, group, _ = bma.build_exact_grouped(amplicon_dir / "amplicons.fasta")

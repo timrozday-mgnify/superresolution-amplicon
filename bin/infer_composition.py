@@ -51,23 +51,29 @@ def _fit_args(a) -> SimpleNamespace:
         warmup=a.warmup, progress=False, use_mismapping=not a.no_mismapping,
         use_presence=not a.no_presence, presence_prior=a.presence_prior,
         presence_temp=a.presence_temp, seed=a.seed,
+        decay_sigma=getattr(a, "decay_sigma", si.DEFAULT_DECAY_SIGMA),
     )
 
 
 def _mismapping_matrix(a, refseqs: list[str]):
-    """Return a measured or pre-computed mis-mapping matrix in reference order.
+    """Return ``(M, group, strata)``: a measured or pre-computed matrix in reference order.
 
-    Either a reference-square CSR, or the grouped ``(S, group)`` pair that the
-    duplicate-collapsing backends write for database-scale reference sets.
+    ``M`` is a reference-square CSR with ``group`` ``None``, or the unique-amplicon kernel
+    the duplicate-collapsing backends write for database-scale reference sets. ``strata``
+    is the ``(distances, decay)`` pair a ``tau >= 1`` alignment build stores, or ``None``
+    for every other source — only a build that recorded its distances can be re-decayed.
     """
     if getattr(a, "mismapping_matrix", None) is None:
-        return si.build_mismapping(a.sim_mseq, refseqs, a.min_identity)
+        return si.build_mismapping(a.sim_mseq, refseqs, a.min_identity), None, None
 
     if a.mismapping_matrix.suffix == ".npz":
         try:
             if sm.is_grouped(a.mismapping_matrix):
-                return sm.read_grouped(a.mismapping_matrix, refseqs)
-            return sm.read_matrix(a.mismapping_matrix, refseqs)
+                matrix, group, strata = sm.read_grouped(a.mismapping_matrix, refseqs,
+                                                        strata=True)
+                return matrix, group, strata
+            matrix, strata = sm.read_matrix(a.mismapping_matrix, refseqs, strata=True)
+            return matrix, None, strata
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
 
@@ -88,7 +94,7 @@ def _mismapping_matrix(a, refseqs: list[str]):
         raise SystemExit(f"mis-mapping matrix {a.mismapping_matrix} must contain finite, non-negative values")
     if not np.allclose(values.sum(axis=1), 1.0, rtol=1e-6, atol=1e-8):
         raise SystemExit(f"mis-mapping matrix {a.mismapping_matrix} must be row-stochastic")
-    return sparse.csr_array(values)
+    return sparse.csr_array(values), None, None
 
 
 def _translation(amplicon_dir: Path):
@@ -167,6 +173,15 @@ def _renormalise_rows(matrix: sparse.csr_array, row_sums: np.ndarray) -> sparse.
     return matrix
 
 
+def _subset_strata(distances: sparse.csr_array, idx: np.ndarray) -> sparse.csr_array:
+    """Subset the distances with their matrix, keeping distance-0 entries explicit."""
+    distances = distances.copy()
+    distances.data += 1.0
+    distances = distances[idx][:, idx].tocsr()
+    distances.data -= 1.0
+    return distances
+
+
 def _subset_mismapping(M_sparse: sparse.csr_array, group: np.ndarray | None,
                        ref_idx: np.ndarray):
     """Restrict ``M`` to ``ref_idx`` and renormalise it back to row-stochastic.
@@ -200,8 +215,22 @@ def run(a) -> None:
     g_of_ref = np.array([genome_index[si.genome_of_header(r)] for r in refseqs])
 
     # M is either measured from simulated mapseq output or loaded from a prior run.
-    loaded = _mismapping_matrix(a, refseqs)
-    M_sparse, group = loaded if isinstance(loaded, tuple) else (loaded, None)
+    M_sparse, group, strata = _mismapping_matrix(a, refseqs)
+
+    # The decay is only a latent where the matrix says what distance each nonzero came
+    # from, and only *identified* where those distances differ within a row. Refusing is
+    # better than silently fitting a parameter the likelihood is flat in.
+    infer_decay = getattr(a, "infer_distance_decay", False)
+    if infer_decay:
+        if strata is None:
+            raise SystemExit(
+                "--infer-distance-decay needs a mis-mapping matrix built with distance "
+                "strata: --mismapping_method align at --align_tau >= 1 (a simulate-built, "
+                "CSV or tau=0 matrix carries no distances to re-decay)")
+        if not strata[0].data.any():
+            raise SystemExit(
+                "--infer-distance-decay: every distance in this matrix is 0, so the decay "
+                "cancels and the fit would be flat in it. Build at --align_tau >= 1.")
 
     if getattr(a, "build_mismapping", False):
         a.output_dir.mkdir(parents=True, exist_ok=True)
@@ -247,7 +276,10 @@ def run(a) -> None:
             gen_pos = np.full(len(genomes), -1, dtype=np.int64)
             gen_pos[gen_idx] = np.arange(len(gen_idx))
             translation = _subset_translation(translation, ref_idx, gen_idx, gen_pos)
+            kernel_idx = (ref_idx if group is None else np.unique(group[ref_idx]))
             M_sparse, group = _subset_mismapping(M_sparse, group, ref_idx)
+            if strata is not None:
+                strata = (_subset_strata(strata[0], kernel_idx), strata[1])
             refseqs = [refseqs[i] for i in ref_idx]
             genomes = [genomes[i] for i in gen_idx]
             g_of_ref = gen_pos[g_of_ref[ref_idx]]
@@ -261,17 +293,21 @@ def run(a) -> None:
         )
     else:
         T = torch.tensor(translation, dtype=torch.float64)
-    coo = torch.sparse_coo_tensor(
-        torch.tensor(np.vstack(M_sparse.nonzero()), dtype=torch.long),
-        torch.tensor(M_sparse.data, dtype=torch.float64),
-        size=M_sparse.shape,
-    ).coalesce()
-    if group is None:
-        M = (coo, torch.tensor(M_sparse.diagonal(), dtype=torch.float64))
+    if infer_decay:
+        # M becomes a function of the sampled decay instead of a fixed matrix.
+        M = si.DecayKernel(M_sparse, strata[0], strata[1], group)
     else:
-        M = (coo,
-             torch.tensor(sm.grouped_diagonal(M_sparse, group), dtype=torch.float64),
-             torch.tensor(group, dtype=torch.long))
+        coo = torch.sparse_coo_tensor(
+            torch.tensor(np.vstack(M_sparse.nonzero()), dtype=torch.long),
+            torch.tensor(M_sparse.data, dtype=torch.float64),
+            size=M_sparse.shape,
+        ).coalesce()
+        if group is None:
+            M = (coo, torch.tensor(M_sparse.diagonal(), dtype=torch.float64))
+        else:
+            M = (coo,
+                 torch.tensor(sm.grouped_diagonal(M_sparse, group), dtype=torch.float64),
+                 torch.tensor(group, dtype=torch.long))
 
     ref_rel = obs / total if total else obs
 
@@ -329,6 +365,8 @@ def run(a) -> None:
         "use_mismapping": not a.no_mismapping, "min_identity": a.min_identity,
         "use_presence": not a.no_presence, "presence_prior": a.presence_prior,
         "presence_temp": a.presence_temp,
+        "infer_distance_decay": infer_decay,
+        "built_distance_decay": None if strata is None else strata[1],
         "mismapping_group_id": getattr(a, "mismapping_group_id", None),
         "mismapping_matrix_path": getattr(a, "mismapping_matrix_path", None),
         "n_reads": int(total), "mean_diagonal": mean_diagonal,
@@ -417,6 +455,115 @@ def demo_prune() -> None:
     assert np.allclose(sub @ sizes, 1.0), (sub.toarray(), sizes)
     assert sub_group.tolist() == [0, 0, 1], sub_group
     print("prune demo OK")
+
+
+def demo_decay() -> None:
+    """Self-check the latent distance decay end to end, through a stored matrix.
+
+    14 references over 6 genomes and 10 distinct amplicons, four pairs of which are one
+    edit apart. Two things about that shape matter:
+
+    * a row holding an exact duplicate *and* a one-edit neighbour is the only place ``c``
+      changes anything ``s`` cannot — ``s`` rescales a row's off-diagonal mass, ``c``
+      reshapes it across distance classes;
+    * there are more references than genomes, so ``theta`` cannot absorb the difference.
+      On a set where it can (references ~ genomes), ``c`` is not identified and the fit
+      leans on its prior — which is the honest failure mode, not a bug.
+    """
+    import tempfile
+
+    owner = [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 0, 3]     # genome of each reference
+    amplicon = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 2, 4, 6]  # distinct amplicon it carries
+    refs = [f"g{genome}|{i}|x" for i, genome in enumerate(owner)]
+    group = np.array(amplicon)
+    sizes = np.bincount(group, minlength=10).astype(np.float64)
+    truth = np.array([0.30, 0.25, 0.20, 0.12, 0.09, 0.04])
+    c0, c_true = 0.01, 0.3
+
+    distance = np.zeros((10, 10))
+    pattern = np.eye(10, dtype=bool)
+    for i, j in [(0, 1), (2, 3), (4, 5), (6, 7)]:          # one-edit neighbours
+        distance[i, j] = distance[j, i] = 1.0
+        pattern[i, j] = pattern[j, i] = True
+
+    def kernel(c):
+        raw = np.where(pattern, c ** distance, 0.0)
+        return sparse.csr_array(raw / (raw @ sizes)[:, None])
+
+    distances = sparse.csr_array(np.where(pattern, distance + 1.0, 0.0))
+    distances.data -= 1.0                     # zeros stay explicit: M's own pattern
+
+    with tempfile.TemporaryDirectory() as temporary:
+        td = Path(temporary)
+        amp = td / "amp"
+        amp.mkdir()
+        pd.DataFrame({
+            "genome_id": [f"g{genome}" for genome in owner], "refseq": refs,
+            "weight": [1.0 / owner.count(genome) for genome in owner],
+        }).to_csv(amp / "translation_table.tsv", sep="\t", index=False)
+
+        # Observed reads drawn through the matrix the *sample* experienced, which is not
+        # the one the matrix was built with: 30x the leak the build assumed.
+        r_true = np.zeros(len(refs))
+        for reference, genome in enumerate(owner):
+            r_true[reference] = truth[genome] / owner.count(genome)
+        r_obs = r_true @ kernel(c_true).toarray()[np.ix_(group, group)]
+        counts = (100000 * r_obs / r_obs.sum()).round().astype(int)
+        with open(td / "obs.mseq", "w") as fh:
+            for reference, n in enumerate(counts):
+                for i in range(n):
+                    fh.write(f"read{reference}_{i}\t{refs[reference]}\t500\t0.99\n")
+
+        sm.write_grouped(td / "M.npz", kernel(c0), group, refs, (distances, c0))
+        sm.write_grouped(td / "plain.npz", kernel(c0), group, refs)
+
+        def args(**over):
+            return argparse.Namespace(**{
+                "amplicon_dir": amp, "sim_mseq": None, "mismapping_matrix": td / "M.npz",
+                "obs_mseq": [td / "obs.mseq"], "min_identity": None,
+                "sample_id": "decay", "mode": "vi", "alpha": 0.5, "steps": 1500,
+                "lr": 0.05, "num_samples": 200, "warmup": 0, "no_mismapping": False,
+                "seed": 0, "no_presence": True,
+                "presence_prior": si.DEFAULT_PRESENCE_PRIOR,
+                "presence_temp": si.DEFAULT_PRESENCE_TEMP, "no_prune": False,
+                "infer_distance_decay": True,
+                "decay_sigma": si.DEFAULT_DECAY_SIGMA, "output_dir": td / "out", **over})
+
+        def composition(where):
+            return pd.read_csv(where / "inferred_composition.csv").set_index(
+                "genome_id").loc[[f"g{i}" for i in range(6)], "inferred_mean"].to_numpy()
+
+        # The fit must recover the decay the reads actually experienced, from a matrix
+        # built 30x away from it, and beat the fixed decay on composition for doing so.
+        run(args())
+        fitted = float(pd.read_csv(td / "out" / "inference_diagnostics.csv"
+                                   ).iloc[0]["distance_decay"])
+        assert 0.5 * c_true < fitted < 2.0 * c_true, fitted
+        latent_l1 = float(np.abs(composition(td / "out") - truth).sum())
+
+        run(args(infer_distance_decay=False, output_dir=td / "fixed"))
+        fixed_l1 = float(np.abs(composition(td / "fixed") - truth).sum())
+        assert latent_l1 < fixed_l1 / 2, (latent_l1, fixed_l1)
+
+        # Pinned to the built decay (a near-zero prior width) it must reproduce the fixed
+        # path instead — same matrix, same answer, however it got there.
+        run(args(decay_sigma=1e-4, output_dir=td / "pinned"))
+        pinned = pd.read_csv(td / "pinned" / "inference_diagnostics.csv").iloc[0]
+        assert abs(float(pinned["distance_decay"]) - c0) < 1e-3, pinned["distance_decay"]
+        assert pinned["built_distance_decay"] == c0, pinned
+        assert np.abs(composition(td / "pinned") - composition(td / "fixed")).max() < 0.02
+
+        # A matrix that never recorded its distances cannot be re-decayed, and saying so
+        # beats fitting a parameter nothing in the likelihood constrains.
+        try:
+            run(args(mismapping_matrix=td / "plain.npz", output_dir=td / "nope"))
+        except SystemExit as exc:
+            assert "distance strata" in str(exc), exc
+        else:
+            raise AssertionError("--infer-distance-decay must refuse a strata-less matrix")
+
+    print(f"decay demo OK: recovered c={fitted:.3f} (built at {c0}, sample at {c_true}), "
+          f"L1 {latent_l1:.4f} vs {fixed_l1:.4f} at the built decay")
 
 
 def demo() -> None:
@@ -541,6 +688,14 @@ def main() -> None:
                          "(smaller => stronger pull towards absent)")
     ap.add_argument("--presence-temp", type=float, default=si.DEFAULT_PRESENCE_TEMP,
                     help="Concrete relaxation temperature for the presence gate")
+    ap.add_argument("--infer-distance-decay", action="store_true",
+                    help="fit the tie-cluster distance decay c per sample instead of "
+                         "taking the one the matrix was built with. Needs an alignment "
+                         "matrix built at --align_tau >= 1 (it carries the distance behind "
+                         "each nonzero); the matrix itself is not rebuilt, so one build "
+                         "serves samples whose error rates differ.")
+    ap.add_argument("--decay-sigma", type=float, default=si.DEFAULT_DECAY_SIGMA,
+                    help="prior width in logs of that decay, centred on the built one")
     ap.add_argument("--num-samples", type=int, default=500)
     ap.add_argument("--warmup", type=int, default=500)
     ap.add_argument("--steps", type=int, default=3000, help="SVI steps (vi/mle)")
@@ -557,7 +712,8 @@ def main() -> None:
                         format="%(asctime)s %(levelname)s %(message)s")
     if a.demo:
         demo()
-        return demo_prune()
+        demo_prune()
+        return demo_decay()
     if a.sim_mseq and a.mismapping_matrix:
         ap.error("--sim-mseq and --mismapping-matrix are mutually exclusive")
     required = ["amplicon_dir", "output_dir"]

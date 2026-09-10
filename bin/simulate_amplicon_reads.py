@@ -79,18 +79,33 @@ def apply_flat(seq: str, rng, sub_rate: float, ins_rate: float, del_rate: float)
     return "".join(out)
 
 
+def sampler(error_model: str, model_pt=None, sub_rate: float = 0.005,
+            ins_rate: float = 0.0005, del_rate: float = 0.0005, use_vi: bool = False):
+    """Return ``f(records, rng) -> [(name, sequence)]`` for either error model.
+
+    ``records`` are ``(name, sequence, True)`` triples, the shape skiver's ``apply_batch``
+    takes. Both models are reached through one call so callers that only want to
+    *characterise* a model (``build_mismapping_align.measure_error_rate``) do not have to
+    re-implement the loading.
+    """
+    if error_model != "trained":
+        log.info("flat error model: sub=%g ins=%g del=%g", sub_rate, ins_rate, del_rate)
+        return lambda records, rng: [
+            (name, apply_flat(seq, rng, sub_rate, ins_rate, del_rate))
+            for name, seq, _ in records]
+    if str(_SKIVER_LIB) not in sys.path:
+        sys.path.insert(0, str(_SKIVER_LIB))
+    from lib.error_application import ErrorModel, apply_batch  # noqa: E402
+    log.info("loading error model %s", model_pt)
+    model = ErrorModel.load(model_pt, use_vi=use_vi)
+    return lambda records, rng: [
+        (r.name, r.sequence) for r in apply_batch(model, records, rng, emit_quality=False)]
+
+
 def run(a) -> None:
     rng = np.random.default_rng(a.seed)
-    apply_batch = model = None
-    if a.error_model == "trained":
-        if str(_SKIVER_LIB) not in sys.path:
-            sys.path.insert(0, str(_SKIVER_LIB))
-        from lib.error_application import ErrorModel, apply_batch  # noqa: E402
-        log.info("loading error model %s", a.model_pt)
-        model = ErrorModel.load(a.model_pt, use_vi=a.use_vi)
-    else:
-        log.info("flat error model: sub=%g ins=%g del=%g",
-                 a.sub_rate, a.ins_rate, a.del_rate)
+    apply_error = sampler(a.error_model, a.model_pt, a.sub_rate, a.ins_rate, a.del_rate,
+                          a.use_vi)
 
     n_reads = 0
     with open(a.output, "w") as out:
@@ -102,13 +117,7 @@ def run(a) -> None:
             if not recs:
                 log.warning("reference %s produced no usable fragment (non-ACGT?)", header)
                 continue
-            if apply_batch is not None:
-                reads = [(r.name, r.sequence) for r in apply_batch(model, recs, rng,
-                                                                   emit_quality=False)]
-            else:
-                reads = [(name, apply_flat(f, rng, a.sub_rate, a.ins_rate, a.del_rate))
-                         for name, f, _ in recs]
-            for name, sequence in reads:
+            for name, sequence in apply_error(recs, rng):
                 if not sequence:
                     continue
                 out.write(f">{name}\n{sequence}\n")

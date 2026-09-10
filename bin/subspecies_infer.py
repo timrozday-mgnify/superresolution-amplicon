@@ -56,6 +56,12 @@ DEFAULT_PRESENCE_TEMP = 1.0
 # A gate above this is called "present" (Jaccard / n_present / the hard MLE gate).
 PRESENCE_THRESHOLD = 0.5
 
+# Prior width (in logs) of the latent distance decay ``c``, centred on the decay the
+# mis-mapping matrix was built with. ~e**1.2 either way: enough for a sample whose error
+# rate is 3x the build's assumption to say so, tight enough that a reference set with few
+# mixed-distance clusters — which is what identifies ``c`` at all — stays near the build.
+DEFAULT_DECAY_SIGMA = 1.2
+
 _IUPAC = {
     "A": set("A"), "C": set("C"), "G": set("G"), "T": set("T"),
     "R": set("AG"), "Y": set("CT"), "S": set("GC"), "W": set("AT"),
@@ -320,19 +326,114 @@ def _translation_genomes(T) -> int:
     return T[2] if isinstance(T, tuple) else T.shape[0]
 
 
+class DecayKernel:
+    """The tie-cluster kernel as a *function of* the distance decay ``c``.
+
+    A built matrix bakes in the ``c0`` it was built with. Because the kernel is
+    ``M[a, j] proportional to u_j * c ** d(a, j)`` and each row is normalised, the built
+    matrix and the distance behind each of its nonzeros are between them enough to rebuild
+    it at any other decay:
+
+        M(c) = rownorm(M(c0) * (c / c0) ** d)
+
+    — no sequences, no ambiguity weights, no re-alignment. That is what makes ``c`` a
+    latent the fit can move per sample against a matrix built once for the whole batch,
+    instead of a hyperparameter that has to be right at build time for every sample the
+    matrix is shared with. ``sizes`` carries the grouped form's row-stochasticity
+    (``sum_b S[a, b] * size[b] == 1``); it is all ones for a reference-square matrix.
+    """
+
+    def __init__(self, matrix, distances, decay: float, group=None):
+        import torch
+
+        matrix, distances = matrix.tocsr(), distances.tocsr()
+        if (matrix.nnz != distances.nnz
+                or not np.array_equal(matrix.indices, distances.indices)
+                or not np.array_equal(matrix.indptr, distances.indptr)):
+            raise ValueError("distance strata must share the matrix's sparsity pattern")
+        if not 0.0 < decay <= 1.0:
+            raise ValueError("the built distance decay must be in (0, 1]")
+        n = matrix.shape[0]
+        row = np.repeat(np.arange(n), np.diff(matrix.indptr))
+        diagonal = np.flatnonzero(row == matrix.indices)
+        if len(diagonal) != n:
+            # Every reference is in its own tie cluster at distance 0, so this cannot
+            # happen from a build — it would mean a row with no mass of its own.
+            raise ValueError("every kernel row needs a diagonal entry to re-decay")
+        sizes = (np.ones(n) if group is None
+                 else np.bincount(group, minlength=n).astype(np.float64))
+        self.dtype = torch.float64
+        self.n = n
+        self.decay = float(decay)
+        self.row = torch.tensor(row, dtype=torch.long)
+        self.col = torch.tensor(matrix.indices.astype(np.int64), dtype=torch.long)
+        self.values = torch.tensor(matrix.data, dtype=torch.float64)
+        self.distances = torch.tensor(distances.data, dtype=torch.float64)
+        self.diagonal = torch.tensor(diagonal, dtype=torch.long)
+        self.sizes = torch.tensor(sizes, dtype=torch.float64)
+        self.group = None if group is None else torch.tensor(group, dtype=torch.long)
+
+    def kernel(self, decay):
+        """``(values, diag(S))`` of the row-stochastic kernel at this decay."""
+        import torch
+
+        raw = self.values * (decay / self.decay) ** self.distances
+        row_sums = torch.zeros(self.n, dtype=raw.dtype).index_add(
+            0, self.row, raw * self.sizes[self.col])
+        return raw / row_sums[self.row], raw[self.diagonal] / row_sums
+
+    def spread(self, pooled, values):
+        """``S^T pooled`` — the mass each kernel row sends, gathered at its targets."""
+        import torch
+
+        return torch.zeros(self.n, dtype=values.dtype).index_add(
+            0, self.col, pooled[self.row] * values)
+
+
 def _mismapping_dtype(M):
     """Return the floating-point dtype of dense or sparse mis-mapping input."""
     return M[0].dtype if isinstance(M, tuple) else M.dtype
 
 
-def _apply_mismapping(r_true, M, scale):
-    """Apply the scaled, clamped row-stochastic mis-mapping matrix without densifying it.
+def _apply_sparse(r_true, diagonal, transpose_apply, group, n_kernel, scale):
+    """``r_true @ rownorm((1-s)I + s*M)`` from ``M``'s diagonal and its transposed action.
 
-    ``M`` is a dense tensor, a ``(sparse, diagonal)`` pair over references, or a
-    ``(sparse, diagonal, group)`` triple whose sparse factor is over the *distinct*
-    amplicons (see ``sparse_matrix.write_grouped``).
+    The off-diagonal mass is ``1 - diagonal`` rather than a sum, so neither the identity
+    mix nor the renormalisation ever needs the matrix itself.
     """
     import torch
+
+    diagonal_effective = torch.clamp(1.0 - scale + scale * diagonal, min=0.0)
+    row_sums = diagonal_effective + scale * (1.0 - diagonal)
+    scaled_mass = r_true * (scale / row_sums)
+    if group is None:
+        mapped = transpose_apply(scaled_mass)
+    else:
+        # Grouped form: M[a, j] == kernel[group[a], group[j]], so M^T x is a sum over
+        # duplicate groups, one product over the *distinct* amplicons, and a scatter back.
+        # Never materialises the reference-square matrix.
+        pooled = torch.zeros(n_kernel, dtype=scaled_mass.dtype).index_add(
+            0, group, scaled_mass)
+        mapped = transpose_apply(pooled)[group]
+    correction = r_true * ((diagonal_effective - scale * diagonal) / row_sums)
+    return mapped + correction
+
+
+def _apply_mismapping(r_true, M, scale, decay=None):
+    """Apply the scaled, clamped row-stochastic mis-mapping matrix without densifying it.
+
+    ``M`` is a dense tensor, a ``(sparse, diagonal)`` pair over references, a
+    ``(sparse, diagonal, group)`` triple whose sparse factor is over the *distinct*
+    amplicons (see ``sparse_matrix.write_grouped``), or a ``DecayKernel``, which builds
+    that kernel at the sampled ``decay`` first.
+    """
+    import torch
+
+    if isinstance(M, DecayKernel):
+        values, diagonal = M.kernel(decay)
+        return _apply_sparse(r_true, diagonal if M.group is None else diagonal[M.group],
+                             lambda pooled: M.spread(pooled, values), M.group, M.n,
+                             scale)
 
     if not isinstance(M, tuple):
         effective = (1.0 - scale) * torch.eye(M.shape[0], dtype=M.dtype) + scale * M
@@ -340,26 +441,17 @@ def _apply_mismapping(r_true, M, scale):
         return r_true @ (effective / effective.sum(-1, keepdim=True))
 
     matrix, diagonal, group = (M if len(M) == 3 else (*M, None))
-    diagonal_effective = torch.clamp(1.0 - scale + scale * diagonal, min=0.0)
-    row_sums = diagonal_effective + scale * (1.0 - diagonal)
-    scaled_mass = r_true * (scale / row_sums)
-    if group is None:
-        mapped = torch.sparse.mm(matrix.transpose(0, 1), scaled_mass[:, None]).squeeze(1)
-    else:
-        # Grouped form: M[a, j] == matrix[group[a], group[j]], so M^T x is a sum over
-        # duplicate groups, one sparse product over the *distinct* amplicons, and a
-        # scatter back. Never materialises the reference-square matrix.
-        pooled = torch.zeros(matrix.shape[0], dtype=matrix.dtype).index_add(
-            0, group, scaled_mass)
-        mapped = torch.sparse.mm(matrix.transpose(0, 1), pooled[:, None]).squeeze(1)[group]
-    correction = r_true * ((diagonal_effective - scale * diagonal) / row_sums)
-    return mapped + correction
+    return _apply_sparse(
+        r_true, diagonal,
+        lambda x: torch.sparse.mm(matrix.transpose(0, 1), x[:, None]).squeeze(1),
+        group, matrix.shape[0], scale)
 
 
 def composition_model(M, T, alpha, N, y_obs=None, likelihood="dirichlet_multinomial",
                       use_mismapping=True, s_sigma=0.3, od_loc=1.1, od_scale=1.0,
                       use_presence=True, presence_prior=DEFAULT_PRESENCE_PRIOR,
-                      presence_temp=DEFAULT_PRESENCE_TEMP):
+                      presence_temp=DEFAULT_PRESENCE_TEMP,
+                      use_decay=False, decay_sigma=DEFAULT_DECAY_SIGMA):
     """Generative model of the observed per-reference counts.
 
     ``theta`` is the true **read-space** genome composition; ``T`` rows sum to 1
@@ -371,7 +463,16 @@ def composition_model(M, T, alpha, N, y_obs=None, likelihood="dirichlet_multinom
     sampled scalar ``s`` scales the mis-mapping matrix (``M_eff = (1-s)I + s*M``,
     ``s~LogNormal`` centred at 1) which then acts on ``r_true`` to give
     ``r_obs = r_true@M_eff``; otherwise ``r_obs = r_true`` (no correction — the
-    baseline control). Counts follow a Dirichlet-Multinomial whose concentration is
+    baseline control). With ``use_decay`` (``M`` a ``DecayKernel``) the *distance decay*
+    ``c`` is a second sampled scalar, ``LogNormal`` centred on the decay the matrix was
+    built with, and ``M`` is rebuilt at it — the shape of a row across distance classes,
+    which ``s`` cannot reach: ``s`` rescales a whole row's off-diagonal mass uniformly and
+    leaves the ratio between an exact duplicate and a one-edit neighbour exactly where the
+    build put it. ``c`` is identified by the rows that hold both, so a reference set whose
+    clusters are all one distance class leans on the prior instead; keep ``decay_sigma``
+    tight enough to be a prior worth leaning on.
+
+    Counts follow a Dirichlet-Multinomial whose concentration is
     ``conc_frac*N*r_obs`` — overdispersion parameterised as a *fraction of N* so the
     prior is sample-size-invariant and centred near the multinomial limit rather than
     discarding read-count precision — or plain Multinomial.
@@ -413,7 +514,12 @@ def composition_model(M, T, alpha, N, y_obs=None, likelihood="dirichlet_multinom
         # Mis-mapping scale applied to M before it acts on r_true.
         s = pyro.sample("s", dist.LogNormal(torch.tensor(0.0, dtype=dt),
                                             torch.tensor(s_sigma, dtype=dt)))
-        r_obs = _apply_mismapping(r_true, M, s)
+        decay = None
+        if use_decay:
+            decay = pyro.sample("c", dist.LogNormal(
+                torch.tensor(np.log(M.decay), dtype=dt),
+                torch.tensor(decay_sigma, dtype=dt)))
+        r_obs = _apply_mismapping(r_true, M, s, decay)
         r_obs = r_obs / r_obs.sum()
     else:
         r_obs = r_true
@@ -481,15 +587,20 @@ def _fit(mode, M, T, alpha, N, y_obs, likelihood, theta_init, args, desc=""):
     p_prior = getattr(args, "presence_prior", DEFAULT_PRESENCE_PRIOR)
     p_temp = getattr(args, "presence_temp", DEFAULT_PRESENCE_TEMP)
     show = getattr(args, "progress", True)
+    use_decay = use_mm and isinstance(M, DecayKernel)
     G = _translation_genomes(T)
     mk = {"y_obs": y_obs, "likelihood": likelihood, "use_mismapping": use_mm,
-          "use_presence": use_presence, "presence_prior": p_prior, "presence_temp": p_temp}
+          "use_presence": use_presence, "presence_prior": p_prior, "presence_temp": p_temp,
+          "use_decay": use_decay,
+          "decay_sigma": getattr(args, "decay_sigma", DEFAULT_DECAY_SIGMA)}
 
     pyro.set_rng_seed(int(getattr(args, "seed", 0) or 0))
     pyro.clear_param_store()
     init = {"theta": theta_init}
     if use_mm:
         init["s"] = torch.tensor(1.0, dtype=_mismapping_dtype(M))
+    if use_decay:
+        init["c"] = torch.tensor(M.decay, dtype=_mismapping_dtype(M))
     if likelihood == "dirichlet_multinomial":
         init["conc_frac"] = torch.tensor(3.0, dtype=_mismapping_dtype(M))  # ~exp(od_loc), prior median
 
@@ -552,14 +663,21 @@ def _fit(mode, M, T, alpha, N, y_obs, likelihood, theta_init, args, desc=""):
     diag = {"final_loss": losses[-1], **_presence_diag()}
     if mode == "mle":
         # AutoDelta.median() has no deterministic sites, so apply the hard gate here.
+        if use_decay:
+            diag["distance_decay"] = float(guide.median()["c"].detach())
         point = guide.median()["theta"].detach()
         if use_presence:
             point = point * (_presence_probs(G) >= PRESENCE_THRESHOLD).to(point.dtype)
             point = point / point.sum().clamp(min=1e-12)
         return None, point, diag, losses
     pred = Predictive(composition_model, guide=guide, num_samples=args.num_samples,
-                      return_sites=["theta_eff"])
-    s = pred(M, T, alpha, N, **{**mk, "y_obs": None})["theta_eff"].squeeze()
+                      return_sites=["theta_eff"] + (["c"] if use_decay else []))
+    drawn = pred(M, T, alpha, N, **{**mk, "y_obs": None})
+    if use_decay:
+        # The fitted decay is a reportable per-sample quantity in its own right: it is
+        # this sample's per-base error rate as the mis-mapping matrix sees it.
+        diag["distance_decay"] = float(drawn["c"].mean())
+    s = drawn["theta_eff"].squeeze()
     mean, lo, hi = _summ(s)
     return s, mean, diag, losses
 
@@ -687,6 +805,76 @@ def demo_infer() -> None:
     print(f"demo infer: L1 naive={err_naive:.3f} -> inferred={err_inf:.3f} OK")
 
 
+def demo_decay() -> None:
+    """The latent decay must rebuild the kernel, agree with the fixed path at ``c0``, and
+    be a no-op where every cluster member is at distance 0.
+
+    Kernel over 3 distinct amplicons: 0 and 1 are one edit apart, 2 is isolated. Two
+    references share amplicon 0, so the grouped row sums are size-weighted.
+    """
+    import torch
+    from scipy import sparse
+
+    group = np.array([0, 0, 1, 2])
+    sizes = np.bincount(group).astype(np.float64)
+    distances = np.array([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    pattern = np.array([[1, 1, 0], [1, 1, 0], [0, 0, 1]], dtype=bool)
+
+    def built(c):
+        """The kernel a build at decay ``c`` would write: rownorm(pattern * c**d)."""
+        raw = np.where(pattern, c ** distances, 0.0)
+        return raw / (raw @ sizes)[:, None]
+
+    c0 = 0.01
+    S0 = sparse.csr_array(built(c0) * pattern)
+    D = sparse.csr_array(np.where(pattern, distances + 1.0, 0.0))
+    D.data -= 1.0
+    kernel = DecayKernel(S0, D, c0, group)
+
+    # Rebuilding at another decay reproduces the build at that decay, exactly.
+    for c in (c0, 0.2, 1.0):
+        values, diagonal = kernel.kernel(torch.tensor(c, dtype=torch.float64))
+        dense = np.zeros((3, 3))
+        dense[pattern] = values.numpy()
+        assert np.allclose(dense, built(c)), (c, dense, built(c))
+        assert np.allclose(diagonal.numpy(), np.diag(built(c))), (c, diagonal)
+
+    # At the built decay the new branch must agree with the plain grouped path it
+    # replaces — same algebra, different route to the kernel.
+    coo = torch.sparse_coo_tensor(
+        torch.tensor(np.vstack(S0.nonzero()), dtype=torch.long),
+        torch.tensor(S0.data, dtype=torch.float64), size=(3, 3)).coalesce()
+    fixed = (coo, torch.tensor(np.diag(built(c0))[group], dtype=torch.float64),
+             torch.tensor(group, dtype=torch.long))
+    r_true = torch.tensor([0.4, 0.1, 0.3, 0.2], dtype=torch.float64)
+    for scale in (torch.tensor(1.0, dtype=torch.float64),
+                  torch.tensor(0.6, dtype=torch.float64)):
+        latent = _apply_mismapping(r_true, kernel, scale,
+                                   torch.tensor(c0, dtype=torch.float64))
+        assert np.allclose(latent.numpy(), _apply_mismapping(r_true, fixed, scale).numpy())
+        assert abs(float(latent.sum()) - 1.0) < 1e-12, latent
+
+    # A wider decay leaks more mass across the one-edit gap, which is the whole point:
+    # ``s`` cannot do this, it rescales a row's off-diagonal mass without reshaping it.
+    one = torch.tensor(1.0, dtype=torch.float64)
+    across = [float(_apply_mismapping(torch.tensor([1.0, 0.0, 0.0, 0.0],
+                                                   dtype=torch.float64),
+                                      kernel, one, torch.tensor(c, dtype=torch.float64))[2])
+              for c in (c0, 0.2, 1.0)]
+    assert across[0] < across[1] < across[2], across
+    assert across[0] < 0.01 < across[2], across
+
+    # Every member at distance 0 (the tau=0 case): c cancels, so the latent is inert.
+    zeros = sparse.csr_array(np.ones((2, 2)))
+    zeros.data -= 1.0                       # all-zero distances, kept as explicit entries
+    flat = DecayKernel(sparse.csr_array(np.array([[0.5, 0.5], [0.5, 0.5]])), zeros, c0)
+    base = flat.kernel(torch.tensor(c0, dtype=torch.float64))[0]
+    assert np.allclose(flat.kernel(torch.tensor(0.5, dtype=torch.float64))[0].numpy(),
+                       base.numpy())
+    print("demo decay: kernel rebuilds at any c, matches the fixed path at c0, "
+          "inert where every distance is 0 OK")
+
+
 def demo_presence() -> None:
     """The gate must call a genome that contributes no reads absent, and keep the rest.
 
@@ -749,6 +937,7 @@ def main() -> None:
     if args.demo:
         demo_amplicons()
         demo_infer()
+        demo_decay()
         return demo_presence()
     for req in ("db_fasta", "output_dir"):
         if getattr(args, req) is None:
