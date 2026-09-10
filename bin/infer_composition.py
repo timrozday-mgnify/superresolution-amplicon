@@ -111,34 +111,97 @@ def _translation(amplicon_dir: Path):
     return list(legacy.index), list(legacy.columns), legacy.to_numpy(dtype=np.float64)
 
 
+def _active_subset(M_sparse: sparse.csr_array, group: np.ndarray | None,
+                   obs: np.ndarray, g_of_ref: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Reference and genome indices worth fitting, given the observed counts.
+
+    A reference is reachable when the mis-mapping matrix gives it a route to a reference
+    that was actually observed: ``M[a, j] > 0`` for some ``j`` with a read on it. That is
+    the "could this reference have produced one of these reads" question, and it answers
+    the byte-identity case for free — identical amplicons share a row of ``M``, so a
+    zero-count twin of a hit reference is reachable through the tie mapseq broke
+    arbitrarily. The fuzzy backends widen it further, to the near-neighbours they let
+    reads leak across, which is exactly the set they say a read might have come from.
+
+    Then take the genomes owning that set, and every reference copy those genomes own:
+    ``T`` is the within-genome copy distribution and has to stay complete, or a kept
+    genome quietly loses the mass of its dropped copies.
+
+    What is left out is dead weight — a reference no observed read can be traced to, and
+    a genome none of whose copies were seen. Each is an empty row, an empty column, and a
+    genome dimension whose likelihood is flat. Note the closure is one round, not a fixed
+    point: a kept genome's unobserved copy may itself tie to a reference outside the set,
+    and the mass leaking there is absorbed by the renormalisation in
+    ``_subset_mismapping`` rather than pulling another genome in.
+    """
+    hit = np.flatnonzero(obs > 0)
+    if group is None:
+        reachable = np.zeros(len(obs), dtype=bool)
+        reachable[M_sparse[:, hit].nonzero()[0]] = True
+    else:
+        # Grouped form: M[a, j] == M_sparse[group[a], group[j]], so reachability is a
+        # question about the unique-amplicon kernel, scattered back over references.
+        sources = np.unique(M_sparse[:, np.unique(group[hit])].nonzero()[0])
+        reachable = np.isin(group, sources)
+    gen_idx = np.unique(g_of_ref[reachable])
+    return np.flatnonzero(np.isin(g_of_ref, gen_idx)), gen_idx
+
+
+def _subset_translation(translation, ref_idx: np.ndarray, gen_idx: np.ndarray,
+                        gen_pos: np.ndarray):
+    """Restrict ``T`` to the kept genomes x kept references.
+
+    Rows stay normalised without rescaling: every copy of a kept genome is kept.
+    """
+    if isinstance(translation, tuple):
+        genome_of_row, weight, _ = translation
+        return gen_pos[genome_of_row[ref_idx]], weight[ref_idx], len(gen_idx)
+    return translation[np.ix_(gen_idx, ref_idx)]
+
+
+def _renormalise_rows(matrix: sparse.csr_array, row_sums: np.ndarray) -> sparse.csr_array:
+    """Scale each row by ``1 / row_sum``, leaving an all-zero row alone."""
+    matrix = matrix.tocsr()
+    divisor = np.where(row_sums > 0, row_sums, 1.0)
+    matrix.data = matrix.data / np.repeat(divisor, np.diff(matrix.indptr))
+    return matrix
+
+
+def _subset_mismapping(M_sparse: sparse.csr_array, group: np.ndarray | None,
+                       ref_idx: np.ndarray):
+    """Restrict ``M`` to ``ref_idx`` and renormalise it back to row-stochastic.
+
+    Dropping columns drops the mass a kept reference mis-maps onto a pruned one, so the
+    rows no longer sum to 1 — and the sparse path in ``_apply_mismapping`` derives its
+    off-diagonal mass as ``1 - diagonal`` rather than summing. Rescaling is the usual
+    conditioning ("of the reads that landed inside the kept set..."), and the mass it
+    redistributes is small by construction: a pruned reference drew no reads.
+    """
+    if group is None:
+        sub = M_sparse[ref_idx][:, ref_idx].tocsr()
+        return _renormalise_rows(sub, np.asarray(sub.sum(axis=1)).ravel()), None
+    # Grouped form: subset the unique-amplicon kernel, not the reference square.
+    keep_groups = np.unique(group[ref_idx])
+    sub = M_sparse[keep_groups][:, keep_groups].tocsr()
+    position = np.full(M_sparse.shape[0], -1, dtype=np.int64)
+    position[keep_groups] = np.arange(len(keep_groups))
+    new_group = position[group[ref_idx]]
+    sizes = np.bincount(new_group, minlength=len(keep_groups)).astype(np.float64)
+    return _renormalise_rows(sub, sub @ sizes), new_group
+
+
 def run(a) -> None:
     import torch
 
     genomes, refseqs, translation = _translation(a.amplicon_dir)
-    if isinstance(translation, tuple):
-        T = (
-            torch.tensor(translation[0], dtype=torch.long),
-            torch.tensor(translation[1], dtype=torch.float64),
-            translation[2],
-        )
-    else:
-        T = torch.tensor(translation, dtype=torch.float64)
-    g_of_ref = np.array([genomes.index(si.genome_of_header(r)) for r in refseqs])
+    # dict, not genomes.index(): a linear scan per reference is O(n_refs x n_genomes),
+    # which at database scale (GTDB SSU: ~1e5 of each) costs hours before inference starts.
+    genome_index = {genome: index for index, genome in enumerate(genomes)}
+    g_of_ref = np.array([genome_index[si.genome_of_header(r)] for r in refseqs])
 
     # M is either measured from simulated mapseq output or loaded from a prior run.
     loaded = _mismapping_matrix(a, refseqs)
     M_sparse, group = loaded if isinstance(loaded, tuple) else (loaded, None)
-    coo = torch.sparse_coo_tensor(
-        torch.tensor(np.vstack(M_sparse.nonzero()), dtype=torch.long),
-        torch.tensor(M_sparse.data, dtype=torch.float64),
-        size=M_sparse.shape,
-    ).coalesce()
-    if group is None:
-        M = (coo, torch.tensor(M_sparse.diagonal(), dtype=torch.float64))
-    else:
-        M = (coo,
-             torch.tensor(sm.grouped_diagonal(M_sparse, group), dtype=torch.float64),
-             torch.tensor(group, dtype=torch.long))
 
     if getattr(a, "build_mismapping", False):
         a.output_dir.mkdir(parents=True, exist_ok=True)
@@ -149,6 +212,10 @@ def run(a) -> None:
             sm.write_grouped(out, M_sparse, group, refseqs)
         print(f"mismapping: {len(refseqs)} references -> {a.output_dir}")
         return
+
+    # Of the whole matrix, not the pruned one: a property of the reference set, so it
+    # stays comparable between samples that prune to different sizes.
+    mean_diagonal = sm.matrix_diagonal_mean(M_sparse)
 
     counts = si.observed_refseq_counts(a.obs_mseq, refseqs, a.min_identity)
     obs = np.array([counts.get(r, 0) for r in refseqs], dtype=np.float64)
@@ -161,16 +228,58 @@ def run(a) -> None:
     if no_hits:
         log.warning("no reads in %s hit a reference amplicon; emitting a zero composition",
                     a.obs_mseq)
-    ref_rel = obs / total if total else obs
-
     log.info("sample %s: %d mapped reads, %d refs, %d genomes, mode=%s",
              a.sample_id, total, len(refseqs), len(genomes), a.mode)
+
+    # Fit only what the reads can speak to. The reference set is the whole database
+    # (GTDB SSU: ~1e5 amplicons over ~1e5 genomes) while a sample touches a few hundred
+    # of them; the rest is an empty row, an empty column and a flat genome dimension.
+    # `all_genomes` keeps the output contract — every genome in the set is reported, a
+    # pruned one at zero.
+    all_genomes, gen_idx = genomes, None
+    if not no_hits and not getattr(a, "no_prune", False):
+        ref_idx, gen_idx = _active_subset(M_sparse, group, obs, g_of_ref)
+        if len(gen_idx) == len(genomes):
+            gen_idx = None                       # nothing to prune; keep the fast path
+        else:
+            log.info("pruned to %d/%d references and %d/%d genomes with observed support",
+                     len(ref_idx), len(refseqs), len(gen_idx), len(genomes))
+            gen_pos = np.full(len(genomes), -1, dtype=np.int64)
+            gen_pos[gen_idx] = np.arange(len(gen_idx))
+            translation = _subset_translation(translation, ref_idx, gen_idx, gen_pos)
+            M_sparse, group = _subset_mismapping(M_sparse, group, ref_idx)
+            refseqs = [refseqs[i] for i in ref_idx]
+            genomes = [genomes[i] for i in gen_idx]
+            g_of_ref = gen_pos[g_of_ref[ref_idx]]
+            obs = obs[ref_idx]
+
+    if isinstance(translation, tuple):
+        T = (
+            torch.tensor(translation[0], dtype=torch.long),
+            torch.tensor(translation[1], dtype=torch.float64),
+            translation[2],
+        )
+    else:
+        T = torch.tensor(translation, dtype=torch.float64)
+    coo = torch.sparse_coo_tensor(
+        torch.tensor(np.vstack(M_sparse.nonzero()), dtype=torch.long),
+        torch.tensor(M_sparse.data, dtype=torch.float64),
+        size=M_sparse.shape,
+    ).coalesce()
+    if group is None:
+        M = (coo, torch.tensor(M_sparse.diagonal(), dtype=torch.float64))
+    else:
+        M = (coo,
+             torch.tensor(sm.grouped_diagonal(M_sparse, group), dtype=torch.float64),
+             torch.tensor(group, dtype=torch.long))
+
+    ref_rel = obs / total if total else obs
 
     # Observed per-ref signal collapsed to genome-space -> observed composition (init + baseline).
     theta_obs = np.zeros(len(genomes))
     np.add.at(theta_obs, g_of_ref, ref_rel)
 
-    lo = hi = [np.nan] * len(genomes)
+    lo = hi = np.full(len(genomes), np.nan)
     if no_hits:
         samples, losses, diag = None, None, {}
         inferred = np.zeros(len(genomes))
@@ -190,6 +299,21 @@ def run(a) -> None:
     # NaN when the gate is off, so "no call" is never confused with "called absent".
     presence = np.array(diag.pop("presence_prob", [np.nan] * len(genomes)))
 
+    # Back to the full genome list. A pruned genome had no read pointing at it under any
+    # resolution of the ties, so it is reported absent rather than omitted — downstream
+    # scoring compares against a truth over the whole reference set.
+    def expand(values, fill):
+        if gen_idx is None:
+            return np.asarray(values, dtype=np.float64)
+        full = np.full(len(all_genomes), fill, dtype=np.float64)
+        full[gen_idx] = values
+        return full
+
+    interval_fill = np.nan if samples is None else 0.0
+    theta_obs, inferred = expand(theta_obs, 0.0), expand(inferred, 0.0)
+    lo, hi = expand(lo, interval_fill), expand(hi, interval_fill)
+    presence = expand(presence, np.nan if a.no_presence else 0.0)
+
     out = a.output_dir
     out.mkdir(parents=True, exist_ok=True)
     comp = pd.DataFrame([{
@@ -198,7 +322,7 @@ def run(a) -> None:
         "inferred_mean": float(inferred[i]),
         "inferred_lo": float(lo[i]), "inferred_hi": float(hi[i]),
         "presence_prob": float(presence[i]),
-    } for i, g in enumerate(genomes)])
+    } for i, g in enumerate(all_genomes)])
     comp.to_csv(out / "inferred_composition.csv", index=False)
     pd.DataFrame([{
         "sample": a.sample_id, "mode": a.mode, "likelihood": "dirichlet_multinomial",
@@ -207,14 +331,92 @@ def run(a) -> None:
         "presence_temp": a.presence_temp,
         "mismapping_group_id": getattr(a, "mismapping_group_id", None),
         "mismapping_matrix_path": getattr(a, "mismapping_matrix_path", None),
-        "n_reads": int(total), "mean_diagonal": sm.matrix_diagonal_mean(M_sparse),
+        "n_reads": int(total), "mean_diagonal": mean_diagonal,
+        "n_refs_fitted": len(refseqs), "n_genomes_fitted": len(genomes),
+        "n_genomes": len(all_genomes),
         "status": "no_reference_hits" if no_hits else "ok",
         **{k: json.dumps(v) for k, v in diag.items()},
     }]).to_csv(out / "inference_diagnostics.csv", index=False)
     if losses is not None:
         pd.DataFrame([{"sample": a.sample_id, "step": s, "loss": l}
                       for s, l in enumerate(losses)]).to_csv(out / "loss_trace.csv", index=False)
-    print(f"infer[{a.mode}]: sample {a.sample_id}, {len(genomes)} genomes -> {out}")
+    print(f"infer[{a.mode}]: sample {a.sample_id}, {len(all_genomes)} genomes -> {out}")
+
+
+def demo_prune() -> None:
+    """Self-check: pruning drops only genomes no read can reach, and the grouped
+    subset stays row-stochastic.
+
+    Genomes [uni, strain2, ghost]; refs [uni|0(A), strain2|0(A), strain2|1(B),
+    ghost|0(C)]. Every read maps to strain2's two refs — none to uni|0, none to ghost|0.
+    ``ghost`` must be pruned (no read reaches C under any assignment) and reported at
+    zero, while ``uni`` must survive: its amplicon is byte-identical to strain2|0, so
+    mapseq's tie-break is the only reason it shows no counts — and ``M``, built here from
+    the simulated reads, is where that tie is recorded. Pruning uni would delete exactly
+    the case the mis-mapping correction exists for.
+    """
+    import tempfile
+
+    refs = ["uni|0|A", "strain2|0|A", "strain2|1|B", "ghost|0|C"]
+    with tempfile.TemporaryDirectory() as temporary:
+        td = Path(temporary)
+        amp = td / "amp"
+        amp.mkdir()
+        pd.DataFrame({
+            "genome_id": ["uni", "strain2", "strain2", "ghost"],
+            "refseq": refs,
+            "weight": [1.0, 0.5, 0.5, 1.0],
+        }).to_csv(amp / "translation_table.tsv", sep="\t", index=False)
+        # Simulated reads: the identical pair splits 50:50, the distinct refs self-hit.
+        with open(td / "sim.mseq", "w") as fh:
+            for source, hits in enumerate([[0, 1], [0, 1], [2], [3]]):
+                for i in range(100):
+                    fh.write(f"{refs[source]}:{i}\t{refs[hits[i % len(hits)]]}\t500\t0.99\n")
+        # Observed: strain2's refs only. uni|0 is invisible behind the tie; ghost|0 is
+        # genuinely absent.
+        with open(td / "obs.mseq", "w") as fh:
+            for j, n in [(1, 3000), (2, 3000)]:
+                for i in range(n):
+                    fh.write(f"read{j}_{i}\t{refs[j]}\t500\t0.99\n")
+
+        args = argparse.Namespace(
+            amplicon_dir=amp, sim_mseq=[td / "sim.mseq"], obs_mseq=[td / "obs.mseq"],
+            min_identity=None, sample_id="prune", mode="vi", alpha=0.5, steps=500,
+            lr=0.05, num_samples=100, warmup=0, no_mismapping=False, seed=0,
+            no_presence=True, presence_prior=si.DEFAULT_PRESENCE_PRIOR,
+            presence_temp=si.DEFAULT_PRESENCE_TEMP, no_prune=False,
+            output_dir=td / "out")
+        run(args)
+        got = pd.read_csv(td / "out" / "inferred_composition.csv").set_index("genome_id")
+        diag = pd.read_csv(td / "out" / "inference_diagnostics.csv").iloc[0]
+
+        assert set(got.index) == {"uni", "strain2", "ghost"}, got    # full set reported
+        assert diag["n_genomes_fitted"] == 2 and diag["n_genomes"] == 3, diag
+        assert diag["n_refs_fitted"] == 3, diag                      # C dropped, A/A/B kept
+        assert got.loc["ghost", "inferred_mean"] == 0.0, got
+        assert got.loc["uni", "inferred_mean"] > 0.0, got            # survived the tie
+        assert abs(got.loc[["uni", "strain2"], "inferred_mean"].sum() - 1.0) < 1e-6, got
+
+        # Same fit without pruning: the survivors land in the same place. Not bit
+        # identical — the Dirichlet prior is over the fitted genomes, so dropping one
+        # redistributes a little prior mass — but far inside the gap a real pruning bug
+        # would open.
+        args.no_prune, args.output_dir = True, td / "out_full"
+        run(args)
+        full = pd.read_csv(td / "out_full" / "inferred_composition.csv").set_index("genome_id")
+        assert (got["inferred_mean"] - full["inferred_mean"]).abs().max() < 0.05, (got, full)
+
+    # Grouped matrices are subset through their unique-amplicon kernel; the result has to
+    # stay row-stochastic over the references it keeps, or _apply_mismapping's
+    # `1 - diagonal` off-diagonal mass is wrong.
+    group = np.array([0, 0, 1, 2])
+    cluster = sparse.csr_array(np.array([[0.5, 0.0, 0.0], [0.1, 0.8, 0.1], [0.0, 0.2, 0.8]]))
+    kept = np.array([0, 1, 2])                       # drop ghost|0, the only member of 2
+    sub, sub_group = _subset_mismapping(cluster, group, kept)
+    sizes = np.bincount(sub_group).astype(float)
+    assert np.allclose(sub @ sizes, 1.0), (sub.toarray(), sizes)
+    assert sub_group.tolist() == [0, 0, 1], sub_group
+    print("prune demo OK")
 
 
 def demo() -> None:
@@ -345,13 +547,17 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=0.02)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("-o", "--output-dir", type=Path)
+    ap.add_argument("--no-prune", action="store_true",
+                    help="fit every genome in the reference set, not just those with "
+                         "observed support (slow at database scale)")
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--verbose", "-v", action="store_true")
     a = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     if a.demo:
-        return demo()
+        demo()
+        return demo_prune()
     if a.sim_mseq and a.mismapping_matrix:
         ap.error("--sim-mseq and --mismapping-matrix are mutually exclusive")
     required = ["amplicon_dir", "output_dir"]

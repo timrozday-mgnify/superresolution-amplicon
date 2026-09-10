@@ -180,3 +180,74 @@ def test_end_to_end_from_reference_fasta_to_composition(tmp_path: Path) -> None:
         rows = list(csv.DictReader((out / "inferred_composition.csv").open()))
         assert rows and {"genome_id", "inferred_mean"} <= set(rows[0]), rows[:1]
         assert abs(sum(float(row["inferred_mean"]) for row in rows) - 1.0) < 1e-6, rows
+
+
+def test_pruning_drops_unreachable_genomes_from_a_grouped_fit(tmp_path: Path) -> None:
+    """A genome no read can reach is pruned out of the fit but still reported at zero.
+
+    This is the database-scale case: the reference set is GTDB while a sample touches a
+    few hundred of its amplicons, and the rest only cost the fit a dimension. `g1`'s two
+    copies share an amplicon with nothing else, `g2` has its own, and `ghost` is never
+    observed — so `ghost` leaves the fit while `g1`/`g2` are unaffected by its absence.
+    """
+    pytest.importorskip("torch")
+    pytest.importorskip("pyro")
+    import csv                                                  # noqa: PLC0415
+    from types import SimpleNamespace                           # noqa: PLC0415
+
+    import pandas as pd                                         # noqa: PLC0415
+
+    import infer_composition                                    # noqa: PLC0415
+
+    refs = ["g1|0|A", "g1|1|A", "g2|0|B", "ghost|0|C"]
+    amplicon_dir = tmp_path / "amplicons"
+    amplicon_dir.mkdir()
+    pd.DataFrame({"genome_id": ["g1", "g1", "g2", "ghost"], "refseq": refs,
+                  "weight": [0.5, 0.5, 1.0, 1.0]}).to_csv(
+        amplicon_dir / "translation_table.tsv", sep="\t", index=False)
+    matrix = tmp_path / "mismapping_matrix.npz"
+    sm.write_grouped(matrix, sparse.csr_array(np.diag([0.5, 1.0, 1.0])),
+                     np.array([0, 0, 1, 2], dtype=np.int32), refs)
+    observed = tmp_path / "obs.mseq"
+    observed.write_text("\n".join(
+        f"read{i}\t{refs[i % 3]}\t100\t0.99" for i in range(3000)) + "\n")
+
+    # A well-powered fit on purpose. Pruning is not a bit-identical transformation: the
+    # Dirichlet prior is over the genomes being fitted, so dropping one redistributes
+    # prior mass over the survivors. That matters when the likelihood is flat and a
+    # handful of reads is all there is; it washes out as soon as the data says anything,
+    # which is the regime this runs in.
+    out = tmp_path / "out"
+    arguments = SimpleNamespace(
+        amplicon_dir=amplicon_dir, mismapping_matrix=matrix,
+        mismapping_matrix_path=str(matrix), mismapping_group_id="grp", sim_mseq=None,
+        obs_mseq=[observed], min_identity=None, build_mismapping=False, sample_id="S1",
+        output_dir=out, mode="vi", alpha=0.5, no_mismapping=False, no_presence=False,
+        presence_prior=0.5, presence_temp=0.1, num_samples=100, warmup=10, steps=500,
+        lr=0.05, seed=0, no_prune=False,
+    )
+    infer_composition.run(arguments)
+
+    rows = {row["genome_id"]: row for row in
+            csv.DictReader((out / "inferred_composition.csv").open())}
+    assert set(rows) == {"g1", "g2", "ghost"}, rows
+    assert float(rows["ghost"]["inferred_mean"]) == 0.0, rows
+    assert float(rows["ghost"]["presence_prob"]) == 0.0, rows
+    assert abs(sum(float(row["inferred_mean"]) for row in rows.values()) - 1.0) < 1e-6, rows
+
+    diagnostics = next(csv.DictReader((out / "inference_diagnostics.csv").open()))
+    assert (diagnostics["n_genomes_fitted"], diagnostics["n_genomes"]) == ("2", "3")
+    assert diagnostics["n_refs_fitted"] == "3", diagnostics
+
+    # --no-prune must reach the same answer, or this is a different model rather than a
+    # cheaper route to the same one.
+    arguments.no_prune, arguments.output_dir = True, tmp_path / "out_full"
+    infer_composition.run(arguments)
+    full = {row["genome_id"]: row for row in
+            csv.DictReader((tmp_path / "out_full" / "inferred_composition.csv").open())}
+    # A few percent, not equality: see the prior note above. A pruning bug that dropped
+    # a genome the reads do reach moves a survivor by a third of the composition, not by
+    # a percent, so this still catches one.
+    for genome in ("g1", "g2"):
+        assert abs(float(rows[genome]["inferred_mean"])
+                   - float(full[genome]["inferred_mean"])) < 0.05, (rows, full)
