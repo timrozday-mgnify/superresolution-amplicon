@@ -153,22 +153,41 @@ workflow SUPERRESOLUTION_AMPLICON {
         }
     }
 
-    // In-silico PCR -> the mapseq reference set (+ translation table T).
-    EXTRACT_AMPLICONS(ch_refs)
+    // In-silico PCR -> the mapseq reference set (+ translation table T), then its mapseq
+    // clustering: once per distinct reference FASTA, however many samples name it. At GTDB
+    // scale each is hours. The set's meta holds only its id, so adding or removing a
+    // sample leaves both tasks cached.
+    // ponytail: keyed by the file's location. The same bytes at two paths are extracted
+    // twice. Key by a content digest if that happens, which costs a hash of the whole
+    // FASTA per run.
+    ch_refs_by_set = ch_refs.map { meta, refs ->
+        [ "refs_" + refs.toUriString().md5().take(12), meta, refs ]
+    }
+    EXTRACT_AMPLICONS(ch_refs_by_set
+        .unique { it[0] }
+        .map { set, meta, refs -> [ [ id: set ], refs ] })
     ch_versions = ch_versions.mix(EXTRACT_AMPLICONS.out.versions)
 
-    // Build the per-sample mapseq clustering for observed-read mapping.
     MAPSEQ_CLUSTER(EXTRACT_AMPLICONS.out.refs)
     ch_versions = ch_versions.mix(MAPSEQ_CLUSTER.out.versions)
 
-    // [ id, fasta, tax, mscluster ] — the mapseq DB slots, shared by both mappings.
-    ch_db = EXTRACT_AMPLICONS.out.refs
-        .map { meta, fasta, tax -> [ meta.id, fasta, tax ] }
-        .join(MAPSEQ_CLUSTER.out.mscluster.map { meta, mscluster -> [ meta.id, mscluster ] })
+    // Fan the shared results back out to samples by set id. combine, not join: join is
+    // 1:1 and would keep one sample per set.
+    ch_sample_sets = ch_refs_by_set.map { set, meta, refs -> [ set, meta ] }
+    // [ sample meta, amplicon_dir ]
+    ch_amplicons = ch_sample_sets
+        .combine(EXTRACT_AMPLICONS.out.dir.map { meta, d -> [ meta.id, d ] }, by: 0)
+        .map { set, meta, d -> [ meta, d ] }
+    // [ sample id, fasta, tax, mscluster ] — the mapseq DB slots, shared by both mappings.
+    ch_db = ch_sample_sets
+        .combine(EXTRACT_AMPLICONS.out.refs
+            .map { meta, fasta, tax -> [ meta.id, fasta, tax ] }
+            .join(MAPSEQ_CLUSTER.out.mscluster.map { meta, mscluster -> [ meta.id, mscluster ] }), by: 0)
+        .map { set, meta, fasta, tax, mscluster -> [ meta.id, fasta, tax, mscluster ] }
 
     // Fingerprint extracted amplicons and group all samples that experience the same
     // simulation + mapper configuration. The group metadata is also bundle provenance.
-    MATRIX_KEY(EXTRACT_AMPLICONS.out.dir
+    MATRIX_KEY(ch_amplicons
         .map { meta, d -> [ meta.id, meta, d ] }
         .join(ch_model)
         .map { id, meta, d, model, identity -> [ meta, d, model, identity ] })
@@ -291,7 +310,7 @@ workflow SUPERRESOLUTION_AMPLICON {
         .flatMap { meta, bundle -> meta.members.collect { member ->
             [ member.id, bundle.resolve('mismapping_matrix.npz'), meta.matrix_key ]
         } }
-        .join(EXTRACT_AMPLICONS.out.dir.map { meta, d -> [ meta.id, d ] })
+        .join(ch_amplicons.map { meta, d -> [ meta.id, d ] })
         .map { id, matrix, key, d -> [ id, d, matrix, key ] }
 
     // Panel reinterpretation: one rectangular kernel per (database + model + settings, panel).
@@ -370,7 +389,7 @@ workflow SUPERRESOLUTION_AMPLICON {
         .mix(ch_obs.supplied.map { meta, reads -> [ meta.id, meta.mseq ] })
 
     // INFER_COMPOSITION: amplicon dir + canonical matrix + observed mseq, joined by id.
-    ch_infer_in = EXTRACT_AMPLICONS.out.dir
+    ch_infer_in = ch_amplicons
         .map { meta, d -> [ meta.id, meta ] }
         .join(ch_mismapping)
         .join(ch_obs_mseq)
@@ -399,7 +418,7 @@ workflow SUPERRESOLUTION_AMPLICON {
         .collectFile(name: 'software_versions.yml', storeDir: "${params.outdir}/pipeline_info")
 
     emit:
-    amplicons   = EXTRACT_AMPLICONS.out.dir
+    amplicons   = ch_amplicons
     mismapping  = PUBLISH_MISMAPPING.out.bundle
     composition = INFER_COMPOSITION.out.composition
     fit_diagnostics = CHECK_COMPOSITION_FIT.out.diagnostics
