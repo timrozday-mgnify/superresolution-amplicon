@@ -21,6 +21,12 @@ include { PUBLISH_MISMAPPING    } from '../modules/local/publish_mismapping/main
 include { POOL_TRAINING_READS   } from '../modules/local/pool_training_reads/main'
 include { READS_TO_FASTA       } from '../modules/local/reads_to_fasta/main'
 include { INFER_COMPOSITION    } from '../modules/local/infer_composition/main'
+include { CHECK_COMPOSITION_FIT } from '../modules/local/check_composition_fit/main'
+include { PANEL_PREPARE        } from '../modules/local/panel_kernel/prepare/main'
+include { PANEL_KERNEL         } from '../modules/local/panel_kernel/build/main'
+include { SIMULATE_READS as SIMULATE_PANEL_READS } from '../modules/local/simulate_reads/main'
+include { MAPSEQ as MAPSEQ_PANEL_HOME } from '../modules/local/mapseq/map/main'
+include { MAPSEQ as MAPSEQ_PANEL_SIM  } from '../modules/local/mapseq/map/main'
 
 workflow SUPERRESOLUTION_AMPLICON {
     take:
@@ -55,7 +61,8 @@ workflow SUPERRESOLUTION_AMPLICON {
     if (params.align_decay_model && !auto_decay) {
         error "--align_decay_model is only read by --align_distance_decay auto"
     }
-    if (params.infer_distance_decay) {
+    // toString(): a command-line `--flag false` arrives as the truthy String "false".
+    if (params.infer_distance_decay.toString() == 'true') {
         // The latent needs the distances behind the matrix's nonzeros, and needs them to
         // differ within a row. Only a tau >= 1 alignment build has either.
         if (params.mismapping_method != 'align' || (params.align_tau as int) < 1) {
@@ -68,7 +75,7 @@ workflow SUPERRESOLUTION_AMPLICON {
                      "be refused unless that matrix was built with distance strata."
         }
     }
-    if ((params.align_tau as int) >= 1 && !auto_decay && !params.infer_distance_decay
+    if ((params.align_tau as int) >= 1 && !auto_decay && params.infer_distance_decay.toString() != 'true'
         && (params.align_distance_decay as double) == 1.0) {
         // Not an error: it is the behaviour every matrix built before the knob existed
         // has, so a rerun of one must still be possible.
@@ -77,6 +84,14 @@ workflow SUPERRESOLUTION_AMPLICON {
                  "between references a base or two apart. Set --align_distance_decay to " +
                  "about the per-base error rate, or 'auto' to measure it, or set " +
                  "--infer_distance_decay to fit it per sample."
+    }
+    if (!(params.infer_space in ['genome', 'v4_group'])) {
+        error "--infer_space must be 'genome' or 'v4_group'"
+    }
+    if (params.infer_horseshoe.toString() == 'true'
+        && (params.infer_presence.toString() == 'true' || params.infer_mode != 'vi')) {
+        error "--infer_horseshoe replaces the presence gate and needs --infer_mode vi " +
+              "--infer_presence false"
     }
     if (params.minimap2_args =~ /(^|\s)-[kw]\b/) {
         // Silently ignored: with a prebuilt .mmi target, minimap2 takes -k/-w from the
@@ -157,10 +172,17 @@ workflow SUPERRESOLUTION_AMPLICON {
         .map { meta, d -> [ meta.id, meta, d ] }
         .join(ch_model)
         .map { id, meta, d, model, identity -> [ meta, d, model, identity ] })
-    ch_matrix_groups = MATRIX_KEY.out.key
+    // Panel samples get a kernel of their own (below); only the rest share a square matrix.
+    MATRIX_KEY.out.key
         .map { meta, d, identity_file, identity, key_file, ref_file ->
             [ key_file.text.trim(), [meta, d, identity_file, identity, ref_file.text.trim()] ]
         }
+        .branch { key, entry ->
+            panel:  entry[0].panel
+            square: true
+        }
+        .set { ch_keyed }
+    ch_matrix_groups = ch_keyed.square
         .groupTuple()
         .map { key, entries ->
             def representative = entries[0]
@@ -263,10 +285,60 @@ workflow SUPERRESOLUTION_AMPLICON {
     PUBLISH_MISMAPPING.out.record.collectFile(
         name: 'groups.tsv', storeDir: "${params.outdir}/mismapping", keepHeader: true, skip: 1
     )
+    // [ id, amplicon_dir, matrix, matrix_key ]: a square-matrix sample keeps its own
+    // extracted amplicons.
     ch_mismapping = PUBLISH_MISMAPPING.out.bundle
         .flatMap { meta, bundle -> meta.members.collect { member ->
             [ member.id, bundle.resolve('mismapping_matrix.npz'), meta.matrix_key ]
         } }
+        .join(EXTRACT_AMPLICONS.out.dir.map { meta, d -> [ meta.id, d ] })
+        .map { id, matrix, key, d -> [ id, d, matrix, key ] }
+
+    // Panel reinterpretation: one rectangular kernel per (database + model + settings, panel).
+    // Its sources are the panel's distinct V4 amplicons and its labels the database's V4
+    // groups, measured with the same MAPseq database the sample's reads are mapped against.
+    ch_panel_groups = ch_keyed.panel
+        .map { key, entry -> [ [key, entry[0].panel], entry ] }
+        .groupTuple()
+        .map { group, entries ->
+            def (key, panel) = group
+            def rep = entries[0]
+            def id = "panel_" + "${key}|${panel}|${params.panel_sim_n_per_ref}".toString().md5().take(16)
+            [[id: id, matrix_key: id, panel: panel, model_identity: rep[3],
+              members: entries.collect { it[0].id }, db_id: rep[0].id],
+             panel, rep[1], rep[2]]
+        }
+    PANEL_PREPARE(ch_panel_groups.map { meta, panel, d, model ->
+        [ meta, panel, d.resolve('amplicons.fasta') ] })
+    ch_versions = ch_versions.mix(PANEL_PREPARE.out.versions)
+    // [ meta, sources, fasta, tax, mscluster ] against the representative's database.
+    ch_panel_db = PANEL_PREPARE.out.sources
+        .map { meta, sources -> [ meta.db_id, meta, sources ] }
+        .combine(ch_db, by: 0)
+        .map { db_id, meta, sources, fasta, tax, mscluster -> [ meta, sources, fasta, tax, mscluster ] }
+    MAPSEQ_PANEL_HOME(ch_panel_db)
+    SIMULATE_PANEL_READS(PANEL_PREPARE.out.sources
+        .map { meta, sources -> [ meta.id, meta, sources ] }
+        .join(ch_panel_groups.map { meta, panel, d, model -> [ meta.id, model ] })
+        .map { id, meta, sources, model -> [ meta, sources, model ] })
+    MAPSEQ_PANEL_SIM(SIMULATE_PANEL_READS.out.reads
+        .map { meta, reads -> [ meta.id, reads ] }
+        .join(ch_panel_db.map { meta, sources, fasta, tax, mscluster -> [ meta.id, meta, fasta, tax, mscluster ] })
+        .map { id, reads, meta, fasta, tax, mscluster -> [ meta, reads, fasta, tax, mscluster ] })
+    ch_versions = ch_versions.mix(MAPSEQ_PANEL_HOME.out.versions)
+        .mix(SIMULATE_PANEL_READS.out.versions).mix(MAPSEQ_PANEL_SIM.out.versions)
+    PANEL_KERNEL(PANEL_PREPARE.out.prepared
+        .map { meta, prepared -> [ meta.id, meta, prepared ] }
+        .join(ch_panel_db.map { meta, sources, fasta, tax, mscluster -> [ meta.id, fasta ] })
+        .join(MAPSEQ_PANEL_HOME.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
+        .join(MAPSEQ_PANEL_SIM.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
+        .map { id, meta, prepared, fasta, home, sim -> [ meta, prepared, fasta, home, sim ] })
+    ch_versions = ch_versions.mix(PANEL_KERNEL.out.versions)
+    // The kernel directory is the panel sample's amplicon dir (panel_translation.tsv).
+    ch_mismapping = ch_mismapping.mix(PANEL_KERNEL.out.kernel
+        .flatMap { meta, kdir -> meta.members.collect { member ->
+            [ member, kdir, kdir.resolve('mismapping_matrix.npz'), meta.matrix_key ]
+        } })
 
     // Real reads -> fasta -> mapseq -> the observed per-reference counts.
     // A sample carrying `mseq:` in the samplesheet supplies that classification instead
@@ -299,12 +371,28 @@ workflow SUPERRESOLUTION_AMPLICON {
 
     // INFER_COMPOSITION: amplicon dir + canonical matrix + observed mseq, joined by id.
     ch_infer_in = EXTRACT_AMPLICONS.out.dir
-        .map { meta, d -> [ meta.id, meta, d ] }
+        .map { meta, d -> [ meta.id, meta ] }
         .join(ch_mismapping)
         .join(ch_obs_mseq)
         .map { id, meta, d, matrix, matrix_key, obs -> [ meta, d, matrix, obs, matrix_key ] }
-    INFER_COMPOSITION(ch_infer_in)
+    INFER_COMPOSITION(ch_infer_in,
+                      params.taxonomy ? file(params.taxonomy, checkIfExists: true) : [])
     ch_versions = ch_versions.mix(INFER_COMPOSITION.out.versions)
+
+    // Reconstruct the observation-space forward fit for every sample. This remains
+    // downstream of the depth gate so low-depth samples receive an explicit diagnostic
+    // rather than a silently interpretable composition. In v4_group space the group table
+    // is the fitted result; the genome table is only a labelled split of it.
+    ch_fit_composition = params.infer_space == 'v4_group'
+        ? INFER_COMPOSITION.out.v4_groups : INFER_COMPOSITION.out.composition
+    ch_fit_in = ch_infer_in
+        .map { meta, d, matrix, obs, matrix_key -> [ meta.id, meta, d, matrix, obs ] }
+        .join(ch_fit_composition.map { meta, composition -> [ meta.id, composition ] })
+        .join(INFER_COMPOSITION.out.posterior.map { meta, posterior -> [ meta.id, posterior ] })
+        .map { id, meta, d, matrix, obs, composition, posterior ->
+            [ meta, d, matrix, obs, composition, posterior ] }
+    CHECK_COMPOSITION_FIT(ch_fit_in)
+    ch_versions = ch_versions.mix(CHECK_COMPOSITION_FIT.out.versions)
 
     // Collate the per-process versions into one file.
     ch_versions
@@ -314,5 +402,6 @@ workflow SUPERRESOLUTION_AMPLICON {
     amplicons   = EXTRACT_AMPLICONS.out.dir
     mismapping  = PUBLISH_MISMAPPING.out.bundle
     composition = INFER_COMPOSITION.out.composition
+    fit_diagnostics = CHECK_COMPOSITION_FIT.out.diagnostics
     versions    = ch_versions
 }

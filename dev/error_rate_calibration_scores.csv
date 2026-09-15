@@ -1,0 +1,7 @@
+run,tv_truth,mass_outside_truth,v4g_2acb,v4g_a3e62,block_tv,truth_on_unobserved_labels,fit_status,group_ppc,group_tv,s
+old_rates_n500,0.6585,0.6526,0.0651,0.0000,0.0571,0.0105,model_misfit,1.0,0.0185,1.3809
+old_rates_n5000,0.6093,0.5435,0.0001,0.0789,0.1199,0.0099,model_misfit,1.0,0.0214,1.6035
+calibrated_0.0031,0.2196,0.1912,0.0001,0.0001,0.1195,0.0024,model_misfit,1.0,0.0183,1.3499
+calibrated_0.0026,0.2195,0.1911,0.0001,0.0001,0.1194,0.0023,model_misfit,1.0,0.0185,1.3714
+calibrated_s_pinned,0.2193,0.1908,0.0001,0.0001,0.1193,0.0024,model_misfit,1.0,0.0184,0.9987
+trained_oracle,0.3033,0.2715,0.0001,0.0001,0.1066,0.0018,model_misfit,1.0,0.0154,1.2638

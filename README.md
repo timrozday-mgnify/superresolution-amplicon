@@ -23,6 +23,30 @@ pipeline:
 This is a heavy, multi-stage analysis extracted from the
 `synthetic-metagenomic-benchmark-pipeline` into a standalone Nextflow (DSL2) pipeline.
 
+## GTDB-scale safety
+
+Do not use the genome-space fit against the full GTDB V4 reference set. The archived
+full-GTDB run failed its posterior-predictive check because of the *inference*, not the
+forward model: tens of thousands of genomes share each V4 sequence, so the prior, the
+initial point, and the presence gate act on dimensions the data cannot separate, and the
+genome-space fit fails its own check even on data generated from the model. A V4 read
+cannot tell those genomes apart, so no genome or strain call inside a shared V4 sequence
+is possible. Run GTDB-scale sets with `--infer_space v4_group` (one parameter per
+distinct V4 sequence), `--infer_presence false`, and a kernel-version-2 matrix. With the
+presence gate on, 40% of replayed samples fail the fit check; with it off, 2%.
+
+**Not yet validated for production at GTDB scale.** On the batch's *real* GTDB MAPseq
+output every sample still fails the fit check, and the group profile sits TV 0.33 from an
+exact-match ASV profile — the posterior reproduces MAPseq's labels faithfully, but the
+alignment-built kernel does not describe what MAPseq does against a million references
+(it relabels exact hits onto one-edit neighbours, splits ties over a subset of identical
+members, and ignores IUPAC ties). A measured, simulate-and-map matrix is required first. See
+[the GTDB inference recovery plan](docs/gtdb_inference_recovery_plan.md). Read
+`<id>.inferred_v4_groups.csv` with `fit_diagnostics.json`, which gates release on the
+V4-group check; the genome table in that mode is a labelled split, not an estimate. Until
+Phases 4–5 of that plan validate it on real GTDB MAPseq output, treat full-GTDB outputs as
+diagnostic only.
+
 ## Quick start
 
 ```bash
@@ -81,6 +105,8 @@ YAML list of samples (or a map with `samples:`). Per sample:
 | `references` | no | Per-sample reference fasta; overrides `--references`. |
 | `error_model` | no | Path to a pre-trained `.pt` model; **skips training** for this sample. |
 | `mseq` | no | Path to a mapseq classification of this sample's reads (a previous run's `mapseq/<id>/<id>.obs.mseq.gz`); **skips read mapping** for this sample. It must have been produced against the same reference set — the ids in it are matched to the extracted amplicons — and it carries the read-prep settings it was made with, so `--obs_max_reads`, `--trim_primers` and `--min_pair_overlap` no longer apply to that sample. Mapping is the expensive stage, so this is what makes a parameter sweep over the mis-mapping and inference knobs cheap. |
+
+| `panel_references` | no | Genome panel for this sample; overrides `--panel_references`. See [Panel reinterpretation](#panel-reinterpretation). |
 
 \* provide either `reads` or `fastq_1`.
 
@@ -271,11 +297,17 @@ Composition inference (Pyro):
 | `--infer_lr` | `0.02` | SVI learning rate. |
 | `--infer_num_samples` | `500` | Posterior samples (vi/nuts). |
 | `--infer_warmup` | `500` | NUTS warmup. |
+| `--min_infer_reads` | `1000` | Minimum mapped reads required to emit a biological composition. Lower-depth samples are zeroed and labelled `low_depth`, but still receive a fit-diagnostics record. |
 | `--infer_presence` | `true` | Per-genome Bernoulli presence/absence gate. Not supported with `--infer_mode nuts`. |
 | `--infer_presence_prior` | `0.01` | Prior probability a genome is present — the sparsity regulariser. |
 | `--infer_presence_temp` | `1.0` | Concrete relaxation temperature for the gate. Below ~1 the gate barely moves off its initialisation and no prior can sparsify it. |
 | `--infer_distance_decay` | `false` | Fit the tie-cluster distance decay `c` per sample instead of taking the one the matrix was built with. Needs `--mismapping_method align --align_tau >= 1`: only those builds record the distance behind each nonzero, and at `tau 0` every distance is 0 and `c` cancels. The matrix is **not** rebuilt — `M(c) = rownorm(M(c0) * (c/c0)**d)` — so one build still serves the whole matrix group while each sample fits its own error rate. Reported as `distance_decay` in `inference_diagnostics.csv`. |
 | `--infer_decay_sigma` | `1.2` | Prior width in logs of that decay, centred on the built one. |
+| `--infer_space` | `genome` | `genome` \| `v4_group`. `v4_group` fits one parameter per exact distinct V4 amplicon (`v4g_<sha256 prefix>`) and publishes `<id>.inferred_v4_groups.csv`, which the fit check reads. The genome table then splits each group evenly over its member references, marks genomes sharing a group `not_identifiable`, and leaves their intervals and `presence_prob` empty. Required for GTDB-scale sets; genome space logs a warning when one fitted V4 sequence spans more than 100 genomes. |
+| `--taxonomy` | `null` | MAPseq `.tax` (`header<TAB>lineage`) for the `lca` column of the v4-group table (longest common rank prefix of the members). Without it every group is `unclassified_v4_group`. Its sha256 is recorded in `inference_diagnostics.csv`. |
+| `--infer_horseshoe` | `false` | `vi` only, needs `--infer_presence false`: horseshoe shrinkage on unnormalised weights in place of the Dirichlet (`--infer_alpha` is ignored). |
+| `--panel_references` | – | Genome panel (same header convention as `--references`, or a directory of `<genome>.amplicons.fasta`). Per-sample override via the samplesheet. See [Panel reinterpretation](#panel-reinterpretation). |
+| `--panel_sim_n_per_ref` | `5000` | Simulated reads per distinct panel V4 source. |
 | `--infer_prune` | `true` | Fit only the genomes the sample's reads can reach — those owning an observed reference, or one byte-identical to it — instead of the whole reference set. Pruned genomes are still reported, at zero. Against a database-scale set this is most of the per-sample cost; set `false` to fit everything. |
 
 > **The distance decay, fixed or fitted.** `c` is a property of the *sample* — roughly
@@ -330,6 +362,29 @@ Composition inference (Pyro):
 > the confusion the real reads experience, so `MAPSEQ_SIM` and `MAPSEQ_OBS` are the same
 > process with the same settings, differing only in which reads they take.
 
+### Panel reinterpretation
+
+A sample with `panel_references` is still mapped against `--references` (e.g. GTDB), but
+its composition is inferred over the panel genomes plus a `background` row. The panel's
+distinct V4 amplicons are MAPseq'd against that database (each source's home label) and
+reads simulated from them are mapped the same way, giving a rectangular kernel (panel
+sources × database V4 groups). No reference-square matrix is built for such a sample.
+Validated on 20 mock samples against GTDB r232 (median genome TV 0.015, see
+[dev/panel_reinterpretation.md](dev/panel_reinterpretation.md)) with:
+
+```bash
+nextflow run main.nf -profile singularity -c your_hpc.config \
+    --input samplesheet.yml --references gtdb_r232_ssu.fasta \
+    --panel_references panel.fasta \
+    --sim_error_model trained --trained_error_model_scope pooled \
+    --infer_presence false --outdir results
+```
+
+The flat error model misses context-specific relabels and scores no better than home labels
+alone; the presence gate collapses at long runs. Mapping reads directly against the panel
+(a panel-only `--references`) was more accurate on every sample; use reinterpretation when
+that is not possible. Requires `--infer_space genome` and `--mismapping_method simulate`.
+
 Containers: `--sra_skiver_tag` (default `latest`), `--mapseq_tag` (default
 `2.1.1b--hc47f52e_1`). Resources: `--max_cpus`, `--max_memory`, `--max_time`.
 
@@ -356,9 +411,13 @@ results/
       provenance.json                 simulator, mapper, and member-sample metadata
       samples.tsv                     samples consuming this matrix
       reference/                      amplicons + mapseq/inference sidecars
+    panel_<key>/                     panel samples: rectangular kernel (mismapping_matrix.npz),
+                                     panel_sources.tsv, panel_translation.tsv, sources.tsv
   composition/<id>/
     <id>.inferred_composition.csv    inferred vs observed genome abundances
-    <id>.inference_diagnostics.csv   includes canonical matrix bundle ID/path
+    <id>.inference_diagnostics.csv   matrix ID/path, fit status, and two diagonal summaries
+    <id>.posterior_draws.npz         theta_eff and fitted nuisance posterior draws
+    <id>.fit_diagnostics.json        raw/grouped posterior-predictive forward-fit gate
     <id>.loss_trace.csv              (vi/mle)
   pipeline_info/                     trace, report, timeline, dag, software versions
 ```
@@ -367,6 +426,15 @@ results/
 `inferred_mean`, `inferred_lo`/`inferred_hi` (5–95% credible interval for `vi`/`nuts`),
 and `presence_prob` (posterior probability the genome is present; empty when
 `--infer_presence false`). Call a genome present at `presence_prob >= 0.5`.
+
+`fit_diagnostics.json` is calculated from the real MAPseq counts, the exact sparse matrix,
+and retained posterior draws. It reports observed-versus-expected total-variation distance
+and posterior-predictive percentiles at both raw-reference and exact-V4-group resolution.
+`fit_status=model_misfit` is a release gate; `low_depth` is not a biological composition.
+`inference_diagnostics.csv` distinguishes the unweighted unique-kernel
+`mean_kernel_diagonal` from `mean_reference_diagonal`, which expands groups back to their
+member references. Treat `fit_diagnostics.json`, rather than the composition CSV alone,
+as the result's release status.
 
 ## Benchmarking
 

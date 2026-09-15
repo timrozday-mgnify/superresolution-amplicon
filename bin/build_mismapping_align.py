@@ -7,11 +7,16 @@ amplicons to each other and read ``M`` straight off the distances.
 
 The kernel is the *tie cluster*: a read from reference ``a`` is assigned over the
 references within ``--tau`` edit operations of ``a`` (``a`` itself included, at
-distance 0), in proportion to ``--distance-decay ** d(a, j)``, so
+distance 0). Each *distinct* amplicon within reach is weighted by
+``--distance-decay ** d(a, j)`` once, and its share is split evenly over the ``n(j)``
+references that carry it byte-for-byte, so
 
-    M[a, j] proportional to c ** d(a, j)   if d(a, j) <= tau, else 0
+    M[a, j] proportional to c ** d(a, j) / n(j)   if d(a, j) <= tau, else 0
 
-with ``c = 1`` (the default) giving the uniform split. ``c = 1`` is right at ``tau = 0``,
+The ``1 / n(j)`` is kernel version 2 (``sparse_matrix.KERNEL_VERSION``). Without it a
+neighbour a hundred GTDB genomes share captured ~60x MAPseq's measured leak, which
+barely moves with copy number (dev/mapseq_multiplicity.md). ``c = 1`` (the default)
+gives the uniform split over distinct amplicons. ``c = 1`` is right at ``tau = 0``,
 where every cluster member is at distance 0 and the decay cancels, and wrong at any
 larger tau: a reference one edit away is *not* as likely as an exact duplicate. Reaching
 it costs one sequencing error at that exact position, so ``c`` is on the order of the
@@ -73,6 +78,7 @@ from __future__ import annotations
 
 import argparse
 from array import array
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import nullcontext
 import gzip
@@ -407,19 +413,20 @@ def build_kmer_grouped(
         shape=(unique, unique))
     strata.setdiag(1.0)
     strata.data -= 1.0
-    mass = sizes * (1.0 if weights is None else weights)
-    per_row = adjacency @ mass
+    # Kernel version 2: a distinct neighbour is weighted once, not once per duplicate, and
+    # its share is split over its duplicates below (``/ sizes``).
+    weights = np.ones(unique) if weights is None else weights
+    per_row = adjacency @ weights
     width = np.diff(adjacency.indptr)
-    share = (adjacency.data if weights is None
-             else adjacency.data * weights[adjacency.indices])
+    share = adjacency.data * weights[adjacency.indices]
     dead = per_row == 0
     if dead.any():
         # An all-ambiguous cluster has no tie left to break; fall back to the plain split
         # rather than divide by zero (same convention as ``_normalise``).
         source_of = np.repeat(np.arange(unique), width)
         share = np.where(dead[source_of], adjacency.data, share)
-        per_row = np.where(dead, adjacency @ sizes.astype(np.float64), per_row)
-    data = share / np.repeat(per_row, width)
+        per_row = np.where(dead, adjacency @ np.ones(unique), per_row)
+    data = share / sizes[adjacency.indices] / np.repeat(per_row, width)
     cluster = sparse.csr_array((data, adjacency.indices, adjacency.indptr),
                                shape=(unique, unique))
 
@@ -602,9 +609,16 @@ def _normalise(member: np.ndarray, weights: np.ndarray | None) -> np.ndarray:
     return w / tot
 
 
+def byte_multiplicity(seqs: list[str]) -> np.ndarray:
+    """How many references carry each reference's byte-identical amplicon: ``n(j)``."""
+    counts = Counter(seqs)
+    return np.array([counts[s] for s in seqs], dtype=np.float64)
+
+
 def tie_cluster_matrix(d: np.ndarray, tau: int = 0,
                        weights: np.ndarray | None = None,
-                       decay: float = 1.0) -> np.ndarray:
+                       decay: float = 1.0,
+                       multiplicity: np.ndarray | None = None) -> np.ndarray:
     """Row-stochastic ``M`` from a distance matrix: split over each tie cluster.
 
     Self-distance is 0, so every cluster contains its own reference and no row is ever
@@ -612,8 +626,12 @@ def tie_cluster_matrix(d: np.ndarray, tau: int = 0,
     ``ambiguity_weights``) splits a cluster unevenly instead of uniformly, and ``decay``
     (see the module docstring) discounts a member by ``decay ** d``, which is a no-op at
     ``tau = 0`` and the difference between a useful and a harmful ``tau >= 1``.
+    ``multiplicity`` (``byte_multiplicity``) divides each column by ``n(j)``, which is the
+    version-2 kernel the grouped backends build; omit it for the version-1 split.
     """
     member = np.where(d <= tau, np.float64(decay) ** np.minimum(d, tau), 0.0)
+    if multiplicity is not None:
+        member = member / multiplicity
     return _normalise(member, weights)
 
 
@@ -641,7 +659,7 @@ def build(
     bound = max(tau, SUMMARY_DISTANCE)
     d = paf_distances(paf, refseqs, seqs, bound + 1)
     w = ambiguity_weights(seqs, ambiguity_weight)
-    M = tie_cluster_matrix(d, tau, w, distance_decay)
+    M = tie_cluster_matrix(d, tau, w, distance_decay, byte_multiplicity(seqs))
     return pd.DataFrame(M, index=refseqs, columns=refseqs), d
 
 
@@ -711,6 +729,7 @@ def build_sparse(
         members[source][target] = distance
         members[target][source] = distance
     weights = ambiguity_weights(sequences, ambiguity_weight)
+    multiplicity = byte_multiplicity(sequences)
     rows: list[int] = []
     columns: list[int] = []
     values: list[float] = []
@@ -718,7 +737,7 @@ def build_sparse(
     for source, targets in enumerate(members):
         target_list = sorted(targets)
         edits = np.array([targets[target] for target in target_list], dtype=np.float64)
-        decayed = np.float64(distance_decay) ** edits
+        decayed = np.float64(distance_decay) ** edits / multiplicity[target_list]
         weight = decayed if weights is None else decayed * weights[target_list]
         if weight.sum() == 0:
             weight = decayed
@@ -792,14 +811,18 @@ def demo() -> None:
     assert np.allclose(M.sum(axis=1), 1.0), M.sum(axis=1)          # row-stochastic
     assert np.allclose(np.diag(M)[:3], 1 / 3), np.diag(M)          # trio splits 3 ways
     assert np.allclose(M[3], np.eye(5)[3]) and np.allclose(M[4], np.eye(5)[4])  # identity
-    M1 = tie_cluster_matrix(d, tau=1)
-    assert np.allclose(np.diag(M1)[:4], 1 / 4), np.diag(M1)        # tau pulls #3 in
+    # tau pulls #3 in as one distinct amplicon: half of each row, however many copies
+    # the trio has (kernel version 2), and the trio's half split three ways.
+    mult = byte_multiplicity(seqs)
+    M1 = tie_cluster_matrix(d, tau=1, multiplicity=mult)
+    assert np.allclose(np.diag(M1), [1 / 6, 1 / 6, 1 / 6, 1 / 2, 1]), np.diag(M1)
+    assert np.isclose(M1[0, 3], 0.5), M1
     assert np.allclose(M1[4], np.eye(5)[4])                        # still isolated
 
     # Distance decay: the distance-1 neighbour is no longer an equal cluster member.
-    Md = tie_cluster_matrix(d, tau=1, decay=0.01)
+    Md = tie_cluster_matrix(d, tau=1, decay=0.01, multiplicity=mult)
     assert np.allclose(Md.sum(axis=1), 1.0), Md.sum(axis=1)        # still row-stochastic
-    assert np.allclose(Md[:3], tie_cluster_matrix(d, tau=0)[:3], atol=4e-3), Md
+    assert np.isclose(Md[0, 3], 0.01 / 1.01), Md                   # leak c / (1 + c)
     assert Md[0, 3] < M1[0, 3] / 30 and Md[3, 3] > 0.95, Md        # #3 keeps its own mass
     assert np.allclose(tie_cluster_matrix(d, tau=0, decay=0.01),
                        tie_cluster_matrix(d, tau=0))               # no-op at tau=0

@@ -4,6 +4,13 @@
 implementation plan; it now also records what was found, and — more importantly — what the
 result does *not* cover.
 
+> **GTDB V4 scope limit.** This alignment implementation is a generic matrix-building
+> capability, not approval to infer raw genome or strain abundances from the full GTDB V4
+> reference set. The genome-space fit is unsuitable at that scale: it fails its own
+> posterior-predictive check even on data drawn from the model, while the same matrix
+> fitted per distinct V4 sequence passes. The grouped kernel also over-weights duplicated
+> neighbours (kernel version 1). See [the GTDB inference recovery plan](gtdb_inference_recovery_plan.md).
+
 Steps 1, 2, 3 and 6 were executed. Steps 4 and 5 (the kernel ladder beyond rung 1, and the
 alignment-parameter sweeps) were dropped as unjustified once rung 1 passed; §"Limitations
 and biases" says when they become necessary again.

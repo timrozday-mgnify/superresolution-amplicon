@@ -18,7 +18,7 @@ workflow {
 
     // YAML samplesheet: a list of sample entries, each:
     //   id, reads (or fastq_1[/fastq_2]), platform, references (optional),
-    //   error_model (optional), mseq (optional)
+    //   error_model (optional), mseq (optional), panel_references (optional)
     def loaded = new org.yaml.snakeyaml.Yaml().load(file(params.input, checkIfExists: true).text)
     def rows = (loaded instanceof Map) ? loaded.samples : loaded
     if (!(rows instanceof List)) {
@@ -71,6 +71,19 @@ workflow {
         def ref = row.references ?: params.references
         if (!ref) error "Sample ${row.id}: no references (set samplesheet 'references' or --references)"
         def meta = [ id: row.id, platform: (row.platform ?: params.platform) ]
+        // A genome panel to reinterpret this sample's database labels with. Added only when
+        // present so non-panel runs keep their cached task hashes.
+        def panel = row.panel_references ?: params.panel_references
+        if (panel) {
+            if (params.infer_space != 'genome') {
+                error "Sample ${row.id}: panel reinterpretation infers panel genomes; use --infer_space genome"
+            }
+            if (params.mismapping_method != 'simulate' || params.mismapping_matrix) {
+                error "Sample ${row.id}: panel reinterpretation measures its own kernel by " +
+                      "simulation; unset --mismapping_matrix and use --mismapping_method simulate"
+            }
+            meta.panel = resolveFile(panel.toString())
+        }
         [ meta, resolveFile(ref.toString()) ]
     }
 

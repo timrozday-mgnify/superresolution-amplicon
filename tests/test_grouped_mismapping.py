@@ -46,7 +46,8 @@ def _dense(tau: int, weight: float, literal: bool = False) -> np.ndarray:
         [0 if a == b else 1 if literal else bma.bounded_iupac_distance(a, b, tau)
          for b in SEQUENCES] for a in SEQUENCES])
     return bma.tie_cluster_matrix(distances, tau=0 if literal else tau,
-                                  weights=bma.ambiguity_weights(SEQUENCES, weight))
+                                  weights=bma.ambiguity_weights(SEQUENCES, weight),
+                                  multiplicity=bma.byte_multiplicity(SEQUENCES))
 
 
 @pytest.mark.parametrize("tau,weight", [(0, 1.0), (1, 1.0), (1, 0.3), (2, 0.3)])
@@ -59,6 +60,59 @@ def test_grouped_matches_the_dense_tie_cluster(tmp_path: Path, tau: int, weight:
     expanded = cluster.toarray()[np.ix_(group, group)]
     assert np.allclose(expanded, _dense(tau, weight, literal=not tau))
     assert np.allclose(expanded.sum(axis=1), 1.0)
+
+
+@pytest.mark.parametrize("weight", [1.0, 0.3])
+@pytest.mark.parametrize("copies", [1, 10, 100])
+def test_leak_onto_a_neighbour_ignores_its_copy_number(
+        tmp_path: Path, copies: int, weight: float) -> None:
+    """Kernel version 2: MAPseq's leak onto a one-edit neighbour barely moves with how many
+    references carry it (dev/mapseq_multiplicity.md), so the kernel's must not move at all.
+    """
+    source = SEQUENCES[0]
+    neighbour = source[:-1] + "A"                               # one substitution
+    if weight != 1.0:
+        neighbour = "N" + neighbour[1:]                         # still one edit, amb = w
+    fasta = tmp_path / "a.fasta"
+    fasta.write_text(f">a\n{source}\n" + "".join(f">b{i}\n{neighbour}\n" for i in range(copies)))
+    refs, cluster, group, _, _ = bma.build_kmer_grouped(fasta, 1, 4, weight, 1 << 30, 0.01)
+    sizes = np.bincount(group).astype(np.float64)
+    a, b = group[refs.index("a")], group[refs.index("b0")]
+    assert np.isclose(cluster[a, b] * sizes[b], 0.01 * weight / (1 + 0.01 * weight))
+    assert np.allclose(cluster @ sizes, 1.0)                    # sum_b S[a, b] size[b] = 1
+
+
+def test_redecaying_a_built_kernel_equals_building_at_that_decay(tmp_path: Path) -> None:
+    """``M(c) = rownorm(M(c0) * (c / c0) ** d)`` survives the ``1 / size`` factor."""
+    torch = pytest.importorskip("torch")
+    import check_composition_fit as ccf                         # noqa: PLC0415
+
+    fasta = _fasta(tmp_path)
+    _, built, group, _, distances = bma.build_kmer_grouped(fasta, 1, 4, 0.3, 1 << 30, 0.05)
+    _, direct, _, _, _ = bma.build_kmer_grouped(fasta, 1, 4, 0.3, 1 << 30, 0.005)
+    redecayed = ccf._kernel_at_decay(built, group, (distances, 0.05), 0.005)
+    assert np.allclose(redecayed.toarray(), direct.toarray())
+    values, _ = si.DecayKernel(built, distances, 0.05, group).kernel(
+        torch.tensor(0.005, dtype=torch.float64))
+    assert np.allclose(values.numpy(), direct.data)
+
+
+def test_kernel_version_is_stored_hashed_and_warned_about(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A stale kernel must change MATRIX_KEY, and a file that predates versioning warns."""
+    key_module = (ROOT / "modules" / "local" / "matrix_key" / "main.nf").read_text()
+    assert f"kernel_version: {sm.KERNEL_VERSION}," in key_module
+
+    path = tmp_path / "m.npz"
+    sm.write_grouped(path, sparse.csr_array(np.eye(1)), np.zeros(1, dtype=np.int32), ["r"])
+    assert sm.stored_kernel_version(path) == sm.KERNEL_VERSION
+    with np.load(path) as archive:
+        legacy = {key: archive[key] for key in archive.files if key != "kernel_version"}
+    np.savez(path, **legacy)
+    assert sm.stored_kernel_version(path) == 1
+    with caplog.at_level("WARNING"):
+        sm.read_grouped(path, ["r"])
+    assert "kernel_version 1" in caplog.text
 
 
 def test_round_trip_reorders_and_rejects_a_foreign_reference_set(tmp_path: Path) -> None:
