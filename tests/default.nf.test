@@ -298,8 +298,16 @@ nextflow_pipeline {
         then {
             assertAll(
                 { assert workflow.success },
+                // One reference file: one extraction and one mapseq clustering, shared.
+                { assert workflow.trace.succeeded().findAll { it.name.contains(':EXTRACT_AMPLICONS (') }.size() == 1 },
+                { assert workflow.trace.succeeded().findAll { it.name.contains(':MAPSEQ_CLUSTER (') }.size() == 1 },
+                { assert workflow.trace.succeeded().findAll { it.name.contains(':MATRIX_KEY (') }.size() == 2 },
+                { assert workflow.trace.succeeded().findAll { it.name.contains(':MAPSEQ_OBS (') }.size() == 2 },
                 { assert workflow.trace.succeeded().findAll { it.name.contains('SIMULATE_READS') }.size() == 1 },
                 { assert workflow.trace.succeeded().findAll { it.name.contains('BUILD_MISMAPPING') }.size() == 1 },
+                // ...still published under each sample's own id.
+                { assert path("${params.outdir}/amplicons/demo_a_amplicons/amplicons.fasta").exists() },
+                { assert path("${params.outdir}/amplicons/demo_b_amplicons/amplicons.fasta").exists() },
                 { assert path("${params.outdir}/mismapping/groups.tsv").exists() },
                 { assert path("${params.outdir}/composition/demo_a/demo_a.inference_diagnostics.csv").exists() },
                 { assert path("${params.outdir}/composition/demo_b/demo_b.inference_diagnostics.csv").exists() }
@@ -342,6 +350,10 @@ nextflow_pipeline {
         then {
             assertAll(
                 { assert workflow.success },
+                { assert workflow.trace.succeeded().findAll { it.name.contains(':EXTRACT_AMPLICONS (') }.size() == 2 },
+                { assert workflow.trace.succeeded().findAll { it.name.contains(':MAPSEQ_CLUSTER (') }.size() == 2 },
+                { assert path("${params.outdir}/amplicons/demo_a_amplicons/amplicons.fasta").exists() },
+                { assert path("${params.outdir}/amplicons/demo_b_amplicons/amplicons.fasta").exists() },
                 { assert workflow.trace.succeeded().findAll { it.name.contains('SIMULATE_READS') }.size() == 2 },
                 { assert workflow.trace.succeeded().findAll { it.name.contains('BUILD_MISMAPPING') }.size() == 2 }
             )
