@@ -11,6 +11,9 @@ import shutil
 from pathlib import Path
 
 import numpy as np
+
+import sparse_matrix as sm
+
 REFERENCE_FILES = (
     "amplicons.fasta",
     "amplicons.tax",
@@ -68,6 +71,7 @@ def main() -> None:
         shutil.copy2(args.amplicon_dir / name, reference_dir / name)
 
     provenance = json.loads(base64.b64decode(args.provenance_base64))
+    provenance["kernel_version"] = sm.stored_kernel_version(matrix_path)
     members = json.loads(base64.b64decode(args.members_base64))
     (output_dir / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
     with (output_dir / "samples.tsv").open("w") as handle:

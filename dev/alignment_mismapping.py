@@ -92,6 +92,8 @@ def minimap2_distances(
 
 def compare(M: np.ndarray, ref: np.ndarray) -> dict:
     """Matrix-space diagnostics of ``M`` against the measured ``ref``."""
+    # ers.build_M now returns sparse; the diagnostics below are dense and 81x81 is tiny.
+    M, ref = (x.toarray() if hasattr(x, "toarray") else x for x in (M, ref))
     n = len(M)
     offdiag = ~np.eye(n, dtype=bool)
     tv = 0.5 * np.abs(M - ref).sum(axis=1)
@@ -136,7 +138,8 @@ def main() -> None:
     fasta, tax = work / "amplicons.fasta", work / "amplicons.tax"
     recs = si.read_fasta(fasta)
     refseqs, amps = [h for h, _ in recs], [s for _, s in recs]
-    T = pd.read_csv(work / "translation_table.csv", index_col=0)
+    T = pd.read_csv(work / "translation_table.tsv", sep="\t").pivot_table(
+        index="genome_id", columns="refseq", values="weight", fill_value=0.0)[refseqs]
     genomes = list(T.index)
     assert list(T.columns) == refseqs
 
@@ -189,14 +192,15 @@ def main() -> None:
     t0 = time.perf_counter()
     d = minimap2_distances(fasta, refseqs, amps_db, bma.SUMMARY_DISTANCE + 1)
     w = bma.ambiguity_weights(amps_db, bma.DEFAULT_AMBIGUITY_WEIGHT)
-    Ms["align minimap2 tau=0"] = bma.tie_cluster_matrix(d, 0, w)
+    mult = bma.byte_multiplicity(amps_db)
+    Ms["align minimap2 tau=0"] = bma.tie_cluster_matrix(d, 0, w, multiplicity=mult)
     t_align = time.perf_counter() - t0
     for tau in TAUS[1:]:
-        Ms[f"align minimap2 tau={tau}"] = bma.tie_cluster_matrix(d, tau, w)
+        Ms[f"align minimap2 tau={tau}"] = bma.tie_cluster_matrix(d, tau, w, multiplicity=mult)
     if a.inject_n:
         for aw in AMBIGUITY_WEIGHTS:
             Ms[f"align minimap2 tau=0 (ambiguity weight {aw})"] = bma.tie_cluster_matrix(
-                d, 0, bma.ambiguity_weights(amps_db, aw))
+                d, 0, bma.ambiguity_weights(amps_db, aw), multiplicity=mult)
     if a.read_len is not None:
         # align mode has no read-window model on purpose: this run shows what it costs.
         # M is the whole-reference matrix while M_sim was measured with short reads.
@@ -208,7 +212,7 @@ def main() -> None:
     d_shuf = np.zeros_like(d)
     d_shuf[iu] = rng.permutation(d[iu])
     d_shuf = d_shuf + d_shuf.T
-    Ms["shuffled control"] = bma.tie_cluster_matrix(d_shuf, 0)
+    Ms["shuffled control"] = bma.tie_cluster_matrix(d_shuf, 0, multiplicity=mult)
 
     print(f"cost: simulate+map {t_sim:.1f}s   align/minimap2 {t_align:.2f}s "
           f"({t_sim / t_align:.0f}x)\n")

@@ -310,6 +310,77 @@ def build_mismapping(sim_mseq_paths, refseqs: list[str],
     return sparse.csr_array((values, (rows, columns)), shape=(n, n))
 
 
+def tally_kernel(sim_mseq_paths, source_of_query: dict[str, int], label_of_hit: dict[str, int],
+                 n_src: int, n_lab: int, min_identity: float | None = None
+                 ) -> tuple[sparse.csr_array, np.ndarray]:
+    """Count simulated reads per ``(source, label)``: ``counts[s, l]`` reads from ``s`` labelled ``l``.
+
+    A read's source is its query id without the simulator's ``:<i>`` suffix, looked up in
+    ``source_of_query``; its label is ``label_of_hit[hit]``. Sources and labels may be
+    different sets (panel amplicons against database groups). Also returns which sources
+    had a classified read, whether or not its hit had a label. Row normalisation and any
+    fallback rows are the caller's.
+    """
+    counts: Counter[tuple[int, int]] = Counter()
+    seen = np.zeros(n_src, dtype=bool)
+    unknown = 0
+    for path in sim_mseq_paths:
+        for query, hit in iter_mseq(path, min_identity):
+            source = source_of_query.get(query.rsplit(":", 1)[0])
+            if source is None:
+                unknown += 1
+                continue
+            seen[source] = True
+            label = label_of_hit.get(hit)
+            if label is None:
+                unknown += 1
+                continue
+            counts[source, label] += 1
+    if unknown:
+        log.warning("%d simulated hits with an unrecognised source/target reference", unknown)
+    keys = np.array(list(counts), dtype=np.int64).reshape(-1, 2)
+    values = np.array(list(counts.values()), dtype=np.float64)
+    return sparse.csr_array((values, (keys[:, 0], keys[:, 1])), shape=(n_src, n_lab)), seen
+
+
+def build_mismapping_grouped(sim_mseq_paths, refseqs: list[str], group: np.ndarray,
+                             min_identity: float | None = None,
+                             active: np.ndarray | None = None) -> sparse.csr_array:
+    """Measured ``M`` at V4-group level, in the grouped (unique-amplicon kernel) format.
+
+    ``S[A, B]`` is the fraction of reads simulated from group ``A`` that mapseq labels
+    *anywhere* in group ``B``, divided by ``size(B)`` — the grouped format's convention, so
+    ``sum_B S[A, B] * size(B) == 1`` and every member of a group shares the row its
+    representative was simulated from. That is what lets one simulation per distinct
+    amplicon stand in for its duplicates, and it is the granularity the ``v4_group`` fit
+    uses: which identical member mapseq happened to name carries no information.
+
+    A group whose simulated reads all failed to map keeps an identity row, as does any
+    group in ``active`` that produced no read at all — the simulator skips a sequence it
+    cannot draw from (IUPAC codes), and a group meant to be a source must not silently
+    become one no read can come from. Every other group gets an empty row, so it prunes
+    away in inference rather than pretending to be unconfusable.
+    """
+    n = int(group.max()) + 1 if len(group) else 0
+    size = np.bincount(group, minlength=n).astype(np.float64)
+    group_of = {r: int(g) for r, g in zip(refseqs, group)}
+    counts, seen = tally_kernel(sim_mseq_paths, group_of, group_of, n, n, min_identity)
+    simulated = set(np.flatnonzero(seen).tolist())
+    expected = simulated | (set(active.tolist()) if active is not None else set())
+    empty = sorted(expected - set(np.flatnonzero(np.diff(counts.indptr)).tolist()))
+    if empty:
+        log.warning("%d group(s) had no mapped simulated read; using an identity row",
+                    len(empty))
+        counts = counts + sparse.csr_array((np.ones(len(empty)), (empty, empty)), shape=(n, n))
+    log.info("measured %d of %d groups (%d rows stay empty)",
+             len(simulated), n, n - len(simulated | set(empty)))
+    counts = counts.tocoo()
+    totals = np.bincount(counts.row, counts.data, minlength=n)
+    return sparse.csr_array(
+        (counts.data / totals[counts.row] / size[counts.col], (counts.row, counts.col)),
+        shape=(n, n))
+
+
 # ── Pyro inference ────────────────────────────────────────────────────────────
 
 
@@ -341,9 +412,11 @@ class DecayKernel:
     instead of a hyperparameter that has to be right at build time for every sample the
     matrix is shared with. ``sizes`` carries the grouped form's row-stochasticity
     (``sum_b S[a, b] * size[b] == 1``); it is all ones for a reference-square matrix.
+    With ``home`` the matrix is a rectangular sources x labels kernel and ``home[a]`` takes
+    the diagonal's place.
     """
 
-    def __init__(self, matrix, distances, decay: float, group=None):
+    def __init__(self, matrix, distances, decay: float, group=None, home=None):
         import torch
 
         matrix, distances = matrix.tocsr(), distances.tocsr()
@@ -353,17 +426,19 @@ class DecayKernel:
             raise ValueError("distance strata must share the matrix's sparsity pattern")
         if not 0.0 < decay <= 1.0:
             raise ValueError("the built distance decay must be in (0, 1]")
-        n = matrix.shape[0]
+        n, n_cols = matrix.shape
         row = np.repeat(np.arange(n), np.diff(matrix.indptr))
-        diagonal = np.flatnonzero(row == matrix.indices)
+        target = row if home is None else np.asarray(home)[row]
+        diagonal = np.flatnonzero(target == matrix.indices)
         if len(diagonal) != n:
             # Every reference is in its own tie cluster at distance 0, so this cannot
             # happen from a build — it would mean a row with no mass of its own.
-            raise ValueError("every kernel row needs a diagonal entry to re-decay")
-        sizes = (np.ones(n) if group is None
+            raise ValueError("every kernel row needs a diagonal (home) entry to re-decay")
+        sizes = (np.ones(n_cols) if group is None
                  else np.bincount(group, minlength=n).astype(np.float64))
         self.dtype = torch.float64
-        self.n = n
+        self.n, self.n_cols = n, n_cols
+        self.home = None if home is None else torch.tensor(np.asarray(home), dtype=torch.long)
         self.decay = float(decay)
         self.row = torch.tensor(row, dtype=torch.long)
         self.col = torch.tensor(matrix.indices.astype(np.int64), dtype=torch.long)
@@ -386,7 +461,7 @@ class DecayKernel:
         """``S^T pooled`` — the mass each kernel row sends, gathered at its targets."""
         import torch
 
-        return torch.zeros(self.n, dtype=values.dtype).index_add(
+        return torch.zeros(self.n_cols, dtype=values.dtype).index_add(
             0, self.col, pooled[self.row] * values)
 
 
@@ -395,11 +470,13 @@ def _mismapping_dtype(M):
     return M[0].dtype if isinstance(M, tuple) else M.dtype
 
 
-def _apply_sparse(r_true, diagonal, transpose_apply, group, n_kernel, scale):
-    """``r_true @ rownorm((1-s)I + s*M)`` from ``M``'s diagonal and its transposed action.
+def _apply_sparse(r_true, diagonal, transpose_apply, group, n_kernel, scale, home=None):
+    """``r_true @ rownorm((1-s)E + s*M)`` from ``M``'s home entries and its transposed action.
 
-    The off-diagonal mass is ``1 - diagonal`` rather than a sum, so neither the identity
-    mix nor the renormalisation ever needs the matrix itself.
+    ``E`` is the identity, or for a rectangular (sources x labels) kernel the one-hot rows
+    ``E[a, home[a]]``; ``diagonal[a]`` is ``M[a, home[a]]`` either way. The off-home mass is
+    ``1 - diagonal`` rather than a sum, so neither the mix nor the renormalisation ever
+    needs the matrix itself.
     """
     import torch
 
@@ -416,7 +493,10 @@ def _apply_sparse(r_true, diagonal, transpose_apply, group, n_kernel, scale):
             0, group, scaled_mass)
         mapped = transpose_apply(pooled)[group]
     correction = r_true * ((diagonal_effective - scale * diagonal) / row_sums)
-    return mapped + correction
+    if home is None:
+        return mapped + correction
+    # Rectangular kernel: the unscaled mass lands on each source's home label.
+    return mapped.index_add(0, home, correction)
 
 
 def _apply_mismapping(r_true, M, scale, decay=None):
@@ -424,8 +504,10 @@ def _apply_mismapping(r_true, M, scale, decay=None):
 
     ``M`` is a dense tensor, a ``(sparse, diagonal)`` pair over references, a
     ``(sparse, diagonal, group)`` triple whose sparse factor is over the *distinct*
-    amplicons (see ``sparse_matrix.write_grouped``), or a ``DecayKernel``, which builds
-    that kernel at the sampled ``decay`` first.
+    amplicons (see ``sparse_matrix.write_grouped``), a ``(sparse, diagonal, None, home)``
+    rectangular sources x labels kernel with ``diagonal = M[a, home[a]]`` (see
+    ``sparse_matrix.write_kernel``; the result is then over labels), or a ``DecayKernel``,
+    which builds that kernel at the sampled ``decay`` first.
     """
     import torch
 
@@ -433,25 +515,25 @@ def _apply_mismapping(r_true, M, scale, decay=None):
         values, diagonal = M.kernel(decay)
         return _apply_sparse(r_true, diagonal if M.group is None else diagonal[M.group],
                              lambda pooled: M.spread(pooled, values), M.group, M.n,
-                             scale)
+                             scale, M.home)
 
     if not isinstance(M, tuple):
         effective = (1.0 - scale) * torch.eye(M.shape[0], dtype=M.dtype) + scale * M
         effective = torch.clamp(effective, min=0.0)
         return r_true @ (effective / effective.sum(-1, keepdim=True))
 
-    matrix, diagonal, group = (M if len(M) == 3 else (*M, None))
+    matrix, diagonal, group, home = (*M, None, None)[:4]
     return _apply_sparse(
         r_true, diagonal,
         lambda x: torch.sparse.mm(matrix.transpose(0, 1), x[:, None]).squeeze(1),
-        group, matrix.shape[0], scale)
+        group, matrix.shape[0], scale, home)
 
 
 def composition_model(M, T, alpha, N, y_obs=None, likelihood="dirichlet_multinomial",
                       use_mismapping=True, s_sigma=0.3, od_loc=1.1, od_scale=1.0,
                       use_presence=True, presence_prior=DEFAULT_PRESENCE_PRIOR,
                       presence_temp=DEFAULT_PRESENCE_TEMP,
-                      use_decay=False, decay_sigma=DEFAULT_DECAY_SIGMA):
+                      use_decay=False, decay_sigma=DEFAULT_DECAY_SIGMA, use_horseshoe=False):
     """Generative model of the observed per-reference counts.
 
     ``theta`` is the true **read-space** genome composition; ``T`` rows sum to 1
@@ -486,7 +568,18 @@ def composition_model(M, T, alpha, N, y_obs=None, likelihood="dirichlet_multinom
 
     dt = _mismapping_dtype(M)
     G = _translation_genomes(T)
-    theta = pyro.sample("theta", dist.Dirichlet(alpha * torch.ones(G, dtype=dt)))
+    if use_horseshoe:
+        # Continuous shrinkage on unnormalised weights (plan Phase 5): heavy-tailed local
+        # scales let a few sources stay large while the rest shrink to ~0, fully
+        # reparameterisable, so no Concrete noise. ``alpha`` is unused.
+        # ponytail: theta = w/sum(w) is scale-invariant, so the global tau is only weakly
+        # identified; a regularised (slab) horseshoe is the upgrade if it drifts.
+        tau = pyro.sample("tau", dist.HalfCauchy(torch.tensor(1.0, dtype=dt)))
+        lam = pyro.sample("lambda", dist.HalfCauchy(torch.ones(G, dtype=dt)).to_event(1))
+        w = pyro.sample("w", dist.HalfNormal(tau * lam).to_event(1))
+        theta = w / w.sum()
+    else:
+        theta = pyro.sample("theta", dist.Dirichlet(alpha * torch.ones(G, dtype=dt)))
 
     if use_presence:
         # Bernoulli presence per genome, relaxed to a Concrete distribution so SVI can
@@ -592,11 +685,21 @@ def _fit(mode, M, T, alpha, N, y_obs, likelihood, theta_init, args, desc=""):
     mk = {"y_obs": y_obs, "likelihood": likelihood, "use_mismapping": use_mm,
           "use_presence": use_presence, "presence_prior": p_prior, "presence_temp": p_temp,
           "use_decay": use_decay,
-          "decay_sigma": getattr(args, "decay_sigma", DEFAULT_DECAY_SIGMA)}
+          "decay_sigma": getattr(args, "decay_sigma", DEFAULT_DECAY_SIGMA),
+          "use_horseshoe": getattr(args, "use_horseshoe", False),
+          "s_sigma": getattr(args, "s_sigma", 0.3)}
 
     pyro.set_rng_seed(int(getattr(args, "seed", 0) or 0))
     pyro.clear_param_store()
-    init = {"theta": theta_init}
+    if mk["use_horseshoe"]:
+        if mode != "vi":
+            raise SystemExit("--horseshoe is only supported in --mode vi")
+        # w starts at theta_init with unit local scales; tau matches w's scale.
+        dt0 = theta_init.dtype
+        init = {"w": theta_init, "lambda": torch.ones(G, dtype=dt0),
+                "tau": torch.tensor(1.0 / G, dtype=dt0)}
+    else:
+        init = {"theta": theta_init}
     if use_mm:
         init["s"] = torch.tensor(1.0, dtype=_mismapping_dtype(M))
     if use_decay:
@@ -628,13 +731,21 @@ def _fit(mode, M, T, alpha, N, y_obs, likelihood, theta_init, args, desc=""):
         mcmc = MCMC(kernel, num_samples=args.num_samples, warmup_steps=args.warmup,
                     disable_progbar=not show)
         mcmc.run(M, T, alpha, N, **mk)
-        s = mcmc.get_samples()["theta"]
+        drawn = mcmc.get_samples()
+        theta_draws = drawn["theta"]
         diag = mcmc.diagnostics().get("theta", {})
         rhat = np.atleast_1d(np.asarray(diag.get("r_hat", np.nan))).astype(float)
         ess = np.atleast_1d(np.asarray(diag.get("n_eff", np.nan))).astype(float)
-        mean, lo, hi = _summ(s)
-        return s, mean, {"r_hat": rhat.tolist(), "n_eff": ess.tolist(),
-                         "max_r_hat": float(np.nanmax(rhat))}, None
+        mean, lo, hi = _summ(theta_draws)
+        posterior_draws = {"theta_eff": theta_draws.detach().cpu().numpy()}
+        for site in ("s", "conc_frac", "c"):
+            if site in drawn:
+                posterior_draws[site] = drawn[site].detach().cpu().numpy()
+        return theta_draws, mean, {
+            "r_hat": rhat.tolist(), "n_eff": ess.tolist(),
+            "max_r_hat": float(np.nanmax(rhat)),
+            "_posterior_draws": posterior_draws,
+        }, None
 
     from pyro import poutine
     from pyro.infer import SVI, Trace_ELBO, Predictive
@@ -663,23 +774,40 @@ def _fit(mode, M, T, alpha, N, y_obs, likelihood, theta_init, args, desc=""):
     diag = {"final_loss": losses[-1], **_presence_diag()}
     if mode == "mle":
         # AutoDelta.median() has no deterministic sites, so apply the hard gate here.
+        median = guide.median()
         if use_decay:
-            diag["distance_decay"] = float(guide.median()["c"].detach())
-        point = guide.median()["theta"].detach()
+            diag["distance_decay"] = float(median["c"].detach())
+        point = median["theta"].detach()
         if use_presence:
             point = point * (_presence_probs(G) >= PRESENCE_THRESHOLD).to(point.dtype)
             point = point / point.sum().clamp(min=1e-12)
+        posterior_draws = {"theta_eff": point[None].cpu().numpy()}
+        for site in ("s", "conc_frac", "c"):
+            if site in median:
+                posterior_draws[site] = median[site].detach().cpu().numpy().reshape(1)
+        diag["_posterior_draws"] = posterior_draws
         return None, point, diag, losses
+    return_sites = ["theta_eff"]
+    if use_mm:
+        return_sites.append("s")
+    if likelihood == "dirichlet_multinomial":
+        return_sites.append("conc_frac")
+    if use_decay:
+        return_sites.append("c")
     pred = Predictive(composition_model, guide=guide, num_samples=args.num_samples,
-                      return_sites=["theta_eff"] + (["c"] if use_decay else []))
+                      return_sites=return_sites)
     drawn = pred(M, T, alpha, N, **{**mk, "y_obs": None})
     if use_decay:
         # The fitted decay is a reportable per-sample quantity in its own right: it is
         # this sample's per-base error rate as the mis-mapping matrix sees it.
         diag["distance_decay"] = float(drawn["c"].mean())
-    s = drawn["theta_eff"].squeeze()
-    mean, lo, hi = _summ(s)
-    return s, mean, diag, losses
+    theta_draws = drawn["theta_eff"].reshape(-1, G)
+    mean, lo, hi = _summ(theta_draws)
+    diag["_posterior_draws"] = {
+        site: values.detach().cpu().numpy().reshape(-1, *values.shape[1:])
+        for site, values in drawn.items()
+    }
+    return theta_draws, mean, diag, losses
 
 
 # ── Presence/absence scoring ──────────────────────────────────────────────────

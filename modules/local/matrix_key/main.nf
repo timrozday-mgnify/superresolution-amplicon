@@ -13,6 +13,8 @@ process MATRIX_KEY {
 
     script:
     def settings = [
+        // Must equal sparse_matrix.KERNEL_VERSION (tests/test_grouped_mismapping.py checks).
+        kernel_version: 2,
         mismapping_method: params.mismapping_method, align_backend: params.align_backend,
         align_tau: params.align_tau,
         align_distance_decay: params.align_distance_decay,
