@@ -227,7 +227,10 @@ simulates reads, so nothing needs an error model and the skiver subworkflow neve
 | `--sim_n_per_ref` | `500` | Simulated reads per reference (sampling depth for `M`). |
 | `--mismapping_matrix` | – | A previously generated `mismapping_matrix.npz` for the same amplicon reference set. Skips read simulation and simulated-read mapseq. Either form is accepted: the labelled compressed CSR, or the grouped form; legacy CSV matrices remain readable. |
 
-The pipeline fingerprints extracted amplicons and builds each compatible matrix once
+In-silico PCR and the mapseq clustering run once per distinct `references` file,
+however many samples name it: 50 samples against one GTDB SSU FASTA extract and
+cluster it once. `amplicons/<id>_amplicons/` is still published per sample. The
+pipeline then fingerprints extracted amplicons and builds each compatible matrix once
 per run. Canonical reusable matrices are published under `mismapping/<matrix-key>/`:
 
 ```bash
