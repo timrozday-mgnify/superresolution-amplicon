@@ -121,9 +121,19 @@ def extract_v4(seq: str, fwd: str, rev: str, max_mismatch: int) -> str | None:
     """In-silico PCR: return the amplicon between the forward primer and the
     reverse-complement of the reverse primer, or ``None`` if not amplifiable.
 
+    Both orientations are tried: a reference 16S stored on the minus strand amplifies
+    just as a real PCR would (AmpliconHunter searches both strands too), and returns
+    the sense-strand amplicon either way.
+
     ponytail: exact-window IUPAC scan with a mismatch budget; AmpliconHunter may
     amplify a few edge cases this misses, which just drops them from the estimate.
     """
+    return _amplify(seq, fwd, rev, max_mismatch) or _amplify(revcomp(seq), fwd, rev,
+                                                             max_mismatch)
+
+
+def _amplify(seq: str, fwd: str, rev: str, max_mismatch: int) -> str | None:
+    """One-orientation in-silico PCR."""
     f = _find_primer(seq, fwd, max_mismatch)
     if f is None:
         return None
@@ -143,11 +153,8 @@ def trim_read_primers(seq: str, fwd: str, rev: str, max_mismatch: int) -> str:
     reference amplicons they are mapped against); putting them in the same coordinate
     space as ``extract_v4``'s references keeps the observed and simulated reads
     comparable. If no primer pair is found in either orientation (reads already trimmed,
-    or an off-target read), the read is returned unchanged."""
-    amp = extract_v4(seq, fwd, rev, max_mismatch)
-    if amp is None:
-        amp = extract_v4(revcomp(seq), fwd, rev, max_mismatch)
-    return amp if amp else seq
+    or an off-target read), the read is returned unchanged (``extract_v4`` tries both)."""
+    return extract_v4(seq, fwd, rev, max_mismatch) or seq
 
 
 def _progress(iterable, *, total=None, desc="", enabled=True, unit="it", leave=False):
