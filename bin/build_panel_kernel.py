@@ -50,8 +50,10 @@ def v4g(seq: str) -> str:
 
 
 def panel_copies(panel: Path, fwd: str, rev: str, max_mismatch: int,
-                 alias: dict[str, str]) -> dict[str, list[str]]:
-    """Genome -> its amplifiable V4 copies (primers cut off, duplicates kept).
+                 alias: dict[str, str]) -> tuple[dict[str, list[str]], list[str]]:
+    """(genome -> its amplifiable V4 copies, genomes dropped for having none).
+
+    Copies keep primers cut off and duplicates kept.
 
     A directory holds ``<genome>.amplicons.fasta`` files; a single FASTA names the genome
     before the first ``|`` of each header. ``alias`` maps a file stem/genome to a genome id.
@@ -68,12 +70,22 @@ def panel_copies(panel: Path, fwd: str, rev: str, max_mismatch: int,
         amplicon = si.extract_v4(seq, fwd, rev, max_mismatch)
         if amplicon:
             copies[genome].append(amplicon)
-    empty = sorted(g for g, c in copies.items() if not c)
-    if empty:
-        raise SystemExit(f"no amplifiable V4 copy in panel genome(s): {', '.join(empty)}")
     if not copies:
         raise SystemExit(f"no panel genomes found in {panel}")
-    return copies
+    # A genome whose 16S is partial or fragmented across the primer sites has nothing to
+    # simulate from, so it cannot be a source. Drop it rather than failing the run: its
+    # reads then land in `background`, which is what an out-of-panel genome does anyway.
+    dropped = sorted(g for g, c in copies.items() if not c)
+    if dropped:
+        log.warning("no amplifiable V4 copy in %d/%d panel genome(s); dropped from the "
+                    "panel (their reads become `background`): %s",
+                    len(dropped), len(copies), ", ".join(dropped))
+        for g in dropped:
+            del copies[g]
+    if not copies:
+        raise SystemExit(f"no panel genome in {panel} has an amplifiable V4 copy; "
+                         "check the primers, --max-mismatch and the panel references")
+    return copies, dropped
 
 
 def db_groups(db_amplicons: Path) -> tuple[list[str], list[str], np.ndarray, list[str]]:
@@ -98,8 +110,8 @@ def _home_labels(home_mseq: Path, src: dict[str, int], label_of_hit: dict[str, i
 
 
 def prepare(a) -> None:
-    copies = panel_copies(a.panel_amplicons, a.fwd_primer, a.rev_primer, a.max_mismatch,
-                          dict(x.split("=", 1) for x in a.alias))
+    copies, dropped = panel_copies(a.panel_amplicons, a.fwd_primer, a.rev_primer,
+                                   a.max_mismatch, dict(x.split("=", 1) for x in a.alias))
     translation = pd.DataFrame(
         [{"genome_id": g, "source": v4g(seq), "weight": n / len(seqs)}
          for g, seqs in sorted(copies.items()) for seq, n in Counter(seqs).items()])
@@ -110,12 +122,14 @@ def prepare(a) -> None:
     sources["in_db"] = sources.source.isin(set(label_ids))
     a.out.mkdir(parents=True, exist_ok=True)
     translation.to_csv(a.out / "panel_translation.tsv", sep="\t", index=False)
+    if dropped:
+        (a.out / "panel_unamplifiable.txt").write_text("".join(f"{g}\n" for g in dropped))
     sources.to_csv(a.out / "sources.tsv", sep="\t", index=False)
     with open(a.out / "sources.fasta", "w") as fh:
         fh.writelines(f">{s}\n{sequence[s]}\n" for s in sources.source)
-    log.info("%d genomes, %d distinct sources, %d in the database, %d shared",
-             len(copies), len(sources), sources.in_db.sum(),
-             sources.genomes.str.contains(";").sum())
+    log.info("%d genomes (%d unamplifiable, dropped), %d distinct sources, %d in the "
+             "database, %d shared", len(copies), len(dropped), len(sources),
+             sources.in_db.sum(), sources.genomes.str.contains(";").sum())
 
 
 def _mseq_rows(path: Path):
