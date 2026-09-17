@@ -214,7 +214,7 @@ Reference amplicons (in-silico PCR):
 |-------|---------|-------------|
 | `--fwd_primer` / `--rev_primer` | V4 515F / 806R | Amplicon primers. |
 | `--primer_mismatches` | `3` | Allowed primer mismatches. |
-| `--trim_primers` | `true` | Trim primers off observed reads before mapping. Set `false` if reads are already primer-trimmed. |
+| `--trim_primers` | `true` | Trim primers off observed reads before mapping, and simulate the matrix and panel reads from primer-flanked amplicons trimmed the same way. Set `false` if reads are already primer-trimmed. |
 
 Mis-mapping — how `M` is built:
 
@@ -382,7 +382,12 @@ Composition inference (Pyro):
 > extraction stage, both read orientations) before mapping, so observed and simulated
 > reads sit in the same coordinate space. Reads that are already trimmed — or have no
 > detectable primer — are left unchanged, so it is safe to leave on; disable with
-> `--trim_primers false` only if you have a reason to.
+> `--trim_primers false` only if you have a reason to. The simulated reads get the same
+> trim: they are drawn from each amplicon flanked by its primers, so errors a trained
+> model puts at the start of a read fall in the primer and are cut away, as they are
+> for the observed reads. Without that, 42% of trained reads carried extra 5′ bases,
+> and against SILVA NR99 the panel kernel failed the fit check on every sample
+> ([dev/panel_silva_sweep.md](dev/panel_silva_sweep.md)).
 
 > **Why the same mapper twice.** `M` is only meaningful if the simulated reads experience
 > the confusion the real reads experience, so `MAPSEQ_SIM` and `MAPSEQ_OBS` are the same

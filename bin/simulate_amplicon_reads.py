@@ -23,6 +23,13 @@ Two error models (``--error-model``):
 
 By default a read is the whole amplicon (correct for merged V4 reads); ``--read-len``
 draws a uniform random substring of that length instead, for unmerged/short reads.
+
+``--trim-primers`` simulates each read from the amplicon flanked by its primers and then
+trims them off with ``trim_read_primers``, as ``reads_to_fasta.py`` does to the observed
+reads. Without it, an error the model places at the start of a read lands inside the
+amplicon: 42% of the reads a trained model simulated from bare amplicons carried 1-3 extra
+5' bases, and against SILVA NR99's one-base near-ties MAPseq labels those reads differently
+from the trimmed observed reads (dev/panel_silva_sweep.md).
 """
 from __future__ import annotations
 
@@ -102,15 +109,24 @@ def sampler(error_model: str, model_pt=None, sub_rate: float = 0.005,
         (r.name, r.sequence) for r in apply_batch(model, records, rng, emit_quality=False)]
 
 
+def flank(seq: str, fwd: str, rev: str) -> str:
+    """``seq`` between its primers, degenerate codes resolved to their first ACGT option."""
+    concrete = lambda p: "".join(sorted(si._IUPAC[c])[0] for c in p)  # noqa: E731
+    return concrete(fwd) + seq + concrete(si.revcomp(rev))
+
+
 def run(a) -> None:
     rng = np.random.default_rng(a.seed)
     apply_error = sampler(a.error_model, a.model_pt, a.sub_rate, a.ins_rate, a.del_rate,
                           a.use_vi)
+    trim = getattr(a, "trim_primers", False)
 
     n_reads = 0
     with open(a.output, "w") as out:
         # Stream reference-by-reference so a large DB never holds all reads in memory.
         for header, seq in si.read_fasta(a.amplicons):
+            if trim:
+                seq = flank(seq, a.fwd_primer, a.rev_primer)
             frags = [draw_fragment(seq, a.read_len, rng) for _ in range(a.n_per_ref)]
             recs = [(f"{header}:{i}", f, True) for i, f in enumerate(frags)
                     if f and set(f) <= set(_BASES)]
@@ -118,6 +134,9 @@ def run(a) -> None:
                 log.warning("reference %s produced no usable fragment (non-ACGT?)", header)
                 continue
             for name, sequence in apply_error(recs, rng):
+                if trim:
+                    sequence = si.trim_read_primers(sequence, a.fwd_primer, a.rev_primer,
+                                                    a.primer_mismatches)
                 if not sequence:
                     continue
                 out.write(f">{name}\n{sequence}\n")
@@ -165,6 +184,12 @@ def main() -> None:
     ap.add_argument("--n-per-ref", type=int, default=500,
                     help="simulated reads per reference (mis-mapping sampling depth)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--trim-primers", action="store_true",
+                    help="simulate from primer-flanked amplicons and trim the primers off "
+                         "each read, as the observed reads are")
+    ap.add_argument("--fwd-primer", default=si.DEFAULT_FWD_PRIMER)
+    ap.add_argument("--rev-primer", default=si.DEFAULT_REV_PRIMER)
+    ap.add_argument("--primer-mismatches", type=int, default=3)
     ap.add_argument("-o", "--output", type=Path, help="output FASTA (mapseq input)")
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--verbose", "-v", action="store_true")
