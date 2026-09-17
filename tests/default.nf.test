@@ -21,6 +21,8 @@ nextflow_pipeline {
                 // No SKIVER_*: the error model is only used by the read simulator.
                 { assert workflow.trace.succeeded().size() == 12 },
                 { assert workflow.trace.tasks().every { !it.name.contains('SKIVER') } },
+                { assert workflow.trace.tasks().every { !it.name.contains('BUILD_MISMAPPING') } },
+                { assert workflow.trace.tasks().any { it.name.contains('PANEL_PREPARE') } },
                 { assert path("${params.outdir}/composition/demo/demo.inferred_composition.csv").exists() },
                 { assert path("${params.outdir}/composition/demo/demo.fit_diagnostics.json").exists() },
                 { assert path("${params.outdir}/amplicons/demo_amplicons").exists() },
@@ -175,7 +177,7 @@ nextflow_pipeline {
         }
     }
 
-    test("alignment-built M replaces the whole simulation flow - stub") {
+    test("alignment builds a panel kernel without simulation - stub") {
         tag "stub"
         options "-stub"
         when {
@@ -191,91 +193,13 @@ nextflow_pipeline {
         then {
             assertAll(
                 { assert workflow.success },
-                // Indexed minimap2 + PAF parsing replace SIMULATE_READS +
-                // MAPSEQ_CLUSTER_MATRIX + MAPSEQ_SIM + BUILD_MISMAPPING: 12 - 4 + 3 = 11.
-                { assert workflow.trace.succeeded().size() == 11 },
+                // Source home labels still come from MAPseq, but panel alignment replaces
+                // the simulated-read and simulated-MAPseq tasks: 12 - 2 = 10.
+                { assert workflow.trace.succeeded().size() == 10 },
                 { assert workflow.trace.tasks().every { !it.name.contains('SIMULATE') } },
                 { assert workflow.trace.tasks().every { !it.name.contains('SKIVER') } },
-                { assert workflow.trace.tasks().any { it.name.contains('ALIGN_MISMAPPING') } },
-                { assert workflow.trace.tasks().any { it.name.contains('MINIMAP2_INDEX') } },
-                { assert workflow.trace.tasks().any { it.name.contains('MINIMAP2_ALLVSALL') } },
-                { assert path("${params.outdir}/mismapping/groups.tsv").exists() }
-            )
-        }
-    }
-
-    test("exact-hash builds M with no mapper at all - stub") {
-        tag "stub"
-        options "-stub"
-        when {
-            params {
-                input             = "${projectDir}/assets/samplesheet.example.yml"
-                outdir            = "$outputDir"
-                mismapping_method = "align"
-                align_backend     = "exact-hash"
-                align_tau         = 0
-            }
-        }
-        then {
-            assertAll(
-                { assert workflow.success },
-                // One GROUPED_MISMAPPING replaces MINIMAP2_INDEX + MINIMAP2_ALLVSALL +
-                // ALIGN_MISMAPPING: 11 - 2 = 9.
-                { assert workflow.trace.succeeded().size() == 9 },
-                { assert workflow.trace.tasks().any { it.name.contains('GROUPED_MISMAPPING') } },
-                { assert workflow.trace.tasks().every { !it.name.contains('MINIMAP2') } },
-                { assert workflow.trace.tasks().every { !it.name.contains('SIMULATE') } },
-                { assert path("${params.outdir}/mismapping/groups.tsv").exists() }
-            )
-        }
-    }
-
-    test("kmer widens the duplicate groups to tau >= 1 - stub") {
-        tag "stub"
-        options "-stub"
-        when {
-            params {
-                input             = "${projectDir}/assets/samplesheet.example.yml"
-                outdir            = "$outputDir"
-                mismapping_method = "align"
-                align_backend     = "kmer"
-                align_tau         = 1
-                align_distance_decay = 0.007
-            }
-        }
-        then {
-            assertAll(
-                { assert workflow.success },
-                { assert workflow.trace.succeeded().size() == 9 },
-                { assert workflow.trace.tasks().any { it.name.contains('GROUPED_MISMAPPING') } },
-                { assert workflow.trace.tasks().every { !it.name.contains('MINIMAP2') } }
-            )
-        }
-    }
-
-    test("the distance decay can be measured and fitted instead of guessed - stub") {
-        tag "stub"
-        options "-stub"
-        when {
-            params {
-                input             = "${projectDir}/assets/samplesheet.example.yml"
-                outdir            = "$outputDir"
-                mismapping_method = "align"
-                align_backend     = "kmer"
-                align_tau         = 1
-                // Measured off the flat error model at build time, then fitted per
-                // sample at inference — neither needs a number chosen by hand, and
-                // neither trains anything.
-                align_distance_decay = "auto"
-                infer_distance_decay = true
-            }
-        }
-        then {
-            assertAll(
-                { assert workflow.success },
-                { assert workflow.trace.succeeded().size() == 9 },
-                { assert workflow.trace.tasks().every { !it.name.contains('SKIVER') } },
-                { assert workflow.trace.tasks().any { it.name.contains('GROUPED_MISMAPPING') } }
+                { assert workflow.trace.tasks().any { it.name.contains('PANEL_ALIGN') } },
+                { assert workflow.trace.tasks().every { !it.name.contains('BUILD_MISMAPPING') } }
             )
         }
     }
@@ -300,32 +224,7 @@ nextflow_pipeline {
         }
     }
 
-    test("pre-computed mis-mapping matrix skips its simulation flow - stub") {
-        tag "stub"
-        options "-stub"
-        when {
-            params {
-                input              = "${projectDir}/assets/samplesheet.example.yml"
-                outdir             = "$outputDir"
-                sim_error_model    = "trained"
-                mismapping_matrix = "${projectDir}/tests/data/mismapping_matrix.csv"
-            }
-        }
-        then {
-            assertAll(
-                { assert workflow.success },
-                // Matrix fingerprinting + canonical-bundle publication replace the
-                // simulated branch. The pre-computed matrix skips training too.
-                { assert workflow.trace.succeeded().size() == 8 },
-                { assert workflow.trace.tasks().every { !it.name.contains('SIMULATE') } },
-                { assert workflow.trace.tasks().every { !it.name.contains('SKIVER') } },
-                { assert path("${params.outdir}/mismapping/groups.tsv").exists() },
-                { assert !path("${params.outdir}/composition/demo/demo.mismapping_matrix.npz").exists() }
-            )
-        }
-    }
-
-    test("identical reference sets share one canonical mis-mapping matrix - stub") {
+    test("identical reference sets share one panel kernel - stub") {
         tag "stub"
         options "-stub"
         when {
@@ -342,12 +241,11 @@ nextflow_pipeline {
                 { assert workflow.trace.succeeded().findAll { it.name.contains(':MAPSEQ_CLUSTER (') }.size() == 1 },
                 { assert workflow.trace.succeeded().findAll { it.name.contains(':MATRIX_KEY (') }.size() == 2 },
                 { assert workflow.trace.succeeded().findAll { it.name.contains(':MAPSEQ_OBS (') }.size() == 2 },
-                { assert workflow.trace.succeeded().findAll { it.name.contains('SIMULATE_READS') }.size() == 1 },
-                { assert workflow.trace.succeeded().findAll { it.name.contains('BUILD_MISMAPPING') }.size() == 1 },
+                { assert workflow.trace.succeeded().findAll { it.name.contains('SIMULATE_PANEL_READS') }.size() == 1 },
+                { assert workflow.trace.succeeded().findAll { it.name.contains('PANEL_KERNEL') }.size() == 1 },
                 // ...still published under each sample's own id.
                 { assert path("${params.outdir}/amplicons/demo_a_amplicons/amplicons.fasta").exists() },
                 { assert path("${params.outdir}/amplicons/demo_b_amplicons/amplicons.fasta").exists() },
-                { assert path("${params.outdir}/mismapping/groups.tsv").exists() },
                 { assert path("${params.outdir}/composition/demo_a/demo_a.inference_diagnostics.csv").exists() },
                 { assert path("${params.outdir}/composition/demo_b/demo_b.inference_diagnostics.csv").exists() }
             )
@@ -370,14 +268,14 @@ nextflow_pipeline {
                 { assert workflow.success },
                 { assert workflow.trace.succeeded().findAll { it.name.contains('POOL_TRAINING_READS') }.size() == 1 },
                 { assert workflow.trace.succeeded().findAll { it.name.contains('SKIVER_TRAIN') }.size() == 1 },
-                { assert workflow.trace.succeeded().findAll { it.name.contains('SIMULATE_READS') }.size() == 1 },
+                { assert workflow.trace.succeeded().findAll { it.name.contains('SIMULATE_PANEL_READS') }.size() == 1 },
                 { assert path("${params.outdir}/composition/demo_a/demo_a.inference_diagnostics.csv").exists() },
                 { assert path("${params.outdir}/composition/demo_b/demo_b.inference_diagnostics.csv").exists() }
             )
         }
     }
 
-    test("distinct reference sets build distinct matrices - stub") {
+    test("distinct reference sets build distinct panel kernels - stub") {
         tag "stub"
         options "-stub"
         when {
@@ -393,8 +291,8 @@ nextflow_pipeline {
                 { assert workflow.trace.succeeded().findAll { it.name.contains(':MAPSEQ_CLUSTER (') }.size() == 2 },
                 { assert path("${params.outdir}/amplicons/demo_a_amplicons/amplicons.fasta").exists() },
                 { assert path("${params.outdir}/amplicons/demo_b_amplicons/amplicons.fasta").exists() },
-                { assert workflow.trace.succeeded().findAll { it.name.contains('SIMULATE_READS') }.size() == 2 },
-                { assert workflow.trace.succeeded().findAll { it.name.contains('BUILD_MISMAPPING') }.size() == 2 }
+                { assert workflow.trace.succeeded().findAll { it.name.contains('SIMULATE_PANEL_READS') }.size() == 2 },
+                { assert workflow.trace.succeeded().findAll { it.name.contains('PANEL_KERNEL') }.size() == 2 }
             )
         }
     }

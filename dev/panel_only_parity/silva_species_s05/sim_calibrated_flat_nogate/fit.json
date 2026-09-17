@@ -1,0 +1,42 @@
+{
+  "fit_status": "ok",
+  "gate": "unique_v4_group",
+  "infer_space": "genome",
+  "kernel_format": "rectangular",
+  "matrix_path": "work/silva/species/cal.npz",
+  "min_infer_reads": 1000,
+  "n_reads": 79472,
+  "posterior_draw_count": 500,
+  "posterior_draw_path": "dev/panel_only_parity/silva_species_s05/sim_calibrated_flat_nogate/posterior_draws.npz",
+  "raw_reference": {
+    "n_labels": 160,
+    "observed_expected_tv": 0.07568541531205515,
+    "observed_statistic": {
+      "q05": 0.09054407896128484,
+      "q50": 0.1074203466454186,
+      "q95": 0.12578678804998888
+    },
+    "posterior_predictive_percentile": 0.938,
+    "replicated_statistic": {
+      "q05": 0.0666225394542388,
+      "q50": 0.08376154924761106,
+      "q95": 0.10343102880740156
+    }
+  },
+  "sample": "S05",
+  "unique_v4_group": {
+    "n_labels": 160,
+    "observed_expected_tv": 0.07568541531205515,
+    "observed_statistic": {
+      "q05": 0.09054407896128484,
+      "q50": 0.1074203466454186,
+      "q95": 0.12578678804998888
+    },
+    "posterior_predictive_percentile": 0.938,
+    "replicated_statistic": {
+      "q05": 0.0666225394542388,
+      "q50": 0.08376154924761106,
+      "q95": 0.10343102880740156
+    }
+  }
+}

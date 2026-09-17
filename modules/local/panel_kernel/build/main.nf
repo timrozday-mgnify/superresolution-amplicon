@@ -50,3 +50,55 @@ process PANEL_KERNEL {
     END_VERSIONS
     """
 }
+
+// Build the rectangular panel kernel from sequence distance rather than simulated reads.
+// MAPseq still establishes every source's home label before this process runs.
+process PANEL_ALIGN {
+    tag "$meta.id"
+    label 'process_medium'
+
+    container "ghcr.io/timrozday-mgnify/sra-skiver:${params.sra_skiver_tag}"
+
+    input:
+    tuple val(meta), path(prepared), path(db_amplicons), path(home_mseq), path(decay_model)
+
+    output:
+    tuple val(meta), path("${meta.id}"), emit: kernel
+    path "versions.yml",                 emit: versions
+
+    when:
+    task.ext.when == null || task.ext.when
+
+    script:
+    def args = task.ext.args ?: ''
+    def model_arg = params.align_decay_model ? "--model-pt ${decay_model}" : ''
+    def all_args = [model_arg, args].findAll { it }.join(' ')
+    """
+    mkdir -p ${meta.id}
+    cp ${prepared}/panel_translation.tsv ${prepared}/sources.tsv ${meta.id}/
+    build_panel_kernel.py align \\
+        --prepared ${prepared} \\
+        --db-amplicons ${db_amplicons} \\
+        --home-mseq ${home_mseq} \\
+        -o ${meta.id}/mismapping_matrix.npz \\
+        $all_args
+
+    cat <<-END_VERSIONS > versions.yml
+    "${task.process}":
+        python: \$(python --version 2>&1 | sed 's/Python //')
+    END_VERSIONS
+    """
+
+    stub:
+    """
+    mkdir -p ${meta.id}
+    cp ${prepared}/panel_translation.tsv ${prepared}/sources.tsv ${meta.id}/
+    touch ${meta.id}/mismapping_matrix.npz
+    printf 'source\\thome_label\\n' > ${meta.id}/panel_sources.tsv
+
+    cat <<-END_VERSIONS > versions.yml
+    "${task.process}":
+        python: stub
+    END_VERSIONS
+    """
+}

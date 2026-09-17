@@ -1,0 +1,33 @@
+{
+  "matrix_key": "b8a1b3b96c95538858b30af73d55735ac451bc761f0904cbddfc77597b8c0839",
+  "reference_sha256": "f4c3c6d6c4041e2e63e0420065cf7a04c1981bd269dccef75c53603b6b5f99d4",
+  "model_scope": "flat",
+  "source": "generated",
+  "mismapping_method": "simulate",
+  "align_backend": "minimap2",
+  "align_tau": 0,
+  "align_distance_decay": 1.0,
+  "align_decay_model": null,
+  "align_ambiguity_weight": 0.3,
+  "max_ambiguous_bases": 4,
+  "max_postings": 4096,
+  "minimap2_args": "-p 0 -N 1000 --secondary=yes -c",
+  "minimap2_index_args": "-k 11 -w 5",
+  "sim_error_model": "flat",
+  "sim_n_per_ref": "500",
+  "sim_read_len": null,
+  "flat_sub_rate": 0.005,
+  "flat_ins_rate": 0.0005,
+  "flat_del_rate": 0.0005,
+  "mapseq_args": "",
+  "mapseq_min_identity": null,
+  "mapseq_tag": "2.1.1b--hc47f52e_1",
+  "seed": "42",
+  "samples": [
+    {
+      "id": "demo",
+      "platform": "hq-illumina"
+    }
+  ],
+  "kernel_version": 2
+}

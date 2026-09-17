@@ -1,6 +1,6 @@
 // Sample errored reads from each reference amplicon. Read names carry their source
-// reference, so mapping these (MAPSEQ_SIM) and tallying where they land measures the
-// mis-mapping matrix M directly. The error model is either the trained skiver model or
+// reference, so mapping these (MAPSEQ_PANEL_SIM) and tallying where they land measures the
+// panel kernel directly. The error model is either the trained skiver model or
 // the naive flat per-mutation-type one (params.sim_error_model); under 'flat' the model
 // slot is the assets/NO_MODEL placeholder and no training runs at all.
 process SIMULATE_READS {

@@ -1,0 +1,2 @@
+set_id,sample,n_members,members,lca,inferred_mean,inferred_lo,inferred_hi,member_sd,ambiguous_sd,gain
+set_0,b_uniformis,13,BU_JCM13286_NT5170;bacteroides_fragilis;bacteroides_thetaiotaomicron;bacteroides_uniformis;bacteroides_vulgatus;clostridium_bolteae;clostridium_ramosum;clostridium_saccharolyticum;collinsella_aerofaciens;coprococcus_comes;dorea_formicigenerans;eggerthella_lenta;parabacteroides_merdae,,1.0,0.9999999999999998,1.0000000000000002,0.13038478080330712,0.1275129151388977,0.9564329874252969

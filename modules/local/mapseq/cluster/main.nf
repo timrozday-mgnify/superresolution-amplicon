@@ -1,7 +1,7 @@
 // Cluster the reference FASTA against itself so mapseq builds & caches its clustering
 // file (<fasta>.mscluster). We only keep that side-effect; the search results printed to
-// stdout are discarded. Doing it once means MAPSEQ_SIM and MAPSEQ_OBS don't each rebuild
-// it. Ported from synthetic-metagenomic-benchmark-pipeline's MAPSEQ_CLUSTER.
+// stdout are discarded. Doing it once lets panel and observed-read mapping reuse it.
+// Ported from synthetic-metagenomic-benchmark-pipeline's MAPSEQ_CLUSTER.
 process MAPSEQ_CLUSTER {
     tag "$meta.id"
     label 'process_medium'

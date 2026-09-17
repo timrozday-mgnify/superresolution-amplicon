@@ -1,0 +1,42 @@
+{
+  "fit_status": "ok",
+  "gate": "unique_v4_group",
+  "infer_space": "genome",
+  "kernel_format": "rectangular",
+  "matrix_path": "work/panel_kernel/trained_s0/panel_kernel.npz",
+  "min_infer_reads": 1000,
+  "n_reads": 79472,
+  "posterior_draw_count": 500,
+  "posterior_draw_path": "work/panel_sweep/S05/sim_trained/posterior_draws.npz",
+  "raw_reference": {
+    "n_labels": 44,
+    "observed_expected_tv": 0.020143651948711656,
+    "observed_statistic": {
+      "q05": 0.07139925639907883,
+      "q50": 0.10053610773768408,
+      "q95": 0.1469683740409755
+    },
+    "posterior_predictive_percentile": 0.804,
+    "replicated_statistic": {
+      "q05": 0.05615556583895946,
+      "q50": 0.07723312094329204,
+      "q95": 0.10521294943567269
+    }
+  },
+  "sample": "S05",
+  "unique_v4_group": {
+    "n_labels": 44,
+    "observed_expected_tv": 0.020143651948711656,
+    "observed_statistic": {
+      "q05": 0.07139925639907883,
+      "q50": 0.10053610773768408,
+      "q95": 0.1469683740409755
+    },
+    "posterior_predictive_percentile": 0.804,
+    "replicated_statistic": {
+      "q05": 0.05615556583895946,
+      "q50": 0.07723312094329204,
+      "q95": 0.10521294943567269
+    }
+  }
+}

@@ -1,0 +1,5 @@
+refseq,genome,amplicon_len,amplifiable
+genomeA|0|genomeA_16S_0,genomeA,230,True
+genomeA|1|genomeA_16S_1,genomeA,230,True
+genomeB|0|genomeB_16S_0,genomeB,230,True
+genomeB|1|genomeB_16S_1,genomeB,230,True
