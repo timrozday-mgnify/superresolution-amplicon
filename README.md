@@ -167,6 +167,26 @@ Each source sequence receives a header such as
 `Escherichia_coli|0|original_accession`; copy indices reset for each genome. Run
 `python bin/build_mapseq_database.py --demo` for a self-contained check.
 
+#### A generic database from SILVA SSU
+
+SILVA has no genomes, so each sequence is its own reference, `accession|0|accession`.
+The builder converts RNA `U` to `T`, drops the organism name that ends each SILVA lineage,
+and pads shallower lineages with `unclassified`. Use Ref NR99. The `.tax` it writes is the
+real lineage, so pass it as `--taxonomy`:
+
+```bash
+python bin/build_mapseq_database.py \
+    --silva-fasta SILVA_138.2_SSURef_NR99_tax_silva.fasta.gz \
+    --output-prefix db/silva_138_2_ssu_nr99
+
+nextflow run main.nf --input samples.yml \
+    --references db/silva_138_2_ssu_nr99.fasta --taxonomy db/silva_138_2_ssu_nr99.tax \
+    --infer_space v4_group
+```
+
+A SILVA reference is a sequence, not a genome, so genome-space inference against it has no
+biological reading. Use it through `v4_group` or a panel (`panel_references`).
+
 ## Parameters
 
 Run mode / IO:

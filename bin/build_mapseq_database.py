@@ -13,6 +13,12 @@ The ``--ssu-fasta`` form accepts GTDB SSU FASTA headers such as
 ``RS_GCF_002517985.1~NZ_NOCN01000152.1 d__Bacteria;...;s__Escherichia coli``.
 The text before ``~`` is the genome ID and the semicolon-delimited text after the
 first whitespace is its taxonomy. Bracketed source annotations are ignored.
+
+The ``--silva-fasta`` form accepts a SILVA SSU ``*_tax_silva.fasta`` such as
+``AB000001.1.1500 Bacteria;Bacillota;...;Bacillus;Bacillus subtilis``. SILVA has no
+genomes: each record is its own reference ``accession|0|accession``, its lineage drops the
+trailing organism name, and RNA ``U`` becomes ``T``. Lineages are padded with
+``unclassified`` to the deepest one in the file.
 """
 from __future__ import annotations
 
@@ -197,6 +203,21 @@ def parse_gtdb_ssu_header(header: str) -> tuple[str, str, tuple[str, ...]]:
     return genome_id, source_id, taxonomy
 
 
+def parse_silva_header(header: str) -> tuple[str, tuple[str, ...]]:
+    """Return the accession and lineage (organism name dropped) from a SILVA SSU header.
+
+    Raises:
+        ValueError: If the header has no lineage above the organism name.
+    """
+    accession, _, remainder = header.partition(" ")
+    fields = remainder.split(";")
+    if len(fields) < 2:
+        raise ValueError(f"SILVA header has no lineage: {header!r}")
+    if "|" in accession:
+        raise ValueError(f"SILVA accession cannot contain '|': {accession!r}")
+    return accession, parse_taxonomy(";".join(fields[:-1]), 1)
+
+
 def output_paths(prefix: Path) -> tuple[Path, Path]:
     """Return output FASTA and taxonomy paths for a prefix."""
     return Path(f"{prefix}.fasta"), Path(f"{prefix}.tax")
@@ -329,6 +350,49 @@ def build_gtdb_ssu_database(source_fasta: Path, output_prefix: Path) -> tuple[Pa
     return fasta_path, tax_path, record_count
 
 
+def build_silva_ssu_database(source_fasta: Path, output_prefix: Path) -> tuple[Path, Path, int]:
+    """Build a MAPseq database from a SILVA SSU ``*_tax_silva.fasta``.
+
+    Reads the FASTA twice: once for the deepest lineage (SILVA depths vary, and MAPseq's
+    ``#levels`` header comes first), once to write.
+
+    Returns:
+        Output FASTA path, taxonomy path, and number of reference records written.
+
+    Raises:
+        ValueError: If a header is malformed or an accession repeats.
+    """
+    depth = max(len(parse_silva_header(header)[1]) for header, _ in iter_fasta(source_fasta))
+    fasta_path, tax_path = output_paths(output_prefix)
+    fasta_path.parent.mkdir(parents=True, exist_ok=True)
+    fasta_temp = _temporary_path(fasta_path.parent, ".fasta")
+    tax_temp = _temporary_path(tax_path.parent, ".tax")
+    seen_references: set[str] = set()
+    complete = False
+    try:
+        with fasta_temp.open("w") as fasta_handle, tax_temp.open("w") as tax_handle:
+            tax_handle.write(taxonomy_cutoffs(depth))
+            tax_handle.write(_TAX_NAME)
+            tax_handle.write(f"#levels: {' '.join(f'Taxonomy_{i}' for i in range(1, depth + 1))}\n")
+            for header, sequence in iter_fasta(source_fasta):
+                accession, taxonomy = parse_silva_header(header)
+                reference_id = f"{accession}|0|{accession}"
+                if reference_id in seen_references:
+                    raise ValueError(f"duplicate SILVA accession: {accession!r}")
+                seen_references.add(reference_id)
+                fasta_handle.write(f">{reference_id}\n{sequence.replace('U', 'T')}\n")
+                lineage = taxonomy + (_UNCLASSIFIED,) * (depth - len(taxonomy))
+                tax_handle.write(f"{reference_id}\t{';'.join(lineage)}\n")
+        fasta_temp.replace(fasta_path)
+        tax_temp.replace(tax_path)
+        complete = True
+    finally:
+        if not complete:
+            fasta_temp.unlink(missing_ok=True)
+            tax_temp.unlink(missing_ok=True)
+    return fasta_path, tax_path, len(seen_references)
+
+
 def _require(condition: bool, message: str) -> None:
     """Raise RuntimeError unless a demo condition is true."""
     if not condition:
@@ -404,6 +468,38 @@ def demo() -> None:
             "GTDB SSU demo did not preserve taxonomy",
         )
 
+        (root / "silva.fasta").write_text(
+            ">AB000001.1.1500 Bacteria;Bacillota;Bacilli;Bacillus;Bacillus subtilis\n"
+            "acgu\nuuaa\n"
+            ">AB000002.1.1400 Bacteria;Bacillota;uncultured bacterium\nUGCA\n"
+        )
+        silva_fasta, silva_tax, silva_count = build_silva_ssu_database(
+            root / "silva.fasta", root / "silva_database"
+        )
+        _require(silva_count == 2, "SILVA demo wrote the wrong record count")
+        _require(
+            silva_fasta.read_text().splitlines()
+            == [">AB000001.1.1500|0|AB000001.1.1500", "ACGTTTAA",
+                ">AB000002.1.1400|0|AB000002.1.1400", "TGCA"],
+            "SILVA demo headers or U->T conversion are wrong",
+        )
+        silva_lines = silva_tax.read_text().splitlines()
+        _require(silva_lines[2] == "#levels: Taxonomy_1 Taxonomy_2 Taxonomy_3 Taxonomy_4",
+                 "SILVA demo levels are wrong")
+        _require(silva_lines[3] == "AB000001.1.1500|0|AB000001.1.1500\t"
+                 "Bacteria;Bacillota;Bacilli;Bacillus", "SILVA demo kept the organism name")
+        _require(silva_lines[4].endswith("\tBacteria;Bacillota;unclassified;unclassified"),
+                 "SILVA demo did not pad the shallow lineage")
+        (root / "silva_dup.fasta").write_text(">A.1.9 Bacteria;x;y\nACGT\n>A.1.9 Bacteria;x;y\nACGT\n")
+        (root / "silva_bare.fasta").write_text(">A.1.9 Bacillus subtilis\nACGT\n")
+        _expect_value_error(
+            lambda: build_silva_ssu_database(root / "silva_dup.fasta", root / "silva_dup_db")
+        )
+        _expect_value_error(
+            lambda: build_silva_ssu_database(root / "silva_bare.fasta", root / "silva_bare_db")
+        )
+        _require(not output_paths(root / "silva_dup_db")[0].exists(), "partial SILVA output")
+
         (root / "duplicate.yml").write_text(
             "genomes:\n- id: alpha\n  taxonomy: Bacteria\n  fasta: alpha.fasta\n"
             "- id: alpha\n  taxonomy: Bacteria\n  fasta: alpha.fasta\n"
@@ -437,6 +533,11 @@ def main() -> None:
         help="GTDB SSU FASTA whose headers encode genome IDs and taxonomy",
     )
     parser.add_argument(
+        "--silva-fasta",
+        type=Path,
+        help="SILVA SSU *_tax_silva.fasta (RNA, lineage + organism name headers)",
+    )
+    parser.add_argument(
         "-o",
         "--output-prefix",
         type=Path,
@@ -447,10 +548,17 @@ def main() -> None:
     if arguments.demo:
         demo()
         return
-    if arguments.output_prefix is None or (arguments.input is None) == (arguments.ssu_fasta is None):
-        parser.error("provide exactly one of --input or --ssu-fasta, plus --output-prefix")
+    sources = [arguments.input, arguments.ssu_fasta, arguments.silva_fasta]
+    if arguments.output_prefix is None or sum(source is not None for source in sources) != 1:
+        parser.error(
+            "provide exactly one of --input, --ssu-fasta or --silva-fasta, plus --output-prefix"
+        )
     try:
-        if arguments.ssu_fasta is not None:
+        if arguments.silva_fasta is not None:
+            fasta_path, tax_path, record_count = build_silva_ssu_database(
+                arguments.silva_fasta, arguments.output_prefix
+            )
+        elif arguments.ssu_fasta is not None:
             fasta_path, tax_path, record_count = build_gtdb_ssu_database(
                 arguments.ssu_fasta, arguments.output_prefix
             )
