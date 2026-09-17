@@ -12,7 +12,9 @@
 
 ``prepare`` cuts each panel genome's V4 copies and writes ``sources.fasta`` (one record per
 distinct amplicon, ``v4g_<sha16>``), ``panel_translation.tsv`` (genome_id, source, weight)
-and ``sources.tsv`` (source, genomes, in_db). MAPseq runs outside this script, as the same
+and ``sources.tsv`` (source, genomes, in_db). A taxon entry (``--panel-taxa``) contributes
+each database V4 group under its lineage as a free member ``<entry>::<v4g>`` of weight 1;
+inference sums members back into the entry. MAPseq runs outside this script, as the same
 command used for the observed reads.
 
 ``build`` writes the rectangular kernel: sources x database exact-sequence groups, ``K[s, l]``
@@ -43,6 +45,7 @@ import subspecies_infer as si  # noqa: E402  (needs sys.path)
 log = logging.getLogger("build_panel_kernel")
 
 BLOCK_MASS = 0.99   # the block rule from dev/error_rate_calibration.md
+ENTRY_SEP = "::"    # a taxon member is "<entry>::<v4g>"; the entry is the part before it
 
 
 def v4g(seq: str) -> str:
@@ -98,6 +101,74 @@ def db_groups(db_amplicons: Path) -> tuple[list[str], list[str], np.ndarray, lis
             [records[i][1] for i in first])
 
 
+def _ranks(lineage: str) -> tuple[str, ...]:
+    return tuple(r.strip() for r in lineage.strip().rstrip(";").split(";"))
+
+
+def _resolve_taxon(taxon: str, prefixes: set[tuple[str, ...]]) -> tuple[str, ...]:
+    """A lineage prefix (``;``-separated) or a bare name that ends exactly one prefix."""
+    ranks = _ranks(taxon)
+    if len(ranks) > 1:
+        if ranks in prefixes:
+            return ranks
+        candidates = sorted(p for p in prefixes if p[-1].lower() == ranks[-1].lower())
+    else:
+        candidates = sorted(p for p in prefixes if p[-1] == ranks[0])
+        if len(candidates) == 1:
+            return candidates[0]
+    listed = "; ".join(";".join(c) for c in candidates[:20]) or "none"
+    if len(ranks) > 1:
+        raise SystemExit(f"taxon {taxon!r} is no database lineage prefix; lineages ending in "
+                         f"{ranks[-1]!r}: {listed}")
+    raise SystemExit(f"taxon {taxon!r} ends {len(candidates)} database lineage prefixes, "
+                     f"not exactly one; give the full lineage. Candidates: {listed}")
+
+
+def taxon_members(taxa: list[tuple[str, str]], headers: list[str], label_ids: list[str],
+                  label_of_ref: np.ndarray, lineage_of: dict[str, str],
+                  excluded: set[str], max_sources: int) -> dict[str, list[str]]:
+    """Entry id -> the database V4 groups it owns.
+
+    A group belongs to a taxon entry when any member sequence's lineage lies under it, but
+    each sequence counts only for the most specific entry above it, so nested taxa split
+    ("other Bacteroides"). A group in ``excluded`` (a genome entry's source, or a sequence
+    MAPseq cannot place) belongs to no taxon. A group whose sequences fall under two
+    unnested entries is shared by both.
+    """
+    lineages = {h: _ranks(lineage_of[h]) for h in headers if h in lineage_of}
+    if not lineages:
+        raise SystemExit("--db-taxonomy has no lineage for any database amplicon header")
+    prefixes = {r[:i] for r in set(lineages.values()) for i in range(1, len(r) + 1)}
+    entries = {entry: _resolve_taxon(taxon, prefixes) for entry, taxon in taxa}
+    if len(set(entries.values())) < len(entries):
+        raise SystemExit("two --panel-taxa entries resolve to the same lineage")
+    by_prefix = {p: e for e, p in entries.items()}
+    depth = sorted({len(p) for p in by_prefix}, reverse=True)
+    groups: dict[str, set[str]] = defaultdict(set)
+    for header, label in zip(headers, label_of_ref):
+        ranks = lineages.get(header)
+        group = label_ids[label]
+        if ranks is None or group in excluded:
+            continue
+        owner = next((by_prefix[ranks[:d]] for d in depth if ranks[:d] in by_prefix), None)
+        if owner is not None:
+            groups[owner].add(group)
+    members = {}
+    for entry, prefix in entries.items():
+        found = sorted(groups.get(entry, ()))
+        if len(found) > max_sources:
+            raise SystemExit(f"taxon entry {entry!r} ({';'.join(prefix)}) resolves to "
+                             f"{len(found)} V4 groups, over --max-taxon-sources "
+                             f"{max_sources}; use a lower rank")
+        if not found:
+            log.warning("taxon entry %r (%s) owns no database V4 group (none amplified, or "
+                        "all belong to genome entries or more specific taxa); dropped",
+                        entry, ";".join(prefix))
+            continue
+        members[entry] = found
+    return members
+
+
 def _home_labels(home_mseq: Path, src: dict[str, int], label_of_hit: dict[str, int]):
     """Each source's MAPseq label (-1 when unhit) and identity, from the sources' own mapping."""
     home = np.full(len(src), -1, dtype=np.int64)
@@ -109,14 +180,54 @@ def _home_labels(home_mseq: Path, src: dict[str, int], label_of_hit: dict[str, i
     return home, identity
 
 
+def _read_taxa(path: Path) -> list[tuple[str, str]]:
+    """``id<TAB>taxon`` rows; blank lines, ``#`` comments and an ``id``/``taxon`` header skipped."""
+    rows = [line.rstrip("\n").split("\t") for line in path.read_text().splitlines()
+            if line.strip() and not line.startswith("#")]
+    if rows and rows[0][:2] == ["id", "taxon"]:
+        rows = rows[1:]
+    if any(len(r) != 2 or not r[0].strip() or not r[1].strip() for r in rows):
+        raise SystemExit(f"{path}: every row must be id<TAB>taxon")
+    return [(i.strip(), t.strip()) for i, t in rows]
+
+
 def prepare(a) -> None:
-    copies, dropped = panel_copies(a.panel_amplicons, a.fwd_primer, a.rev_primer,
-                                   a.max_mismatch, dict(x.split("=", 1) for x in a.alias))
-    translation = pd.DataFrame(
-        [{"genome_id": g, "source": v4g(seq), "weight": n / len(seqs)}
-         for g, seqs in sorted(copies.items()) for seq, n in Counter(seqs).items()])
+    if not (a.panel_amplicons or a.panel_taxa):
+        raise SystemExit("prepare needs --panel-amplicons, --panel-taxa or both")
+    if a.panel_taxa and not a.db_taxonomy:
+        raise SystemExit("--panel-taxa needs --db-taxonomy")
+    copies, dropped = ({}, []) if not a.panel_amplicons else panel_copies(
+        a.panel_amplicons, a.fwd_primer, a.rev_primer, a.max_mismatch,
+        dict(x.split("=", 1) for x in a.alias))
+    taxa = _read_taxa(a.panel_taxa) if a.panel_taxa else []
+    ids = list(copies) + [e for e, _ in taxa]
+    bad = sorted({i for i in ids if ENTRY_SEP in i or i == "background"}
+                 | {i for i, n in Counter(ids).items() if n > 1})
+    if bad:
+        raise SystemExit("panel entry ids must be unique, not 'background' and not contain "
+                         f"{ENTRY_SEP!r}: {', '.join(bad)}")
+    rows = [{"genome_id": g, "source": v4g(seq), "weight": n / len(seqs)}
+            for g, seqs in sorted(copies.items()) for seq, n in Counter(seqs).items()]
     sequence = {v4g(s): s for seqs in copies.values() for s in seqs}
-    _, label_ids, _, _ = db_groups(a.db_amplicons)
+    headers, label_ids, label_of_ref, label_seqs = db_groups(a.db_amplicons)
+    if taxa:
+        import infer_composition as ic
+        # A group with an ambiguous base is no source: simulated reads would carry its Ns, and
+        # MAPseq may not place it at all, leaving no home label. The organism's unambiguous
+        # groups stay. SILVA NR99, the 17 genera of the 20HM panel: 587 of 9,126 groups (15 unhit).
+        ambiguous = {g for g, s in zip(label_ids, label_seqs) if set(s) - set("ACGT")}
+        members = taxon_members(taxa, headers, label_ids, label_of_ref,
+                                ic._read_taxonomy(a.db_taxonomy), set(sequence) | ambiguous,
+                                a.max_taxon_sources)
+        group_seq = dict(zip(label_ids, label_seqs))
+        for entry, groups in members.items():
+            rows += [{"genome_id": f"{entry}{ENTRY_SEP}{g}", "source": g, "weight": 1.0}
+                     for g in groups]
+            sequence.update((g, group_seq[g]) for g in groups)
+            log.info("taxon entry %s: %d V4 group(s)", entry, len(groups))
+    if not rows:
+        raise SystemExit("no panel entry has a source")
+    translation = pd.DataFrame(rows)
     sources = (translation.groupby("source").genome_id.agg(";".join).rename("genomes")
                .reset_index())
     sources["in_db"] = sources.source.isin(set(label_ids))
@@ -286,8 +397,14 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("prepare")
-    p.add_argument("--panel-amplicons", type=Path, required=True,
+    p.add_argument("--panel-amplicons", type=Path,
                    help="directory of <genome>.amplicons.fasta, or one FASTA with genome|... headers")
+    p.add_argument("--panel-taxa", type=Path, help="TSV id<TAB>taxon (lineage prefix or bare name)")
+    p.add_argument("--db-taxonomy", type=Path,
+                   help="MAPseq .tax (header<TAB>lineage) for --db-amplicons; needed by --panel-taxa")
+    # ponytail: hard cap; sub-sample or cluster groups if broad taxa turn out to be needed.
+    p.add_argument("--max-taxon-sources", type=int, default=200,
+                   help="fail when a taxon entry resolves to more V4 groups than this")
     p.add_argument("--db-amplicons", type=Path, required=True)
     p.add_argument("--fwd-primer", default=si.DEFAULT_FWD_PRIMER)
     p.add_argument("--rev-primer", default=si.DEFAULT_REV_PRIMER)

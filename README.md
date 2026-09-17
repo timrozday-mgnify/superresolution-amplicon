@@ -107,6 +107,7 @@ YAML list of samples (or a map with `samples:`). Per sample:
 | `mseq` | no | Path to a mapseq classification of this sample's reads (a previous run's `mapseq/<id>/<id>.obs.mseq.gz`); **skips read mapping** for this sample. It must have been produced against the same reference set — the ids in it are matched to the extracted amplicons — and it carries the read-prep settings it was made with, so `--obs_max_reads`, `--trim_primers` and `--min_pair_overlap` no longer apply to that sample. Mapping is the expensive stage, so this is what makes a parameter sweep over the mis-mapping and inference knobs cheap. |
 
 | `panel_references` | no | Genome panel for this sample; overrides `--panel_references`. See [Panel reinterpretation](#panel-reinterpretation). |
+| `panel_taxa` | no | Taxon panel entries for this sample; overrides `--panel_taxa`. See [Panel reinterpretation](#panel-reinterpretation). |
 
 \* provide either `reads` or `fastq_1`.
 
@@ -330,6 +331,8 @@ Composition inference (Pyro):
 | `--taxonomy` | `null` | MAPseq `.tax` (`header<TAB>lineage`) for the `lca` column of the v4-group table (longest common rank prefix of the members). Without it every group is `unclassified_v4_group`. Its sha256 is recorded in `inference_diagnostics.csv`. |
 | `--infer_horseshoe` | `false` | `vi` only, needs `--infer_presence false`: horseshoe shrinkage on unnormalised weights in place of the Dirichlet (`--infer_alpha` is ignored). |
 | `--panel_references` | – | Genome panel (same header convention as `--references`, or a directory of `<genome>.amplicons.fasta`). Per-sample override via the samplesheet. See [Panel reinterpretation](#panel-reinterpretation). |
+| `--panel_taxa` | – | TSV `id<TAB>taxon`: panel entries that are taxa. Needs `--taxonomy`. Per-sample override via the samplesheet. See [Taxon entries](#taxon-entries). |
+| `--panel_taxon_max_sources` | `200` | Fail a taxon entry that resolves to more database V4 groups than this; every group is a simulated source. |
 | `--panel_sim_n_per_ref` | `5000` | Simulated reads per distinct panel V4 source. |
 | `--infer_prune` | `true` | Fit only the genomes the sample's reads can reach — those owning an observed reference, or one byte-identical to it — instead of the whole reference set. Pruned genomes are still reported, at zero. Against a database-scale set this is most of the per-sample cost; set `false` to fit everything. |
 
@@ -408,6 +411,34 @@ alone; the presence gate collapses at long runs. Mapping reads directly against 
 (a panel-only `--references`) was more accurate on every sample; use reinterpretation when
 that is not possible. Requires `--infer_space genome` and `--mismapping_method simulate`.
 
+#### Taxon entries
+
+A panel entry can be a taxon instead of a genome (`--panel_taxa`, alone or with
+`--panel_references`):
+
+```
+id	taxon
+bacteroides	Bacteria;Bacteroidota;Bacteroidia;Bacteroidales;Bacteroidaceae;Bacteroides
+streptococcus	Streptococcus
+```
+
+`taxon` is a lineage prefix of `--taxonomy`, matched at `;` boundaries, or a bare name that
+ends exactly one prefix (zero or several is an error listing the candidates: SILVA has
+cross-kingdom homonyms). Its sources are the database V4 groups whose sequences lie under
+it, each a free parameter, and the entry's abundance is their sum. A group that is a genome
+entry's source stays with the genome, and a sequence counts for the most specific taxon
+above it, so `Bacteroides` next to a *B. fragilis* genome means "other *Bacteroides*". A
+group whose sequences fall under two unnested taxa is shared by both, which then report
+`not_identifiable`.
+
+`inferred_composition.csv` is per entry, with intervals and `presence_prob` from summed
+posterior draws; the fitted members (`<entry>::<v4g>`) are in
+`<id>.inferred_panel_members.csv`. **Not usable at genus scale yet:** against SILVA NR99
+a genus is hundreds to thousands of V4 groups, and inference over more than a few hundred
+members collapses to a near-uniform composition (entry TV 0.21–0.35, `model_misfit` on
+every sample; [dev/panel_silva_sweep.md](dev/panel_silva_sweep.md)). SILVA has no species
+rank, so a taxon entry is genus-resolution at best.
+
 Containers: `--sra_skiver_tag` (default `latest`), `--mapseq_tag` (default
 `2.1.1b--hc47f52e_1`). Resources: `--max_cpus`, `--max_memory`, `--max_time`.
 
@@ -442,6 +473,7 @@ results/
     <id>.posterior_draws.npz         theta_eff and fitted nuisance posterior draws
     <id>.fit_diagnostics.json        raw/grouped posterior-predictive forward-fit gate
     <id>.loss_trace.csv              (vi/mle)
+    <id>.inferred_panel_members.csv  panel with taxon entries: the fitted per-member table
   pipeline_info/                     trace, report, timeline, dag, software versions
 ```
 

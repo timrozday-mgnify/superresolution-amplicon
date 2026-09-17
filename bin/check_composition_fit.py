@@ -457,13 +457,16 @@ def run(args: argparse.Namespace) -> None:
         panel = ic._panel_context(args.mismapping_matrix, args.amplicon_dir, args.obs_mseq,
                                   args.min_identity, not metadata["use_mismapping"])
         genomes, observations = panel.genomes, panel.y
+        # The composition is reported per panel entry; the draws stay per fitted member.
+        to_entry = np.eye(len(panel.entries))[panel.entry_of]
     else:
         genomes, references, reference_genomes, weights = _translation_weights(args.amplicon_dir)
         if metadata["infer_space"] == "v4_group":
             # The same translation inference fitted: one "genome" per exact V4 group.
             genomes, reference_genomes = ic._v4_groups(args.amplicon_dir, references)
             weights = 1.0 / np.bincount(reference_genomes)[reference_genomes]
-    if composition_genomes != genomes or posterior_genomes != genomes:
+    reported = panel.entries if rectangular else genomes
+    if composition_genomes != reported or posterior_genomes != genomes:
         raise SystemExit("composition table and posterior draws must use the inference-space order")
 
     if not rectangular:
@@ -556,7 +559,8 @@ def run(args: argparse.Namespace) -> None:
             # point for independently drawn replicated outcomes still gives a calibrated
             # sampling check instead of a degenerate percentile of exactly zero or one.
             draw_indices = rng.integers(available_draws, size=draw_count, dtype=np.int64)
-        if not np.allclose(composition_means, theta.mean(axis=0), rtol=1e-6, atol=1e-8):
+        theta_mean = theta.mean(axis=0) @ to_entry if rectangular else theta.mean(axis=0)
+        if not np.allclose(composition_means, theta_mean, rtol=1e-6, atol=1e-8):
             raise SystemExit("composition inferred_mean values do not match retained theta_eff draws")
         theta = theta[draw_indices][:, genome_indices]
         if use_kernel and "s" not in draws:

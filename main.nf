@@ -18,7 +18,8 @@ workflow {
 
     // YAML samplesheet: a list of sample entries, each:
     //   id, reads (or fastq_1[/fastq_2]), platform, references (optional),
-    //   error_model (optional), mseq (optional), panel_references (optional)
+    //   error_model (optional), mseq (optional), panel_references (optional),
+    //   panel_taxa (optional)
     def loaded = new org.yaml.snakeyaml.Yaml().load(file(params.input, checkIfExists: true).text)
     def rows = (loaded instanceof Map) ? loaded.samples : loaded
     if (!(rows instanceof List)) {
@@ -74,7 +75,8 @@ workflow {
         // A genome panel to reinterpret this sample's database labels with. Added only when
         // present so non-panel runs keep their cached task hashes.
         def panel = row.panel_references ?: params.panel_references
-        if (panel) {
+        def panel_taxa = row.panel_taxa ?: params.panel_taxa
+        if (panel || panel_taxa) {
             if (params.infer_space != 'genome') {
                 error "Sample ${row.id}: panel reinterpretation infers panel genomes; use --infer_space genome"
             }
@@ -82,7 +84,12 @@ workflow {
                 error "Sample ${row.id}: panel reinterpretation measures its own kernel by " +
                       "simulation; unset --mismapping_matrix and use --mismapping_method simulate"
             }
-            meta.panel = resolveFile(panel.toString())
+            // Taxon entries resolve against the database's own lineages.
+            if (panel_taxa && !params.taxonomy) {
+                error "Sample ${row.id}: panel_taxa needs --taxonomy (the database's MAPseq .tax)"
+            }
+            if (panel) meta.panel = resolveFile(panel.toString())
+            if (panel_taxa) meta.panel_taxa = resolveFile(panel_taxa.toString())
         }
         [ meta, resolveFile(ref.toString()) ]
     }

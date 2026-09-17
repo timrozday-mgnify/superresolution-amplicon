@@ -197,7 +197,7 @@ workflow SUPERRESOLUTION_AMPLICON {
             [ key_file.text.trim(), [meta, d, identity_file, identity, ref_file.text.trim()] ]
         }
         .branch { key, entry ->
-            panel:  entry[0].panel
+            panel:  entry[0].panel || entry[0].panel_taxa
             square: true
         }
         .set { ch_keyed }
@@ -317,18 +317,22 @@ workflow SUPERRESOLUTION_AMPLICON {
     // Its sources are the panel's distinct V4 amplicons and its labels the database's V4
     // groups, measured with the same MAPseq database the sample's reads are mapped against.
     ch_panel_groups = ch_keyed.panel
-        .map { key, entry -> [ [key, entry[0].panel], entry ] }
+        .map { key, entry -> [ [key, entry[0].panel, entry[0].panel_taxa], entry ] }
         .groupTuple()
         .map { group, entries ->
-            def (key, panel) = group
+            def (key, panel, panel_taxa) = group
             def rep = entries[0]
-            def id = "panel_" + "${key}|${panel}|${params.panel_sim_n_per_ref}".toString().md5().take(16)
-            [[id: id, matrix_key: id, panel: panel, model_identity: rep[3],
+            // Genome-only panels keep their pre-taxa id (and so their published kernel dir).
+            def taxa_key = panel_taxa ? "|${panel_taxa}|${params.panel_taxon_max_sources}" : ''
+            def id = "panel_" + "${key}|${panel}|${params.panel_sim_n_per_ref}${taxa_key}".toString().md5().take(16)
+            [[id: id, matrix_key: id, panel: panel, panel_taxa: panel_taxa, model_identity: rep[3],
               members: entries.collect { it[0].id }, db_id: rep[0].id],
              panel, rep[1], rep[2]]
         }
-    PANEL_PREPARE(ch_panel_groups.map { meta, panel, d, model ->
-        [ meta, panel, d.resolve('amplicons.fasta') ] })
+    PANEL_PREPARE(
+        ch_panel_groups.map { meta, panel, d, model ->
+            [ meta, panel ?: [], meta.panel_taxa ?: [], d.resolve('amplicons.fasta') ] },
+        params.taxonomy ? file(params.taxonomy, checkIfExists: true) : [])
     ch_versions = ch_versions.mix(PANEL_PREPARE.out.versions)
     // [ meta, sources, fasta, tax, mscluster ] against the representative's database.
     ch_panel_db = PANEL_PREPARE.out.sources

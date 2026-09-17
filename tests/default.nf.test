@@ -75,6 +75,45 @@ nextflow_pipeline {
         }
     }
 
+    test("taxa-only and mixed panels each get their own panel kernel - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input    = "${projectDir}/tests/data/samplesheet.panel_taxa.yml"
+                taxonomy = "${projectDir}/tests/data/refs.tax"
+                outdir   = "$outputDir"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.tasks().every { !it.name.contains('BUILD_MISMAPPING') } },
+                // Different panels, so two kernels.
+                { assert workflow.trace.tasks().count { it.name.contains('PANEL_PREPARE') } == 2 },
+                { assert path("${params.outdir}/composition/taxa_only/taxa_only.inferred_composition.csv").exists() },
+                { assert path("${params.outdir}/composition/mixed/mixed.fit_diagnostics.json").exists() }
+            )
+        }
+    }
+
+    test("panel_taxa without --taxonomy is refused - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input  = "${projectDir}/tests/data/samplesheet.panel_taxa.yml"
+                outdir = "$outputDir"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.failed },
+                { assert workflow.stdout.any { it.contains('panel_taxa needs --taxonomy') } }
+            )
+        }
+    }
+
     test("a supplied mseq skips read mapping - stub") {
         tag "stub"
         options "-stub"
