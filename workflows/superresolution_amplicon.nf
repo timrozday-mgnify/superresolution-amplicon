@@ -1,29 +1,19 @@
 //
-// superresolution-amplicon: extract the reference amplicons, establish reference-to-
-// reference mis-mapping — by simulating reads and mapping them with the same mapper the
-// real reads go through (mapseq), or by aligning the reference amplicons to each other
-// (params.mismapping_method) — and infer the true genome composition.
+// superresolution-amplicon: extract the reference amplicons, build one rectangular panel
+// kernel per panel/database/settings combination, then infer the composition from MAPseq's
+// observed database labels.
 //
 include { TRAIN_ERROR_MODEL    } from '../subworkflows/local/train_error_model/main'
 include { EXTRACT_AMPLICONS    } from '../modules/local/extract_amplicons/main'
 include { MAPSEQ_CLUSTER       } from '../modules/local/mapseq/cluster/main'
-include { MAPSEQ_CLUSTER as MAPSEQ_CLUSTER_MATRIX } from '../modules/local/mapseq/cluster/main'
-include { MAPSEQ as MAPSEQ_SIM } from '../modules/local/mapseq/map/main'
 include { MAPSEQ as MAPSEQ_OBS } from '../modules/local/mapseq/map/main'
-include { SIMULATE_READS       } from '../modules/local/simulate_reads/main'
-include { BUILD_MISMAPPING     } from '../modules/local/build_mismapping/main'
-include { ALIGN_MISMAPPING     } from '../modules/local/align_mismapping/main'
-include { GROUPED_MISMAPPING   } from '../modules/local/grouped_mismapping/main'
-include { MINIMAP2_INDEX       } from '../modules/local/minimap2/index/main'
-include { MINIMAP2_ALLVSALL    } from '../modules/local/minimap2/allvsall/main'
 include { MATRIX_KEY            } from '../modules/local/matrix_key/main'
-include { PUBLISH_MISMAPPING    } from '../modules/local/publish_mismapping/main'
 include { POOL_TRAINING_READS   } from '../modules/local/pool_training_reads/main'
 include { READS_TO_FASTA       } from '../modules/local/reads_to_fasta/main'
 include { INFER_COMPOSITION    } from '../modules/local/infer_composition/main'
 include { CHECK_COMPOSITION_FIT } from '../modules/local/check_composition_fit/main'
 include { PANEL_PREPARE        } from '../modules/local/panel_kernel/prepare/main'
-include { PANEL_KERNEL         } from '../modules/local/panel_kernel/build/main'
+include { PANEL_KERNEL; PANEL_ALIGN } from '../modules/local/panel_kernel/build/main'
 include { SIMULATE_READS as SIMULATE_PANEL_READS } from '../modules/local/simulate_reads/main'
 include { MAPSEQ as MAPSEQ_PANEL_HOME } from '../modules/local/mapseq/map/main'
 include { MAPSEQ as MAPSEQ_PANEL_SIM  } from '../modules/local/mapseq/map/main'
@@ -42,17 +32,8 @@ workflow SUPERRESOLUTION_AMPLICON {
     if (!(params.mismapping_method in ['simulate', 'align'])) {
         error "--mismapping_method must be 'simulate' or 'align'"
     }
-    if (!(params.align_backend in ['minimap2', 'exact-hash', 'kmer'])) {
-        error "--align_backend must be 'minimap2', 'exact-hash' or 'kmer'"
-    }
     // `as int`: a --align_tau on the command line arrives as a String, and comparing that
-    // to a number silently misjudges every backend check below.
-    if (params.align_backend == 'kmer' && (params.align_tau as int) < 1) {
-        error "--align_backend kmer requires --align_tau >= 1; use exact-hash for tau=0"
-    }
-    if (params.align_backend == 'exact-hash' && (params.align_tau as int) != 0) {
-        error "--align_backend exact-hash requires --align_tau 0; use kmer for tau >= 1"
-    }
+    // to a number silently misjudges the alignment validation below.
     def auto_decay = params.align_distance_decay.toString() == 'auto'
     if (!auto_decay && !((params.align_distance_decay as double) >= 0.0
                          && (params.align_distance_decay as double) <= 1.0)) {
@@ -69,10 +50,6 @@ workflow SUPERRESOLUTION_AMPLICON {
             error "--infer_distance_decay needs --mismapping_method align at " +
                   "--align_tau >= 1: no other matrix records the distance behind each " +
                   "nonzero, and at tau 0 every distance is 0 and c cancels."
-        }
-        if (params.mismapping_matrix) {
-            log.warn "--infer_distance_decay with a supplied --mismapping_matrix: it will " +
-                     "be refused unless that matrix was built with distance strata."
         }
     }
     if ((params.align_tau as int) >= 1 && !auto_decay && params.infer_distance_decay.toString() != 'true'
@@ -93,11 +70,6 @@ workflow SUPERRESOLUTION_AMPLICON {
         error "--infer_horseshoe replaces the presence gate and needs --infer_mode vi " +
               "--infer_presence false"
     }
-    if (params.minimap2_args =~ /(^|\s)-[kw]\b/) {
-        // Silently ignored: with a prebuilt .mmi target, minimap2 takes -k/-w from the
-        // index. Putting them here would look like they applied when they did not.
-        error "-k/-w belong in --minimap2_index_args, not --minimap2_args"
-    }
     if (params.mismapping_method == 'align' && params.sim_read_len) {
         // Whole-reference distances cannot see what a short read cannot see, and quietly
         // understating confusion is worse than refusing.
@@ -107,12 +79,16 @@ workflow SUPERRESOLUTION_AMPLICON {
     }
 
     if (params.mismapping_matrix) {
-        ch_model = ch_reads.map { meta, reads -> [ meta.id, file(params.mismapping_matrix, checkIfExists: true), 'supplied' ] }
+        error "--mismapping_matrix is a square-matrix input and is not supported by the panel workflow; P.4 replaces it with --panel_kernel"
     }
-    else if (params.mismapping_method == 'align') {
-        // M comes from reference-to-reference alignment: no reads are simulated, so no
-        // error model is needed and the skiver training subworkflow never runs.
-        ch_model = ch_reads.map { meta, reads -> [ meta.id, file("${projectDir}/assets/NO_MODEL"), 'align' ] }
+    if (params.mismapping_method == 'align') {
+        // Alignment never trains an error model. `auto` can, however, measure a supplied
+        // pre-trained model's error rate, so its content fingerprint enters the panel key.
+        def decay_model = params.align_decay_model
+            ? file(params.align_decay_model, checkIfExists: true)
+            : file("${projectDir}/assets/NO_MODEL")
+        def decay_identity = params.align_decay_model ? 'align-decay-model' : 'align-flat'
+        ch_model = ch_reads.map { meta, reads -> [ meta.id, decay_model, decay_identity ] }
     }
     else if (params.sim_error_model == 'flat') {
         ch_model = ch_reads.map { meta, reads -> [ meta.id, file("${projectDir}/assets/NO_MODEL"), 'flat' ] }
@@ -185,153 +161,46 @@ workflow SUPERRESOLUTION_AMPLICON {
             .join(MAPSEQ_CLUSTER.out.mscluster.map { meta, mscluster -> [ meta.id, mscluster ] }), by: 0)
         .map { set, meta, fasta, tax, mscluster -> [ meta.id, fasta, tax, mscluster ] }
 
-    // Fingerprint extracted amplicons and group all samples that experience the same
-    // simulation + mapper configuration. The group metadata is also bundle provenance.
+    // Fingerprint every panel kernel. The hash includes the extracted database, panel
+    // identity, model identity, and every method setting that can affect the kernel.
     MATRIX_KEY(ch_amplicons
         .map { meta, d -> [ meta.id, meta, d ] }
         .join(ch_model)
         .map { id, meta, d, model, identity -> [ meta, d, model, identity ] })
-    // Panel samples get a kernel of their own (below); only the rest share a square matrix.
-    MATRIX_KEY.out.key
+    ch_panel_groups = MATRIX_KEY.out.key
         .map { meta, d, identity_file, identity, key_file, ref_file ->
             [ key_file.text.trim(), [meta, d, identity_file, identity, ref_file.text.trim()] ]
         }
-        .branch { key, entry ->
-            panel:  entry[0].panel || entry[0].panel_taxa
-            square: true
-        }
-        .set { ch_keyed }
-    ch_matrix_groups = ch_keyed.square
         .groupTuple()
         .map { key, entries ->
-            def representative = entries[0]
-            def members = entries.collect { [id: it[0].id, platform: it[0].platform] }
-            def scope = representative[3].tokenize(':')[0]
-            def source = params.mismapping_matrix ? 'supplied' : 'generated'
+            def rep = entries[0]
+            def panel = rep[0].panel ?: 'database'
+            def panel_taxa = rep[0].panel_taxa
+            def id = "panel_${key.take(16)}"
+            def members = entries.collect { it[0].id }
             def provenance = [
-                matrix_key: key, reference_sha256: representative[4], model_scope: scope,
-                source: source, mismapping_method: params.mismapping_method,
-                align_backend: params.align_backend, align_tau: params.align_tau,
+                matrix_key: id, reference_sha256: rep[4], panel: panel,
+                panel_taxa: panel_taxa, model_identity: rep[3],
+                mismapping_method: params.mismapping_method, align_tau: params.align_tau,
                 align_distance_decay: params.align_distance_decay,
-                align_decay_model: params.align_decay_model,
                 align_ambiguity_weight: params.align_ambiguity_weight,
-                max_ambiguous_bases: params.max_ambiguous_bases,
-                max_postings: params.max_postings,
-                minimap2_args: params.minimap2_args,
-                minimap2_index_args: params.minimap2_index_args,
+                max_ambiguous_bases: params.max_ambiguous_bases, max_postings: params.max_postings,
                 sim_error_model: params.sim_error_model,
-                sim_n_per_ref: params.sim_n_per_ref, sim_read_len: params.sim_read_len,
+                sim_n_per_ref: params.panel_sim_n_per_ref, sim_read_len: params.sim_read_len,
                 flat_sub_rate: params.flat_sub_rate, flat_ins_rate: params.flat_ins_rate,
                 flat_del_rate: params.flat_del_rate, mapseq_args: params.mapseq_args,
                 mapseq_min_identity: params.mapseq_min_identity, mapseq_tag: params.mapseq_tag,
                 seed: params.seed, samples: members
             ]
-            [[id: "matrix_${key}", matrix_key: key, reference_sha256: representative[4],
-              model_scope: scope, source: source, members: members, provenance: provenance],
-             representative[1], representative[2]]
+            [[id: id, matrix_key: id, panel: panel, panel_taxa: panel_taxa,
+              model_identity: rep[3], members: members, db_id: rep[0].id,
+              provenance: provenance], panel, rep[1], rep[2]]
         }
 
-    if (params.mismapping_matrix) {
-        ch_bundle_in = ch_matrix_groups.map { meta, d, supplied_matrix -> [ meta, d, supplied_matrix ] }
-    }
-    else if (params.mismapping_method == 'align') {
-        // One alignment of the reference amplicons against themselves replaces the whole
-        // simulate -> cluster -> map -> tally chain.
-        // Only read by '--align_distance_decay auto'; the placeholder keeps the input
-        // slot filled and means "measure the flat rates instead". This is a *pre-trained*
-        // model — align mode still never runs the skiver training subworkflow.
-        ch_decay_model = file(params.align_decay_model ?: "${projectDir}/assets/NO_MODEL",
-                              checkIfExists: true)
-        ch_align_refs = ch_matrix_groups.map { meta, d, model ->
-            [ meta, d.resolve('amplicons.fasta'), ch_decay_model ] }
-        // Index once, then align against it — the reference set is the target of its own
-        // all-vs-all, so without this every run re-indexes the whole DB.
-        if (params.align_backend in ['kmer', 'exact-hash']) {
-            GROUPED_MISMAPPING(ch_align_refs)
-            ch_versions = ch_versions.mix(GROUPED_MISMAPPING.out.versions)
-            ch_bundle_in = GROUPED_MISMAPPING.out.mismapping
-                .map { meta, matrix -> [ meta.id, meta, matrix ] }
-                .join(ch_matrix_groups.map { meta, d, model -> [ meta.id, d ] })
-                .map { id, meta, matrix, d -> [ meta, d, matrix ] }
-        }
-        else {
-        ch_minimap2_refs = ch_align_refs.map { meta, fasta, model -> [ meta, fasta ] }
-        MINIMAP2_INDEX(ch_minimap2_refs)
-        MINIMAP2_ALLVSALL(ch_minimap2_refs
-            .map { meta, fasta -> [ meta.id, meta, fasta ] }
-            .join(MINIMAP2_INDEX.out.index.map { meta, mmi -> [ meta.id, mmi ] })
-            .map { id, meta, fasta, mmi -> [ meta, fasta, mmi ] })
-        ch_versions = ch_versions.mix(MINIMAP2_INDEX.out.versions)
-                                 .mix(MINIMAP2_ALLVSALL.out.versions)
-        ch_align_in = ch_align_refs
-            .map { meta, fasta, model -> [ meta.id, meta, fasta, model ] }
-            .join(MINIMAP2_ALLVSALL.out.paf.map { meta, paf -> [ meta.id, paf ] })
-            .map { id, meta, fasta, model, paf -> [ meta, fasta, paf, model ] }
-        ALIGN_MISMAPPING(ch_align_in)
-        ch_versions = ch_versions.mix(ALIGN_MISMAPPING.out.versions)
-        ch_bundle_in = ALIGN_MISMAPPING.out.mismapping
-            .map { meta, matrix -> [ meta.id, meta, matrix ] }
-            .join(ch_matrix_groups.map { meta, d, model -> [ meta.id, d ] })
-            .map { id, meta, matrix, d -> [ meta, d, matrix ] }
-        }
-    }
-    else {
-        // The representative's amplicon directory is sufficient for the common matrix.
-        ch_group_refs = ch_matrix_groups.map { meta, d, model ->
-            [ meta, d, d.resolve('amplicons.fasta'), d.resolve('amplicons.tax'), model ]
-        }
-        MAPSEQ_CLUSTER_MATRIX(ch_group_refs.map { meta, d, fasta, tax, model -> [ meta, fasta, tax ] })
-        SIMULATE_READS(ch_group_refs.map { meta, d, fasta, tax, model -> [ meta, fasta, model ] })
-        ch_versions = ch_versions.mix(MAPSEQ_CLUSTER_MATRIX.out.versions).mix(SIMULATE_READS.out.versions)
-        MAPSEQ_SIM(SIMULATE_READS.out.reads
-            .map { meta, reads -> [ meta.id, meta, reads ] }
-            .join(ch_group_refs.map { meta, d, fasta, tax, model -> [ meta.id, d, fasta, tax ] })
-            .join(MAPSEQ_CLUSTER_MATRIX.out.mscluster.map { meta, cluster -> [ meta.id, cluster ] })
-            .map { id, meta, reads, d, fasta, tax, cluster -> [ meta, reads, fasta, tax, cluster ] })
-        ch_versions = ch_versions.mix(MAPSEQ_SIM.out.versions)
-        BUILD_MISMAPPING(ch_group_refs
-            .map { meta, d, fasta, tax, model -> [ meta.id, meta, d ] }
-            .join(MAPSEQ_SIM.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
-            .map { id, meta, d, mseq -> [ meta, d, mseq ] })
-        ch_versions = ch_versions.mix(BUILD_MISMAPPING.out.versions)
-        ch_bundle_in = BUILD_MISMAPPING.out.mismapping
-            .map { meta, matrix -> [ meta.id, meta, matrix ] }
-            .join(ch_matrix_groups.map { meta, d, model -> [ meta.id, d ] })
-            .map { id, meta, matrix, d -> [ meta, d, matrix ] }
-    }
-    PUBLISH_MISMAPPING(ch_bundle_in)
-    ch_versions = ch_versions.mix(PUBLISH_MISMAPPING.out.versions)
-    PUBLISH_MISMAPPING.out.record.collectFile(
-        name: 'groups.tsv', storeDir: "${params.outdir}/mismapping", keepHeader: true, skip: 1
-    )
-    // [ id, amplicon_dir, matrix, matrix_key ]: a square-matrix sample keeps its own
-    // extracted amplicons.
-    ch_mismapping = PUBLISH_MISMAPPING.out.bundle
-        .flatMap { meta, bundle -> meta.members.collect { member ->
-            [ member.id, bundle.resolve('mismapping_matrix.npz'), meta.matrix_key ]
-        } }
-        .join(ch_amplicons.map { meta, d -> [ meta.id, d ] })
-        .map { id, matrix, key, d -> [ id, d, matrix, key ] }
-
-    // Panel reinterpretation: one rectangular kernel per (database + model + settings, panel).
-    // Its sources are the panel's distinct V4 amplicons and its labels the database's V4
-    // groups, measured with the same MAPseq database the sample's reads are mapped against.
-    ch_panel_groups = ch_keyed.panel
-        .map { key, entry -> [ [key, entry[0].panel, entry[0].panel_taxa], entry ] }
-        .groupTuple()
-        .map { group, entries ->
-            def (key, panel, panel_taxa) = group
-            def rep = entries[0]
-            // Genome-only panels keep their pre-taxa id (and so their published kernel dir).
-            def taxa_key = panel_taxa ? "|${panel_taxa}|${params.panel_taxon_max_sources}" : ''
-            def id = "panel_" + "${key}|${panel}|${params.panel_sim_n_per_ref}${taxa_key}".toString().md5().take(16)
-            [[id: id, matrix_key: id, panel: panel, panel_taxa: panel_taxa, model_identity: rep[3],
-              members: entries.collect { it[0].id }, db_id: rep[0].id],
-             panel, rep[1], rep[2]]
-        }
     PANEL_PREPARE(
         ch_panel_groups.map { meta, panel, d, model ->
-            [ meta, panel ?: [], meta.panel_taxa ?: [], d.resolve('amplicons.fasta') ] },
+            [ meta, panel == 'database' ? [] : panel ?: [], meta.panel_taxa ?: [],
+              d.resolve('amplicons.fasta'), d ] },
         params.taxonomy ? file(params.taxonomy, checkIfExists: true) : [])
     ch_versions = ch_versions.mix(PANEL_PREPARE.out.versions)
     // [ meta, sources, fasta, tax, mscluster ] against the representative's database.
@@ -340,28 +209,42 @@ workflow SUPERRESOLUTION_AMPLICON {
         .combine(ch_db, by: 0)
         .map { db_id, meta, sources, fasta, tax, mscluster -> [ meta, sources, fasta, tax, mscluster ] }
     MAPSEQ_PANEL_HOME(ch_panel_db)
-    SIMULATE_PANEL_READS(PANEL_PREPARE.out.sources
-        .map { meta, sources -> [ meta.id, meta, sources ] }
-        .join(ch_panel_groups.map { meta, panel, d, model -> [ meta.id, model ] })
-        .map { id, meta, sources, model -> [ meta, sources, model ] })
-    MAPSEQ_PANEL_SIM(SIMULATE_PANEL_READS.out.reads
-        .map { meta, reads -> [ meta.id, reads ] }
-        .join(ch_panel_db.map { meta, sources, fasta, tax, mscluster -> [ meta.id, meta, fasta, tax, mscluster ] })
-        .map { id, reads, meta, fasta, tax, mscluster -> [ meta, reads, fasta, tax, mscluster ] })
     ch_versions = ch_versions.mix(MAPSEQ_PANEL_HOME.out.versions)
-        .mix(SIMULATE_PANEL_READS.out.versions).mix(MAPSEQ_PANEL_SIM.out.versions)
-    PANEL_KERNEL(PANEL_PREPARE.out.prepared
-        .map { meta, prepared -> [ meta.id, meta, prepared ] }
-        .join(ch_panel_db.map { meta, sources, fasta, tax, mscluster -> [ meta.id, fasta ] })
-        .join(MAPSEQ_PANEL_HOME.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
-        .join(MAPSEQ_PANEL_SIM.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
-        .map { id, meta, prepared, fasta, home, sim -> [ meta, prepared, fasta, home, sim ] })
-    ch_versions = ch_versions.mix(PANEL_KERNEL.out.versions)
-    // The kernel directory is the panel sample's amplicon dir (panel_translation.tsv).
-    ch_mismapping = ch_mismapping.mix(PANEL_KERNEL.out.kernel
+    if (params.mismapping_method == 'simulate') {
+        SIMULATE_PANEL_READS(PANEL_PREPARE.out.sources
+            .map { meta, sources -> [ meta.id, meta, sources ] }
+            .join(ch_panel_groups.map { meta, panel, d, model -> [ meta.id, model ] })
+            .map { id, meta, sources, model -> [ meta, sources, model ] })
+        MAPSEQ_PANEL_SIM(SIMULATE_PANEL_READS.out.reads
+            .map { meta, reads -> [ meta.id, reads ] }
+            .join(ch_panel_db.map { meta, sources, fasta, tax, mscluster -> [ meta.id, meta, fasta, tax, mscluster ] })
+            .map { id, reads, meta, fasta, tax, mscluster -> [ meta, reads, fasta, tax, mscluster ] })
+        ch_versions = ch_versions.mix(SIMULATE_PANEL_READS.out.versions)
+            .mix(MAPSEQ_PANEL_SIM.out.versions)
+        PANEL_KERNEL(PANEL_PREPARE.out.prepared
+            .map { meta, prepared -> [ meta.id, meta, prepared ] }
+            .join(ch_panel_db.map { meta, sources, fasta, tax, mscluster -> [ meta.id, fasta ] })
+            .join(MAPSEQ_PANEL_HOME.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
+            .join(MAPSEQ_PANEL_SIM.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
+            .map { id, meta, prepared, fasta, home, sim -> [ meta, prepared, fasta, home, sim ] })
+        ch_versions = ch_versions.mix(PANEL_KERNEL.out.versions)
+        ch_panel_kernel = PANEL_KERNEL.out.kernel
+    }
+    else {
+        PANEL_ALIGN(PANEL_PREPARE.out.prepared
+            .map { meta, prepared -> [ meta.id, meta, prepared ] }
+            .join(ch_panel_db.map { meta, sources, fasta, tax, mscluster -> [ meta.id, fasta ] })
+            .join(MAPSEQ_PANEL_HOME.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
+            .join(ch_panel_groups.map { meta, panel, d, model -> [ meta.id, model ] })
+            .map { id, meta, prepared, fasta, home, model -> [ meta, prepared, fasta, home, model ] })
+        ch_versions = ch_versions.mix(PANEL_ALIGN.out.versions)
+        ch_panel_kernel = PANEL_ALIGN.out.kernel
+    }
+    // The kernel directory carries panel_translation.tsv and sources.tsv for inference.
+    ch_mismapping = ch_panel_kernel
         .flatMap { meta, kdir -> meta.members.collect { member ->
             [ member, kdir, kdir.resolve('mismapping_matrix.npz'), meta.matrix_key ]
-        } })
+        } }
 
     // Real reads -> fasta -> mapseq -> the observed per-reference counts.
     // A sample carrying `mseq:` in the samplesheet supplies that classification instead
@@ -423,7 +306,7 @@ workflow SUPERRESOLUTION_AMPLICON {
 
     emit:
     amplicons   = ch_amplicons
-    mismapping  = PUBLISH_MISMAPPING.out.bundle
+    mismapping  = ch_panel_kernel
     composition = INFER_COMPOSITION.out.composition
     fit_diagnostics = CHECK_COMPOSITION_FIT.out.diagnostics
     versions    = ch_versions

@@ -331,6 +331,25 @@ def test_panel_align_kernel_redecays_exactly_and_fits_a_latent_decay(tmp_path: P
     assert json.loads(fit_json.read_text())["fit_status"] == "ok", fit_json.read_text()
 
 
+def test_panel_align_candidate_probes_and_auto_decay(monkeypatch) -> None:
+    """Limit candidate search to panel sources without losing an ambiguous target."""
+    import build_mismapping_align as bma
+    import build_panel_kernel as bpk
+
+    sequences = [A, B, C, C[:-1] + "N"]
+    pairs = {tuple(pair) for pair in bma.pigeonhole_candidates(
+        sequences, tau=1, max_ambiguous_bases=4, max_postings=1 << 30,
+        probes=np.array([0, 2], dtype=np.int64),
+    )}
+    assert (0, 1) in pairs and (2, 3) in pairs
+
+    monkeypatch.setattr(bma, "measure_error_rate", lambda *args: 0.013)
+    assert bpk._align_decay(SimpleNamespace(
+        distance_decay="auto", model_pt=None, flat_sub_rate=0.005,
+        flat_ins_rate=0.0005, flat_del_rate=0.0005,
+    ), bma) == 0.013
+
+
 def test_panel_kernel_prepare_and_build(tmp_path: Path) -> None:
     """Panel sources against database labels: a shared copy, a copy absent from the
     database whose home is relabelled, an unhit read, and row-stochastic rows."""

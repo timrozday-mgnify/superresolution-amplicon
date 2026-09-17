@@ -15,19 +15,18 @@ process MATRIX_KEY {
     def settings = [
         // Must equal sparse_matrix.KERNEL_VERSION (tests/test_grouped_mismapping.py checks).
         kernel_version: 2,
-        mismapping_method: params.mismapping_method, align_backend: params.align_backend,
+        panel: meta.panel ?: 'database', panel_taxa: meta.panel_taxa ?: '',
+        panel_taxon_max_sources: params.panel_taxon_max_sources,
+        mismapping_method: params.mismapping_method,
         align_tau: params.align_tau,
         align_distance_decay: params.align_distance_decay,
-        align_decay_model: params.align_decay_model,
         align_ambiguity_weight: params.align_ambiguity_weight,
-        max_ambiguous_bases: params.max_ambiguous_bases,
-        max_postings: params.max_postings,
-        minimap2_args: params.minimap2_args,
-        minimap2_index_args: params.minimap2_index_args,
-        minimap2_tag: params.minimap2_tag,
-        sim_error_model: params.sim_error_model, sim_n_per_ref: params.sim_n_per_ref,
+        max_ambiguous_bases: params.max_ambiguous_bases, max_postings: params.max_postings,
+        sim_error_model: params.sim_error_model, sim_n_per_ref: params.panel_sim_n_per_ref,
         sim_read_len: params.sim_read_len, flat_sub_rate: params.flat_sub_rate,
         flat_ins_rate: params.flat_ins_rate, flat_del_rate: params.flat_del_rate,
+        fwd_primer: params.fwd_primer, rev_primer: params.rev_primer,
+        primer_mismatches: params.primer_mismatches, trim_primers: params.trim_primers,
         mapseq_args: params.mapseq_args, mapseq_min_identity: params.mapseq_min_identity,
         mapseq_tag: params.mapseq_tag, seed: params.seed, identity: identity
     ].collect { k, v -> "${k}=${v}" }.sort().join('\n')

@@ -1,0 +1,3 @@
+sample,id_a,id_b,mean_a,mean_b,ambiguous_sd,gain
+b_uniformis,bacteroides_thetaiotaomicron,clostridium_saccharolyticum,0.10193816327568975,0.16976178931742697,0.025003185775508578,0.2077591062445966
+b_uniformis,bacteroides_uniformis,clostridium_saccharolyticum,0.06070365068253381,0.16976178931742697,0.023539693266104368,0.20277666534404362

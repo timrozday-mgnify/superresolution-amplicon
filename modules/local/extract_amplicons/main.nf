@@ -1,7 +1,7 @@
 // In-silico PCR over the reference DB: the primer-trimmed amplicons become the mapseq
 // reference set (fasta + the .tax sidecar mapseq requires), alongside the genome ->
-// reference translation table T. No error model involved — mis-mapping is measured later
-// by simulating reads and mapping them (SIMULATE_READS -> MAPSEQ_SIM).
+// reference translation table T. The downstream panel workflow uses these amplicons to
+// construct a panel-to-database kernel.
 process EXTRACT_AMPLICONS {
     tag "$meta.id"
     label 'process_medium'

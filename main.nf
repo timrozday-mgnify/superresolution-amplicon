@@ -72,24 +72,20 @@ workflow {
         def ref = row.references ?: params.references
         if (!ref) error "Sample ${row.id}: no references (set samplesheet 'references' or --references)"
         def meta = [ id: row.id, platform: (row.platform ?: params.platform) ]
-        // A genome panel to reinterpret this sample's database labels with. Added only when
-        // present so non-panel runs keep their cached task hashes.
+        // A supplied genome/taxon panel can reinterpret this sample's database labels. A
+        // normal sample instead uses every extracted database V4 group as its panel.
         def panel = row.panel_references ?: params.panel_references
         def panel_taxa = row.panel_taxa ?: params.panel_taxa
         if (panel || panel_taxa) {
-            if (params.infer_space != 'genome') {
-                error "Sample ${row.id}: panel reinterpretation infers panel genomes; use --infer_space genome"
-            }
-            if (params.mismapping_method != 'simulate' || params.mismapping_matrix) {
-                error "Sample ${row.id}: panel reinterpretation measures its own kernel by " +
-                      "simulation; unset --mismapping_matrix and use --mismapping_method simulate"
-            }
             // Taxon entries resolve against the database's own lineages.
             if (panel_taxa && !params.taxonomy) {
                 error "Sample ${row.id}: panel_taxa needs --taxonomy (the database's MAPseq .tax)"
             }
             if (panel) meta.panel = resolveFile(panel.toString())
             if (panel_taxa) meta.panel_taxa = resolveFile(panel_taxa.toString())
+        }
+        else {
+            meta.panel = 'database'
         }
         [ meta, resolveFile(ref.toString()) ]
     }

@@ -8,7 +8,7 @@ process PANEL_PREPARE {
     container "ghcr.io/timrozday-mgnify/sra-skiver:${params.sra_skiver_tag}"
 
     input:
-    tuple val(meta), path(panel), path(panel_taxa), path(db_amplicons)
+    tuple val(meta), path(panel), path(panel_taxa), path(db_amplicons), path(amplicon_dir)
     path taxonomy   // the database's MAPseq .tax; [] unless the panel has taxa
 
     output:
@@ -23,9 +23,10 @@ process PANEL_PREPARE {
     def args = task.ext.args ?: ''
     def panel_arg = panel ? "--panel-amplicons ${panel}" : ''
     def taxa_arg = panel_taxa ? "--panel-taxa ${panel_taxa} --db-taxonomy ${taxonomy}" : ''
+    def whole_database_arg = meta.panel == 'database' ? "--whole-database ${amplicon_dir}" : ''
     """
     build_panel_kernel.py prepare \\
-        ${panel_arg} ${taxa_arg} \\
+        ${panel_arg} ${taxa_arg} ${whole_database_arg} \\
         --db-amplicons ${db_amplicons} \\
         -o ${meta.id}_prepared \\
         $args

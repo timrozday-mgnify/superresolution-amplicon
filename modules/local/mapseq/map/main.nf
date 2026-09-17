@@ -1,8 +1,7 @@
 // Classify reads against the amplicon reference set with mapseq. One process for both
-// the simulated reads (-> the mis-mapping matrix) and the real reads (-> the observed
-// per-reference counts), aliased MAPSEQ_SIM / MAPSEQ_OBS in the workflow and told apart
-// only by ext.prefix: the whole point is that the confusion matrix is measured with the
-// same mapper and settings the real reads go through.
+// simulated panel reads (-> the panel kernel) and real reads (-> observed per-reference
+// counts), aliased MAPSEQ_PANEL_SIM / MAPSEQ_OBS in the workflow and told apart only by
+// ext.prefix. Simulation uses the same mapper and settings as the real-read path.
 //
 // The pre-built <fasta>.mscluster is staged alongside the fasta, so mapseq reuses it
 // instead of re-clustering per task.

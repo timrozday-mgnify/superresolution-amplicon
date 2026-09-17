@@ -1,0 +1,42 @@
+{
+  "fit_status": "ok",
+  "gate": "unique_v4_group",
+  "infer_space": "genome",
+  "kernel_format": "square",
+  "matrix_path": "mismapping_matrix.npz",
+  "min_infer_reads": 1000,
+  "n_reads": 1500,
+  "posterior_draw_count": 500,
+  "posterior_draw_path": "demo.posterior_draws.npz",
+  "raw_reference": {
+    "n_labels": 4,
+    "observed_expected_tv": 0.014553557392765634,
+    "observed_statistic": {
+      "q05": 0.014418487722860716,
+      "q50": 0.021104350897851627,
+      "q95": 0.08312355967271318
+    },
+    "posterior_predictive_percentile": 0.476,
+    "replicated_statistic": {
+      "q05": 0.007896095650283737,
+      "q50": 0.02409737168145884,
+      "q95": 0.04887919711103161
+    }
+  },
+  "sample": "demo",
+  "unique_v4_group": {
+    "n_labels": 4,
+    "observed_expected_tv": 0.014553557392765634,
+    "observed_statistic": {
+      "q05": 0.014418487722860716,
+      "q50": 0.021104350897851655,
+      "q95": 0.08312355967271318
+    },
+    "posterior_predictive_percentile": 0.476,
+    "replicated_statistic": {
+      "q05": 0.007896095650283739,
+      "q50": 0.02409737168145884,
+      "q95": 0.04887919711103161
+    }
+  }
+}

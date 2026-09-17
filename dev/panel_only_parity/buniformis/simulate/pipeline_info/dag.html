@@ -1,0 +1,163 @@
+<!--
+  ~ Copyright 2013-2026, Seqera Labs
+  ~
+  ~ Licensed under the Apache License, Version 2.0 (the "License");
+  ~ you may not use this file except in compliance with the License.
+  ~ You may obtain a copy of the License at
+  ~
+  ~     http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing, software
+  ~ distributed under the License is distributed on an "AS IS" BASIS,
+  ~ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  ~ See the License for the specific language governing permissions and
+  ~ limitations under the License.
+  -->
+<html>
+<head>
+<meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1, maximum-scale=1">
+</head>
+<body>
+<pre class="mermaid" style="text-align: center;">
+%%{
+  init: {
+    'theme': 'base',
+    'themeVariables': {
+      'primaryColor': '#B6ECE2',
+      'primaryTextColor': '#160F26',
+      'primaryBorderColor': '#065647',
+      'lineColor': '#545555',
+      'clusterBkg': '#BABCBD22',
+      'clusterBorder': '#DDDEDE',
+      'fontFamily': 'arial'
+    }
+  }
+}%%
+flowchart TB
+    subgraph " "
+    v0["channel.fromList"]
+    v6["channel.empty"]
+    v71["taxonomy"]
+    v118["taxonomy"]
+    end
+    subgraph " "
+    v5["ch_pretrained"]
+    v12[" "]
+    v29[" "]
+    v62[" "]
+    v120[" "]
+    v121[" "]
+    v122[" "]
+    v123[" "]
+    v124[" "]
+    v125[" "]
+    v126[" "]
+    v135["fit_diagnostics"]
+    v138[" "]
+    end
+    subgraph "SUPERRESOLUTION_AMPLICON [SUPERRESOLUTION_AMPLICON]"
+    v11(["EXTRACT_AMPLICONS"])
+    v14(["MAPSEQ_CLUSTER"])
+    v28(["MATRIX_KEY"])
+    v36(["MAPSEQ_CLUSTER_MATRIX"])
+    v38(["SIMULATE_READS"])
+    v47(["MAPSEQ_SIM"])
+    v53(["BUILD_MISMAPPING"])
+    v59(["PUBLISH_MISMAPPING"])
+    v72(["PANEL_PREPARE"])
+    v77(["MAPSEQ_PANEL_HOME"])
+    v82(["SIMULATE_PANEL_READS"])
+    v87(["MAPSEQ_PANEL_SIM"])
+    v99(["PANEL_KERNEL"])
+    v104(["READS_TO_FASTA"])
+    v109(["MAPSEQ_OBS"])
+    v119(["INFER_COMPOSITION"])
+    v134(["CHECK_COMPOSITION_FIT"])
+    v7(( ))
+    v13(( ))
+    v30(( ))
+    v61(( ))
+    end
+    v1(( ))
+    v2(( ))
+    v3(( ))
+    v0 --> v1
+    v0 --> v2
+    v0 --> v3
+    v3 --> v5
+    v6 --> v13
+    v7 --> v11
+    v11 --> v14
+    v11 --> v12
+    v11 --> v7
+    v11 --> v13
+    v14 --> v7
+    v14 --> v13
+    v7 --> v28
+    v28 --> v29
+    v28 --> v30
+    v30 --> v36
+    v36 --> v13
+    v36 --> v30
+    v30 --> v38
+    v38 --> v13
+    v38 --> v30
+    v30 --> v47
+    v47 --> v13
+    v47 --> v30
+    v30 --> v53
+    v53 --> v13
+    v53 --> v30
+    v30 --> v59
+    v59 --> v7
+    v59 --> v13
+    v59 --> v61
+    v61 --> v62
+    v71 --> v72
+    v30 --> v72
+    v72 --> v7
+    v72 --> v13
+    v72 --> v30
+    v7 --> v77
+    v77 --> v7
+    v77 --> v13
+    v30 --> v82
+    v82 --> v7
+    v82 --> v13
+    v7 --> v87
+    v87 --> v7
+    v87 --> v13
+    v7 --> v99
+    v99 --> v7
+    v99 --> v13
+    v7 --> v104
+    v104 --> v7
+    v104 --> v13
+    v7 --> v109
+    v109 --> v7
+    v109 --> v13
+    v118 --> v119
+    v7 --> v119
+    v119 --> v126
+    v119 --> v125
+    v119 --> v124
+    v119 --> v123
+    v119 --> v122
+    v119 --> v121
+    v119 --> v120
+    v119 --> v7
+    v119 --> v13
+    v7 --> v134
+    v134 --> v135
+    v134 --> v13
+    v13 --> v138
+    v1 --> v7
+    v2 --> v7
+
+</pre>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, maxTextSize: Number.MAX_SAFE_INTEGER, maxEdges: Number.MAX_SAFE_INTEGER });
+</script>
+</body>
+</html>

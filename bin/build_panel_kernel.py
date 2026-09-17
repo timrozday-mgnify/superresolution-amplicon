@@ -2,6 +2,7 @@
 """Measure a genome panel's confusion kernel against a generic MAPseq database.
 
     build_panel_kernel.py prepare --panel-amplicons DIR|FASTA --db-amplicons amplicons.fasta -o OUT
+    build_panel_kernel.py prepare --whole-database amplicon_dir -o OUT
     mapseq OUT/sources.fasta amplicons.fasta amplicons.tax > home.mseq
     simulate_amplicon_reads.py --amplicons OUT/sources.fasta --n-per-ref 5000 ... -o sim.fasta
     mapseq sim.fasta amplicons.fasta amplicons.tax > sim.mseq
@@ -10,12 +11,12 @@
     build_panel_kernel.py align --prepared OUT --db-amplicons amplicons.fasta \
         --home-mseq home.mseq --tau 1 --distance-decay 0.007 -o OUT/align_kernel.npz
 
-``prepare`` cuts each panel genome's V4 copies and writes ``sources.fasta`` (one record per
-distinct amplicon, ``v4g_<sha16>``), ``panel_translation.tsv`` (genome_id, source, weight)
-and ``sources.tsv`` (source, genomes, in_db). A taxon entry (``--panel-taxa``) contributes
-each database V4 group under its lineage as a free member ``<entry>::<v4g>`` of weight 1;
-inference sums members back into the entry. MAPseq runs outside this script, as the same
-command used for the observed reads.
+``prepare`` cuts each panel genome's V4 copies, or reuses every V4 group from an extracted
+database, and writes ``sources.fasta`` (one record per distinct amplicon, ``v4g_<sha16>``),
+``panel_translation.tsv`` (genome_id, source, weight) and ``sources.tsv`` (source, genomes,
+in_db). A taxon entry (``--panel-taxa``) contributes each database V4 group under its lineage
+as a free member ``<entry>::<v4g>`` of weight 1; inference sums members back into the entry.
+MAPseq runs outside this script, as the same command used for the observed reads.
 
 ``build`` writes the rectangular kernel: sources x database exact-sequence groups, ``K[s, l]``
 the fraction of ``s``'s classified simulated reads MAPseq labels ``l``, and ``home[s]`` the
@@ -191,25 +192,75 @@ def _read_taxa(path: Path) -> list[tuple[str, str]]:
     return [(i.strip(), t.strip()) for i, t in rows]
 
 
+def whole_database_rows(amplicon_dir: Path) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Return the panel translation and source sequences for an extracted database.
+
+    The extracted directory is authoritative: its FASTA provides the byte-identical source
+    sequences and its translation table provides the genome-copy weights. Multiple copies of
+    the same V4 group for one genome are collapsed by summing their existing weights.
+    """
+    db_amplicons = amplicon_dir / "amplicons.fasta"
+    db_translation = amplicon_dir / "translation_table.tsv"
+    missing = [str(p) for p in (db_amplicons, db_translation) if not p.is_file()]
+    if missing:
+        raise SystemExit("--whole-database needs an EXTRACT_AMPLICONS directory containing "
+                         "amplicons.fasta and translation_table.tsv; missing: "
+                         + ", ".join(missing))
+
+    headers, label_ids, label_of_ref, label_seqs = db_groups(db_amplicons)
+    label_by_header = dict(zip(headers, (label_ids[i] for i in label_of_ref)))
+    translation = pd.read_csv(db_translation, sep="\t")
+    expected = {"genome_id", "refseq", "weight"}
+    if not expected.issubset(translation.columns):
+        raise SystemExit(f"{db_translation}: needs columns "
+                         "genome_id, refseq and weight")
+    unknown = sorted(set(translation.refseq) - set(label_by_header))
+    if unknown:
+        raise SystemExit(f"{db_translation}: refseq entries absent from {db_amplicons}: "
+                         + ", ".join(unknown[:20]))
+
+    panel = translation.loc[:, ["genome_id", "refseq", "weight"]].copy()
+    panel["source"] = panel.refseq.map(label_by_header)
+    panel = (panel.loc[:, ["genome_id", "source", "weight"]]
+             .groupby(["genome_id", "source"], as_index=False, sort=True)
+             .weight.sum())
+    return panel, dict(zip(label_ids, label_seqs))
+
+
 def prepare(a) -> None:
-    if not (a.panel_amplicons or a.panel_taxa):
-        raise SystemExit("prepare needs --panel-amplicons, --panel-taxa or both")
+    whole_database = getattr(a, "whole_database", None)
+    if whole_database and (a.panel_amplicons or a.panel_taxa):
+        raise SystemExit("--whole-database cannot be combined with --panel-amplicons or "
+                         "--panel-taxa")
+    if not (whole_database or a.panel_amplicons or a.panel_taxa):
+        raise SystemExit("prepare needs --panel-amplicons, --panel-taxa, or --whole-database")
     if a.panel_taxa and not a.db_taxonomy:
         raise SystemExit("--panel-taxa needs --db-taxonomy")
-    copies, dropped = ({}, []) if not a.panel_amplicons else panel_copies(
-        a.panel_amplicons, a.fwd_primer, a.rev_primer, a.max_mismatch,
-        dict(x.split("=", 1) for x in a.alias))
-    taxa = _read_taxa(a.panel_taxa) if a.panel_taxa else []
+
+    if whole_database:
+        db_amplicons = whole_database / "amplicons.fasta"
+        rows, sequence = whole_database_rows(whole_database)
+        rows = rows.to_dict("records")
+        copies, dropped, taxa = {}, [], []
+    else:
+        if not a.db_amplicons:
+            raise SystemExit("--db-amplicons is required unless --whole-database is used")
+        db_amplicons = a.db_amplicons
+        copies, dropped = ({}, []) if not a.panel_amplicons else panel_copies(
+            a.panel_amplicons, a.fwd_primer, a.rev_primer, a.max_mismatch,
+            dict(x.split("=", 1) for x in a.alias))
+        rows = [{"genome_id": g, "source": v4g(seq), "weight": n / len(seqs)}
+                for g, seqs in sorted(copies.items()) for seq, n in Counter(seqs).items()]
+        sequence = {v4g(s): s for seqs in copies.values() for s in seqs}
+        taxa = _read_taxa(a.panel_taxa) if a.panel_taxa else []
+
     ids = list(copies) + [e for e, _ in taxa]
     bad = sorted({i for i in ids if ENTRY_SEP in i or i == "background"}
                  | {i for i, n in Counter(ids).items() if n > 1})
     if bad:
         raise SystemExit("panel entry ids must be unique, not 'background' and not contain "
                          f"{ENTRY_SEP!r}: {', '.join(bad)}")
-    rows = [{"genome_id": g, "source": v4g(seq), "weight": n / len(seqs)}
-            for g, seqs in sorted(copies.items()) for seq, n in Counter(seqs).items()]
-    sequence = {v4g(s): s for seqs in copies.values() for s in seqs}
-    headers, label_ids, label_of_ref, label_seqs = db_groups(a.db_amplicons)
+    headers, label_ids, label_of_ref, label_seqs = db_groups(db_amplicons)
     if taxa:
         import infer_composition as ic
         # A group with an ambiguous base is no source: simulated reads would carry its Ns, and
@@ -230,7 +281,10 @@ def prepare(a) -> None:
     translation = pd.DataFrame(rows)
     sources = (translation.groupby("source").genome_id.agg(";".join).rename("genomes")
                .reset_index())
-    sources["in_db"] = sources.source.isin(set(label_ids))
+    sources["in_db"] = True if whole_database else sources.source.isin(set(label_ids))
+    if whole_database and len(sources) > 10_000:
+        log.warning("whole-database panel has %d distinct sources; this may be expensive",
+                    len(sources))
     a.out.mkdir(parents=True, exist_ok=True)
     translation.to_csv(a.out / "panel_translation.tsv", sep="\t", index=False)
     if dropped:
@@ -238,8 +292,9 @@ def prepare(a) -> None:
     sources.to_csv(a.out / "sources.tsv", sep="\t", index=False)
     with open(a.out / "sources.fasta", "w") as fh:
         fh.writelines(f">{s}\n{sequence[s]}\n" for s in sources.source)
+    n_genomes = translation.genome_id.nunique() if whole_database else len(copies)
     log.info("%d genomes (%d unamplifiable, dropped), %d distinct sources, %d in the "
-             "database, %d shared", len(copies), len(dropped), len(sources),
+             "database, %d shared", n_genomes, len(dropped), len(sources),
              sources.in_db.sum(), sources.genomes.str.contains(";").sum())
 
 
@@ -299,6 +354,31 @@ def build(a) -> None:
              *kernel.shape, sum(label_ids[h] != s for s, h in zip(source_ids, home)))
 
 
+def _align_decay(a, bma) -> float:
+    """Return the requested fixed or measured alignment distance-decay value."""
+    requested = str(a.distance_decay)
+    if requested == "auto":
+        model_pt = getattr(a, "model_pt", None)
+        decay = bma.measure_error_rate(
+            "trained" if model_pt else "flat",
+            model_pt,
+            getattr(a, "flat_sub_rate", 0.005),
+            getattr(a, "flat_ins_rate", 0.0005),
+            getattr(a, "flat_del_rate", 0.0005),
+        )
+        if decay <= 0.0:
+            raise SystemExit("--distance-decay auto measured a zero error rate; set it explicitly")
+        log.info("--distance-decay auto -> %.5f", decay)
+    else:
+        try:
+            decay = float(requested)
+        except ValueError as exc:
+            raise SystemExit("--distance-decay must be a number or 'auto'") from exc
+    if not 0.0 < decay <= 1.0:
+        raise SystemExit("--distance-decay must be in (0, 1]")
+    return decay
+
+
 def align(a) -> None:
     """The alignment kernel: ``K[s, l]`` proportional to ``w(l) * c ** d(s, l)`` over the
     database groups within ``--tau`` edits of source ``s``, the ``--mode align`` tie cluster
@@ -327,20 +407,66 @@ def align(a) -> None:
     if (home < 0).any():
         raise SystemExit("no home label for source(s) (not in the database, or unhit in "
                          "--home-mseq): " + ", ".join(np.asarray(source_ids)[home < 0]))
-    if not 0.0 < a.distance_decay <= 1.0:
-        raise SystemExit("--distance-decay must be in (0, 1]")
+    if a.tau < 0:
+        raise SystemExit("--tau must be non-negative")
+    a.distance_decay = _align_decay(a, bma)
+    max_ambiguous_bases = getattr(a, "max_ambiguous_bases", bma.DEFAULT_MAX_AMBIGUOUS_BASES)
+    max_postings = getattr(a, "max_postings", bma.DEFAULT_MAX_POSTINGS)
+    if max_ambiguous_bases < 0 or max_postings < 1:
+        raise SystemExit("--max-ambiguous-bases must be non-negative and --max-postings >= 1")
     ambiguity = bma.ambiguity_weights(label_seqs, a.ambiguity_weight)
 
+    # Labels already contain one literal sequence per database group. Add only external
+    # panel sequences, then use those sequence indexes as pigeonhole probes. At tau zero
+    # the literal sequence lookup is the exact hash join; at tau >= 1 the candidate
+    # filter avoids comparing every panel source with every database label.
+    sequence_index = {seq: index for index, seq in enumerate(label_seqs)}
+    unique_sequences = list(label_seqs)
+    source_rows: dict[int, list[int]] = defaultdict(list)
+    for row, source in enumerate(source_ids):
+        source_sequence = sequence[source]
+        index = sequence_index.get(source_sequence)
+        if index is None:
+            index = len(unique_sequences)
+            sequence_index[source_sequence] = index
+            unique_sequences.append(source_sequence)
+        source_rows[index].append(row)
+
+    entries_by_source = [{} for _ in source_ids]
+
+    def add_candidate(source_index: int, label: int, distance: int) -> None:
+        weight = (1.0 if ambiguity is None else ambiguity[label]) * a.distance_decay ** distance
+        for row in source_rows.get(source_index, ()):
+            if label != own.get(source_ids[row]):
+                entries_by_source[row][label] = (weight, distance)
+
+    for source_index in source_rows:
+        label = sequence_index.get(unique_sequences[source_index])
+        if label is not None and label < len(label_ids):
+            add_candidate(source_index, label, 0)
+
+    if a.tau >= 1:
+        probes = np.fromiter(source_rows, dtype=np.int64)
+        pairs = bma.pigeonhole_candidates(
+            unique_sequences,
+            a.tau,
+            max_ambiguous_bases,
+            max_postings,
+            probes=probes,
+        )
+        log.info("verifying %d panel-to-database alignment candidate pair(s)", len(pairs))
+        for left, right in pairs:
+            distance = bma.bounded_iupac_distance(
+                unique_sequences[left], unique_sequences[right], a.tau)
+            if distance > a.tau:
+                continue
+            if left < len(label_ids):
+                add_candidate(right, int(left), distance)
+            if right < len(label_ids):
+                add_candidate(left, int(right), distance)
+
     rows, cols, weights, dists = [], [], [], []
-    for s, source in enumerate(source_ids):
-        entries = {}
-        # ponytail: brute force over every group (26 x 86,557 in ~10 s); use
-        # bma.pigeonhole_candidates when panels reach hundreds of sources.
-        for label, target in enumerate(label_seqs):
-            d = bma.bounded_iupac_distance(sequence[source], target, a.tau)
-            if d <= a.tau and label != own.get(source):
-                entries[label] = ((1.0 if ambiguity is None else ambiguity[label])
-                                  * a.distance_decay ** d, d)
+    for s, entries in enumerate(entries_by_source):
         entries[home[s]] = (1.0, 0)       # overrides the home's own neighbour entry
         total = sum(w for w, _ in entries.values())
         for label, (w, d) in entries.items():
@@ -358,6 +484,7 @@ def align(a) -> None:
         strata = (distances, a.distance_decay)
     provenance = {"method": "align", "prepared": str(a.prepared), "tau": a.tau,
                   "distance_decay": a.distance_decay, "ambiguity_weight": a.ambiguity_weight,
+                  "max_ambiguous_bases": max_ambiguous_bases, "max_postings": max_postings,
                   "home_mseq": None if a.home_mseq is None else str(a.home_mseq)}
     sm.write_kernel(a.out, kernel, source_ids, label_ids, home, ref_headers=headers,
                     label_of_ref=label_of_ref,
@@ -400,12 +527,15 @@ def main() -> None:
     p.add_argument("--panel-amplicons", type=Path,
                    help="directory of <genome>.amplicons.fasta, or one FASTA with genome|... headers")
     p.add_argument("--panel-taxa", type=Path, help="TSV id<TAB>taxon (lineage prefix or bare name)")
+    p.add_argument("--whole-database", type=Path,
+                   help="EXTRACT_AMPLICONS directory; reuse all groups without another PCR")
     p.add_argument("--db-taxonomy", type=Path,
                    help="MAPseq .tax (header<TAB>lineage) for --db-amplicons; needed by --panel-taxa")
     # ponytail: hard cap; sub-sample or cluster groups if broad taxa turn out to be needed.
     p.add_argument("--max-taxon-sources", type=int, default=200,
                    help="fail when a taxon entry resolves to more V4 groups than this")
-    p.add_argument("--db-amplicons", type=Path, required=True)
+    p.add_argument("--db-amplicons", type=Path,
+                   help="database amplicons.fasta; required unless --whole-database is used")
     p.add_argument("--fwd-primer", default=si.DEFAULT_FWD_PRIMER)
     p.add_argument("--rev-primer", default=si.DEFAULT_REV_PRIMER)
     p.add_argument("--max-mismatch", type=int, default=2)
@@ -427,8 +557,22 @@ def main() -> None:
     al.add_argument("--home-mseq", type=Path, default=None,
                     help="MAPseq of sources.fasta; without it each source's home is its own group")
     al.add_argument("--tau", type=int, default=1)
-    al.add_argument("--distance-decay", type=float, default=0.007)
+    al.add_argument("--distance-decay", default="0.007",
+                    help="weight a label d edits away by c**d, or 'auto' to measure c")
+    al.add_argument("--model-pt", type=Path,
+                    help="pre-trained skiver model for '--distance-decay auto'")
+    al.add_argument("--flat-sub-rate", type=float, default=0.005,
+                    help="flat-model substitution rate for '--distance-decay auto'")
+    al.add_argument("--flat-ins-rate", type=float, default=0.0005,
+                    help="flat-model insertion rate for '--distance-decay auto'")
+    al.add_argument("--flat-del-rate", type=float, default=0.0005,
+                    help="flat-model deletion rate for '--distance-decay auto'")
     al.add_argument("--ambiguity-weight", type=float, default=0.3)
+    al.add_argument("--max-ambiguous-bases", type=int,
+                    default=4,
+                    help="IUPAC positions tolerated across a pigeonhole candidate pair")
+    al.add_argument("--max-postings", type=int, default=4096,
+                    help="skip pigeonhole blocks shared by more than this many sequences")
     al.add_argument("-o", "--out", type=Path, required=True)
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")

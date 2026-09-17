@@ -98,6 +98,42 @@ def test_prepare_writes_taxon_members_beside_genomes(tmp_path: Path) -> None:
     assert dict(bpk.si.read_fasta(prep / "sources.fasta"))[g("GGGG")] == "GGGG"
 
 
+def test_prepare_whole_database_reuses_groups_and_copy_weights(tmp_path: Path) -> None:
+    amplicon_dir = tmp_path / "database_amplicons"
+    amplicon_dir.mkdir()
+    records = {
+        "g1|0|a": "AAAA",
+        "g1|1|b": "AAAA",
+        "g2|0|c": "CCCC",
+    }
+    (amplicon_dir / "amplicons.fasta").write_text(
+        "".join(f">{header}\n{sequence}\n" for header, sequence in records.items()))
+    pd.DataFrame({
+        "genome_id": ["g1", "g1", "g2"],
+        "refseq": list(records),
+        "weight": [0.25, 0.75, 1.0],
+    }).to_csv(amplicon_dir / "translation_table.tsv", sep="\t", index=False)
+
+    prep = tmp_path / "prepared"
+    bpk.prepare(SimpleNamespace(
+        panel_amplicons=None, panel_taxa=None, whole_database=amplicon_dir,
+        db_amplicons=None, db_taxonomy=None, alias=[], max_taxon_sources=200,
+        fwd_primer="not-used", rev_primer="not-used", max_mismatch=2, out=prep,
+    ))
+
+    translation = pd.read_csv(prep / "panel_translation.tsv", sep="\t")
+    assert translation.to_dict("records") == [
+        {"genome_id": "g1", "source": g("AAAA"), "weight": 1.0},
+        {"genome_id": "g2", "source": g("CCCC"), "weight": 1.0},
+    ]
+    sources = pd.read_csv(prep / "sources.tsv", sep="\t")
+    assert sources.in_db.all()
+    assert dict(bpk.si.read_fasta(prep / "sources.fasta")) == {
+        g("AAAA"): "AAAA",
+        g("CCCC"): "CCCC",
+    }
+
+
 def _panel_run(tmp_path: Path, genome_ids: list[str], K: np.ndarray, per_label: dict,
                mode: str, **kw) -> Path:
     tmp_path.mkdir(parents=True, exist_ok=True)

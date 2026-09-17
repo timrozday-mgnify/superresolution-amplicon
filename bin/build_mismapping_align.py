@@ -324,8 +324,13 @@ def _block_pass(sequences: list[str], probes: np.ndarray, tau: int, blocks: int,
     return np.unique(np.concatenate(packed)) if packed else np.empty(0, dtype=np.int64)
 
 
-def pigeonhole_candidates(sequences: list[str], tau: int, max_ambiguous_bases: int,
-                          max_postings: int) -> np.ndarray:
+def pigeonhole_candidates(
+    sequences: list[str],
+    tau: int,
+    max_ambiguous_bases: int,
+    max_postings: int,
+    probes: np.ndarray | None = None,
+) -> np.ndarray:
     """Return candidate near-duplicate pairs of distinct amplicons, exactly.
 
     Pigeonhole filter. Cut each sequence into ``P`` disjoint blocks. An aligned pair
@@ -349,12 +354,19 @@ def pigeonhole_candidates(sequences: list[str], tau: int, max_ambiguous_bases: i
         max_ambiguous_bases: IUPAC positions tolerated across the pair *combined* — two
             references carrying two ambiguity codes each need a budget of four.
         max_postings: Drop a block shared by more than this many sequences.
+        probes: Sequence indexes to search against all sequences. By default every
+            sequence is searched. Ambiguous sequences are also searched when needed to
+            retain the filter's recall guarantee for a clean probe and ambiguous target.
 
     Returns:
         ``(m, 2)`` array of ``i < j`` index pairs to verify.
     """
     total = len(sequences)
-    packed = _block_pass(sequences, np.arange(total), tau, tau + 1, max_postings)
+    probe_indexes = (np.arange(total, dtype=np.int64) if probes is None
+                     else np.unique(np.asarray(probes, dtype=np.int64)))
+    if (probe_indexes < 0).any() or (probe_indexes >= total).any():
+        raise ValueError("probe indexes must address the supplied sequences")
+    packed = _block_pass(sequences, probe_indexes, tau, tau + 1, max_postings)
     ambiguous = np.fromiter(
         (index for index, sequence in enumerate(sequences)
          if not set(sequence).issubset(_BASES)),
@@ -362,6 +374,9 @@ def pigeonhole_candidates(sequences: list[str], tau: int, max_ambiguous_bases: i
     )
     log.info("%d of %d distinct amplicons carry IUPAC codes", len(ambiguous), total)
     if len(ambiguous) and max_ambiguous_bases:
+        # A clean probe can be near an ambiguous target. Searching the ambiguous targets
+        # as well as the requested probes preserves the pigeonhole guarantee in that
+        # direction without indexing a second copy of the database.
         packed = np.union1d(packed, _block_pass(
             sequences, ambiguous, tau, tau + max_ambiguous_bases + 1, max_postings))
     return np.stack(divmod(packed, total), axis=1)
