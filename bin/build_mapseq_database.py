@@ -16,8 +16,10 @@ first whitespace is its taxonomy. Bracketed source annotations are ignored.
 
 The ``--silva-fasta`` form accepts a SILVA SSU ``*_tax_silva.fasta`` such as
 ``AB000001.1.1500 Bacteria;Bacillota;...;Bacillus;Bacillus subtilis``. SILVA has no
-genomes: each record is its own reference ``accession|0|accession``, its lineage drops the
-trailing organism name, and RNA ``U`` becomes ``T``. Lineages are padded with
+genomes: each record is its own reference ``accession|0|accession``, and RNA ``U`` becomes
+``T``. SILVA has no species rank either: a Bacteria/Archaea lineage that reaches genus gains
+``<genus> <epithet>`` when the trailing organism name is a binomial (``Bacillus subtilis``;
+not ``Bacillus sp. X`` or ``uncultured bacterium``), and the organism name is otherwise dropped. Lineages are padded with
 ``unclassified`` to the deepest one in the file.
 """
 from __future__ import annotations
@@ -25,6 +27,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import os
+import re
 import tempfile
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -34,6 +37,11 @@ import yaml
 
 _TAX_NAME = "#name: refdb\n"
 _UNCLASSIFIED = "unclassified"
+# A SILVA organism name gives a species only as "<Genus> <epithet>"; these epithets are not one.
+_GENUS_WORD = re.compile(r"^\[?[A-Z][a-z]+\]?$")
+_EPITHET = re.compile(r"^[a-z]+$")
+_NOT_EPITHETS = frozenset({"sp", "bacterium", "archaeon", "metagenome", "endosymbiont", "symbiont"})
+_SILVA_GENUS_DEPTH = 6  # domain;phylum;class;order;family;genus
 
 
 @dataclass(frozen=True)
@@ -204,7 +212,12 @@ def parse_gtdb_ssu_header(header: str) -> tuple[str, str, tuple[str, ...]]:
 
 
 def parse_silva_header(header: str) -> tuple[str, tuple[str, ...]]:
-    """Return the accession and lineage (organism name dropped) from a SILVA SSU header.
+    """Return the accession and lineage from a SILVA SSU header.
+
+    The organism name becomes a species rank ``<genus> <epithet>`` below a Bacteria/Archaea
+    genus when it is a binomial, and is dropped otherwise. The genus comes from the lineage,
+    so synonyms fold into it (``[Clostridium] bolteae`` under Enterocloster is
+    ``Enterocloster bolteae``).
 
     Raises:
         ValueError: If the header has no lineage above the organism name.
@@ -215,7 +228,13 @@ def parse_silva_header(header: str) -> tuple[str, tuple[str, ...]]:
         raise ValueError(f"SILVA header has no lineage: {header!r}")
     if "|" in accession:
         raise ValueError(f"SILVA accession cannot contain '|': {accession!r}")
-    return accession, parse_taxonomy(";".join(fields[:-1]), 1)
+    lineage = parse_taxonomy(";".join(fields[:-1]), 1)
+    name = fields[-1].split()
+    if (lineage[0] in ("Bacteria", "Archaea") and len(lineage) == _SILVA_GENUS_DEPTH
+            and len(name) >= 2 and _GENUS_WORD.match(name[0]) and _EPITHET.match(name[1])
+            and name[1] not in _NOT_EPITHETS):
+        lineage += (f"{lineage[-1]} {name[1]}",)
+    return accession, lineage
 
 
 def output_paths(prefix: Path) -> tuple[Path, Path]:
@@ -472,24 +491,33 @@ def demo() -> None:
             ">AB000001.1.1500 Bacteria;Bacillota;Bacilli;Bacillus;Bacillus subtilis\n"
             "acgu\nuuaa\n"
             ">AB000002.1.1400 Bacteria;Bacillota;uncultured bacterium\nUGCA\n"
+            ">AB000003.1.1450 Bacteria;Bacillota;Clostridia;Lachnospirales;Lachnospiraceae;"
+            "Enterocloster;[Clostridium] bolteae\nACGU\n"
+            ">AB000004.1.1450 Bacteria;Bacillota;Bacilli;Lactobacillales;Streptococcaceae;"
+            "Streptococcus;Streptococcus sp. X\nACGU\n"
         )
         silva_fasta, silva_tax, silva_count = build_silva_ssu_database(
             root / "silva.fasta", root / "silva_database"
         )
-        _require(silva_count == 2, "SILVA demo wrote the wrong record count")
+        _require(silva_count == 4, "SILVA demo wrote the wrong record count")
         _require(
             silva_fasta.read_text().splitlines()
-            == [">AB000001.1.1500|0|AB000001.1.1500", "ACGTTTAA",
-                ">AB000002.1.1400|0|AB000002.1.1400", "TGCA"],
+            [:4] == [">AB000001.1.1500|0|AB000001.1.1500", "ACGTTTAA",
+                     ">AB000002.1.1400|0|AB000002.1.1400", "TGCA"],
             "SILVA demo headers or U->T conversion are wrong",
         )
         silva_lines = silva_tax.read_text().splitlines()
-        _require(silva_lines[2] == "#levels: Taxonomy_1 Taxonomy_2 Taxonomy_3 Taxonomy_4",
+        _require(silva_lines[2] == "#levels: " + " ".join(f"Taxonomy_{i}" for i in range(1, 8)),
                  "SILVA demo levels are wrong")
         _require(silva_lines[3] == "AB000001.1.1500|0|AB000001.1.1500\t"
-                 "Bacteria;Bacillota;Bacilli;Bacillus", "SILVA demo kept the organism name")
-        _require(silva_lines[4].endswith("\tBacteria;Bacillota;unclassified;unclassified"),
+                 "Bacteria;Bacillota;Bacilli;Bacillus;unclassified;unclassified;unclassified",
+                 "SILVA demo kept the organism name above genus depth")
+        _require(silva_lines[4].endswith("\tBacteria;Bacillota" + ";unclassified" * 5),
                  "SILVA demo did not pad the shallow lineage")
+        _require(silva_lines[5].endswith(";Lachnospiraceae;Enterocloster;Enterocloster bolteae"),
+                 "SILVA demo did not add the species under the lineage's genus")
+        _require(silva_lines[6].endswith(";Streptococcus;unclassified"),
+                 "SILVA demo took 'sp.' as a species epithet")
         (root / "silva_dup.fasta").write_text(">A.1.9 Bacteria;x;y\nACGT\n>A.1.9 Bacteria;x;y\nACGT\n")
         (root / "silva_bare.fasta").write_text(">A.1.9 Bacillus subtilis\nACGT\n")
         _expect_value_error(
