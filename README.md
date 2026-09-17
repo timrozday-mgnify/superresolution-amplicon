@@ -171,8 +171,11 @@ Each source sequence receives a header such as
 #### A generic database from SILVA SSU
 
 SILVA has no genomes, so each sequence is its own reference, `accession|0|accession`.
-The builder converts RNA `U` to `T`, drops the organism name that ends each SILVA lineage,
-and pads shallower lineages with `unclassified`. Use Ref NR99. The `.tax` it writes is the
+The builder converts RNA `U` to `T` and pads shallower lineages with `unclassified`. SILVA
+has no species rank, so the organism name that ends each lineage becomes one under a
+Bacteria/Archaea genus when it is a binomial (`…;Enterocloster;Enterocloster bolteae`, the
+genus taken from the lineage), and is dropped otherwise (`sp.`, `uncultured bacterium`).
+About a quarter of NR99 sequences get a species. Use Ref NR99. The `.tax` it writes is the
 real lineage, so pass it as `--taxonomy`:
 
 ```bash
@@ -423,8 +426,8 @@ A panel entry can be a taxon instead of a genome (`--panel_taxa`, alone or with
 
 ```
 id	taxon
-bacteroides	Bacteria;Bacteroidota;Bacteroidia;Bacteroidales;Bacteroidaceae;Bacteroides
-streptococcus	Streptococcus
+bacteroides_fragilis	Bacteria;Bacteroidota;Bacteroidia;Bacteroidales;Bacteroidaceae;Bacteroides;Bacteroides fragilis
+streptococcus_salivarius	Streptococcus salivarius
 ```
 
 `taxon` is a lineage prefix of `--taxonomy`, matched at `;` boundaries, or a bare name that
@@ -438,11 +441,13 @@ group whose sequences fall under two unnested taxa is shared by both, which then
 
 `inferred_composition.csv` is per entry, with intervals and `presence_prob` from summed
 posterior draws; the fitted members (`<entry>::<v4g>`) are in
-`<id>.inferred_panel_members.csv`. **Not usable at genus scale yet:** against SILVA NR99
-a genus is hundreds to thousands of V4 groups, and inference over more than a few hundred
-members collapses to a near-uniform composition (entry TV 0.21–0.35, `model_misfit` on
-every sample; [dev/panel_silva_sweep.md](dev/panel_silva_sweep.md)). SILVA has no species
-rank, so a taxon entry is genus-resolution at best.
+`<id>.inferred_panel_members.csv`. **Use species taxa only.** Against SILVA NR99 a species
+is 1–24 V4 groups, and a panel of 20 species plus two genomes scores genome TV 0.034
+(horseshoe) / 0.039 (no gate) with no misfit, against 0.030 for the same genomes as genome
+entries; the presence gate misfits on half the samples. A genus is hundreds to thousands of
+groups, and inference over more than a few hundred members collapses to a near-uniform
+composition (entry TV 0.21–0.35, `model_misfit` on every sample). Both in
+[dev/panel_silva_sweep.md](dev/panel_silva_sweep.md).
 
 Containers: `--sra_skiver_tag` (default `latest`), `--mapseq_tag` (default
 `2.1.1b--hc47f52e_1`). Resources: `--max_cpus`, `--max_memory`, `--max_time`.
