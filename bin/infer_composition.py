@@ -601,14 +601,42 @@ IDENTIFIABLE_TV = 0.01   # genomes whose label distributions are closer than thi
 
 
 def _panel_identifiability(K: sparse.csr_array, genome_of_row: np.ndarray,
-                           weight: np.ndarray, n_genomes: int) -> np.ndarray:
-    """Per genome, whether its label distribution ``T·K`` is TV >= 0.01 from every other's."""
-    rows = sparse.csr_array((weight, (genome_of_row, np.arange(len(weight)))),
-                            shape=(n_genomes, K.shape[0])) @ K
-    dense = rows[:, np.unique(rows.nonzero()[1])].toarray()
-    tv = 0.5 * np.abs(dense[:, None, :] - dense[None, :, :]).sum(axis=2)
-    np.fill_diagonal(tv, np.inf)
-    return tv.min(axis=1) >= IDENTIFIABLE_TV
+                           weight: np.ndarray, entry_of: np.ndarray) -> np.ndarray:
+    """Per entry, whether every member's label distribution ``T·K`` is TV >= 0.01 from
+    every member of every *other* entry. Members of one taxon entry may collide freely:
+    only their sum is reported.
+
+    A taxon panel has thousands of members, so pairs are not enumerated. TV(a, b) < 0.01
+    needs ``|a_l - b_l| < 0.02`` on every label, in particular on ``a``'s largest one, so
+    only members with more than ``max(a) - 0.02`` there are compared with ``a``.
+    """
+    n_members = len(entry_of)
+    n_entries = int(entry_of.max()) + 1 if n_members else 0
+    rows = sparse.csr_array(sparse.csr_array(
+        (weight, (genome_of_row, np.arange(len(weight)))),
+        shape=(n_members, K.shape[0])) @ K)
+    rows = sparse.csr_array(sparse.diags_array(1.0 / rows.sum(axis=1)) @ rows)
+    top_label = np.asarray(rows.argmax(axis=1)).ravel()
+    top_mass = rows.max(axis=1).toarray().ravel()
+    at_top = rows[:, top_label].tocoo()       # [j, i] = member j's mass on i's top label
+    near = at_top.data > top_mass[at_top.col] - 2 * IDENTIFIABLE_TV
+    j, i = at_top.row[near], at_top.col[near]
+    other = entry_of[j] != entry_of[i]
+    j, i = j[other], i[other]
+    ok = np.ones(n_entries, dtype=bool)
+    if len(i):
+        tv = 0.5 * np.asarray(abs(rows[i] - rows[j]).sum(axis=1)).ravel()
+        close = tv < IDENTIFIABLE_TV
+        ok[np.unique(entry_of[np.concatenate([i[close], j[close]])])] = False
+    return ok
+
+
+def _panel_entries(members: list[str]) -> tuple[list[str], np.ndarray]:
+    """Entry ids in first-seen order and each member's entry index. A taxon member is
+    ``<entry>::<v4g>`` (``build_panel_kernel.py``); a genome is its own entry."""
+    entry_ids = list(dict.fromkeys(m.split("::", 1)[0] for m in members))
+    position = {e: i for i, e in enumerate(entry_ids)}
+    return entry_ids, np.array([position[m.split("::", 1)[0]] for m in members], dtype=np.int64)
 
 
 def run_panel(a) -> None:
@@ -681,15 +709,32 @@ def run_panel(a) -> None:
     fit_status = "low_depth" if low_depth else "ok"
     out = a.output_dir
     out.mkdir(parents=True, exist_ok=True)
-    _uncertainty_outputs(a, list(genomes), draws, total)     # panel ids carry no lineage
+    # Report per entry. Interval ends come from summed draws, not summed member intervals;
+    # members are independent under the mean-field presence guide, so an entry is present
+    # unless every member is absent.
+    to_entry = np.eye(len(c.entries))[c.entry_of]                  # members x entries
+    entry_draws = draws @ to_entry
+    entry_lo = entry_hi = np.full(len(c.entries), np.nan)
+    if len(entry_draws) > 1:
+        entry_lo, entry_hi = np.quantile(entry_draws, [0.05, 0.95], axis=0)
+    absent = np.ones(len(c.entries))
+    np.multiply.at(absent, c.entry_of, 1.0 - presence)
+    _uncertainty_outputs(a, list(c.entries), entry_draws, total)   # panel ids carry no lineage
     pd.DataFrame({
-        "sample": a.sample_id, "genome_id": genomes,
-        "observed_rel_abundance": theta_obs, "inferred_mean": inferred,
-        "inferred_lo": lo, "inferred_hi": hi, "presence_prob": presence,
+        "sample": a.sample_id, "genome_id": c.entries,
+        "observed_rel_abundance": theta_obs @ to_entry, "inferred_mean": inferred @ to_entry,
+        "inferred_lo": entry_lo, "inferred_hi": entry_hi, "presence_prob": 1.0 - absent,
         "fit_status": fit_status,
         "resolution": [("identifiable" if ok else "not_identifiable") for ok in c.identifiable]
                       + ["background"],
     }).to_csv(out / "inferred_composition.csv", index=False)
+    if len(c.entries) < len(genomes):
+        pd.DataFrame({
+            "sample": a.sample_id, "genome_id": genomes,
+            "entry": np.asarray(c.entries)[c.entry_of],
+            "observed_rel_abundance": theta_obs, "inferred_mean": inferred,
+            "inferred_lo": lo, "inferred_hi": hi, "presence_prob": presence,
+        }).to_csv(out / "inferred_panel_members.csv", index=False)
     np.savez_compressed(
         out / "posterior_draws.npz", format_version=np.asarray("1"),
         infer_space=np.asarray("genome"), kernel_format=np.asarray("rectangular"),
@@ -714,7 +759,7 @@ def run_panel(a) -> None:
         "unexplained_fraction": float(inferred[G]),
         "observed_unexplained_fraction": float(y[-1] / total) if total else 0.0,
         "n_reads": total, "n_foreign_hits": c.n_foreign_hits, "min_infer_reads": min_infer_reads,
-        "n_genomes": G, "status": "no_reference_hits" if no_hits else fit_status,
+        "n_genomes": G, "n_entries": len(c.entries) - 1, "status": "no_reference_hits" if no_hits else fit_status,
         "fit_status": fit_status, "posterior_draw_count": len(draws),
         **{key: json.dumps(v) for key, v in diag.items()},
     }]).to_csv(out / "inference_diagnostics.csv", index=False)
@@ -730,8 +775,9 @@ def _panel_context(kernel_path: Path, amplicon_dir: Path, obs_mseq, min_identity
 
     Returns ``fitted`` (rows: one per (genome, source) pair, then background; columns:
     explained observed labels, at most one sink, then ``U``), ``home``, counts ``y`` over
-    those columns, ``genome_of_row``/``weight`` (compact ``T``), ``genomes`` (panel genomes
-    then ``background``), per-genome ``identifiable``, and counts for diagnostics.
+    those columns, ``genome_of_row``/``weight`` (compact ``T``), ``genomes`` (fitted panel
+    members then ``background``), ``entries`` (reported ids, ``background`` last) with each
+    member's ``entry_of`` index, per-entry ``identifiable``, and counts for diagnostics.
     """
     try:
         k = sm.read_kernel(kernel_path)
@@ -762,7 +808,8 @@ def _panel_context(kernel_path: Path, amplicon_dir: Path, obs_mseq, min_identity
     gpos = {g: i for i, g in enumerate(panel_genomes)}
     genome_of_row = np.append(table.genome_id.map(gpos).to_numpy(), G)   # + background
     weight = np.append(table.weight.to_numpy(dtype=np.float64), 1.0)
-    identifiable = _panel_identifiability(K, genome_of_row[:S], weight[:S], G)
+    entries, entry_of = _panel_entries(panel_genomes + ["background"])
+    identifiable = _panel_identifiability(K, genome_of_row[:S], weight[:S], entry_of[:G])
 
     # Observed reads per database label. A hit outside the kernel's database is a
     # different database, not background, so it is counted and warned about.
@@ -801,7 +848,8 @@ def _panel_context(kernel_path: Path, amplicon_dir: Path, obs_mseq, min_identity
     return SimpleNamespace(
         fitted=fitted, home=fitted_home, y=y, genome_of_row=genome_of_row, weight=weight,
         strata=strata, method=k.provenance.get("method", "simulate"),
-        genomes=panel_genomes + ["background"], identifiable=identifiable, n_rows=S,
+        genomes=panel_genomes + ["background"], entries=entries, entry_of=entry_of,
+        identifiable=identifiable, n_rows=S,
         n_sources=len(set(rows)), n_labels_observed=len(observed),
         n_labels_unexplained=len(unexplained), n_foreign_hits=foreign)
 

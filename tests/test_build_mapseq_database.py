@@ -62,6 +62,62 @@ def _write_fasta(path: Path, records: dict[str, str]) -> None:
             output_handle.write(f">{header}\n{sequence}\n")
 
 
+def _mapseq_top_hit(data_dir: Path, prefix: str) -> str:
+    """Classify ``query.fasta`` against ``<prefix>.{fasta,tax}`` in the pinned MAPseq image."""
+    container = subprocess.run(
+        [
+            "docker",
+            "create",
+            "--platform",
+            "linux/amd64",
+            "--entrypoint",
+            "/bin/sh",
+            MAPSEQ_IMAGE,
+            "-c",
+            "sleep 600",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    ).stdout.strip()
+    try:
+        subprocess.run(["docker", "start", container], check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["docker", "cp", f"{data_dir}/.", f"{container}:/data"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        result = subprocess.run(
+            [
+                "docker",
+                "exec",
+                container,
+                "mapseq",
+                "/data/query.fasta",
+                f"/data/{prefix}.fasta",
+                f"/data/{prefix}.tax",
+                "-nthreads",
+                "1",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    finally:
+        subprocess.run(
+            ["docker", "rm", "--force", container],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    hits = [line.split("\t") for line in result.stdout.splitlines() if line and not line.startswith("#")]
+    assert hits
+    return hits[0][1]
+
+
 def test_built_database_is_accepted_by_mapseq(tmp_path: Path) -> None:
     """Build a database and classify an identical query with MAPseq in its pinned image."""
     records = _read_fasta(ROOT / "tests" / "data" / "refs.fasta")
@@ -93,56 +149,24 @@ def test_built_database_is_accepted_by_mapseq(tmp_path: Path) -> None:
         check=True,
         cwd=tmp_path,
     )
-    container = subprocess.run(
-        [
-            "docker",
-            "create",
-            "--platform",
-            "linux/amd64",
-            "--entrypoint",
-            "/bin/sh",
-            MAPSEQ_IMAGE,
-            "-c",
-            "sleep 600",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=180,
-    ).stdout.strip()
-    try:
-        subprocess.run(["docker", "start", container], check=True, capture_output=True, text=True)
-        subprocess.run(
-            ["docker", "cp", f"{tmp_path}/.", f"{container}:/data"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        result = subprocess.run(
-            [
-                "docker",
-                "exec",
-                container,
-                "mapseq",
-                "/data/query.fasta",
-                "/data/references.fasta",
-                "/data/references.tax",
-                "-nthreads",
-                "1",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-    finally:
-        subprocess.run(
-            ["docker", "rm", "--force", container],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+    assert _mapseq_top_hit(tmp_path, "references") == f"genomeA|0|{query_id}"
 
-    hits = [line.split("\t") for line in result.stdout.splitlines() if line and not line.startswith("#")]
-    assert hits
-    assert hits[0][1] == f"genomeA|0|{query_id}"
+
+def test_silva_database_is_accepted_by_mapseq(tmp_path: Path) -> None:
+    """A SILVA-form database (RNA input, uneven lineage depths, no genome level) maps."""
+    records = list(_read_fasta(ROOT / "tests" / "data" / "refs.fasta").values())
+    lineages = [
+        "Bacteria;Bacteroidota;Bacteroidia;Bacteroides;Bacteroides fragilis",
+        "Bacteria;Bacillota;uncultured bacterium",
+    ]
+    with (tmp_path / "silva.fasta").open("w") as handle:
+        for index, sequence in enumerate(records):
+            handle.write(f">ACC{index}.1.1500 {lineages[index % 2]}\n{sequence.replace('T', 'U')}\n")
+    _write_fasta(tmp_path / "query.fasta", {"query": records[0]})
+
+    subprocess.run(
+        [sys.executable, str(BUILDER), "--silva-fasta", "silva.fasta", "--output-prefix", "silva_db"],
+        check=True,
+        cwd=tmp_path,
+    )
+    assert _mapseq_top_hit(tmp_path, "silva_db") == "ACC0.1.1500|0|ACC0.1.1500"

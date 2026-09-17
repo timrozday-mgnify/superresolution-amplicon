@@ -17,6 +17,7 @@ process INFER_COMPOSITION {
     tuple val(meta), path("${meta.id}.ambiguity_pairs.csv"), optional: true, emit: ambiguity_pairs
     tuple val(meta), path("${meta.id}.ambiguity_sets.csv"),  optional: true, emit: ambiguity_sets
     tuple val(meta), path("${meta.id}.lca_composition.csv"), optional: true, emit: lca_composition
+    tuple val(meta), path("${meta.id}.inferred_panel_members.csv"), optional: true, emit: panel_members
     path "versions.yml",                                             emit: versions
 
     when:
@@ -47,6 +48,7 @@ process INFER_COMPOSITION {
     [ -f out/ambiguity_pairs.csv ] && cp out/ambiguity_pairs.csv ${prefix}.ambiguity_pairs.csv || true
     [ -f out/ambiguity_sets.csv ] && cp out/ambiguity_sets.csv ${prefix}.ambiguity_sets.csv || true
     [ -f out/lca_composition.csv ] && cp out/lca_composition.csv ${prefix}.lca_composition.csv || true
+    [ -f out/inferred_panel_members.csv ] && cp out/inferred_panel_members.csv ${prefix}.inferred_panel_members.csv || true
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":

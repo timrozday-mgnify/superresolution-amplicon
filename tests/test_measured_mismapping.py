@@ -345,6 +345,7 @@ def test_panel_kernel_prepare_and_build(tmp_path: Path) -> None:
     db = _amplicons(tmp_path / "amplicons.fasta")
     prep = tmp_path / "prep"
     bpk.prepare(SimpleNamespace(panel_amplicons=panel, db_amplicons=db, out=prep, alias=[],
+                                panel_taxa=None, db_taxonomy=None, max_taxon_sources=200,
                                 fwd_primer=si.DEFAULT_FWD_PRIMER,
                                 rev_primer=si.DEFAULT_REV_PRIMER, max_mismatch=2))
 

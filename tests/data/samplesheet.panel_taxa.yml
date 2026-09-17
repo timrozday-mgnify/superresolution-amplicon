@@ -1,0 +1,11 @@
+- id: taxa_only
+  reads: tests/data/sample.fastq.gz
+  platform: hq-illumina
+  references: tests/data/refs.fasta
+  panel_taxa: tests/data/panel_taxa.tsv
+- id: mixed
+  reads: tests/data/sample.fastq.gz
+  platform: hq-illumina
+  references: tests/data/refs.fasta
+  panel_references: tests/data/refs.fasta
+  panel_taxa: tests/data/panel_taxa.tsv

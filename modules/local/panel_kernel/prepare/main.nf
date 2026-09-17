@@ -1,5 +1,5 @@
-// Cut a genome panel's V4 copies into distinct sources (v4g_<sha16>) and the genome ->
-// source translation. The sources are then mapped (home labels) and simulated from against
+// Cut a panel into distinct sources (v4g_<sha16>) and the entry -> source translation:
+// a genome entry's V4 copies, or every database V4 group under a taxon entry's lineage. The sources are then mapped (home labels) and simulated from against
 // the sample's generic database, the same way the real reads are.
 process PANEL_PREPARE {
     tag "$meta.id"
@@ -8,7 +8,8 @@ process PANEL_PREPARE {
     container "ghcr.io/timrozday-mgnify/sra-skiver:${params.sra_skiver_tag}"
 
     input:
-    tuple val(meta), path(panel), path(db_amplicons)
+    tuple val(meta), path(panel), path(panel_taxa), path(db_amplicons)
+    path taxonomy   // the database's MAPseq .tax; [] unless the panel has taxa
 
     output:
     tuple val(meta), path("${meta.id}_prepared"),               emit: prepared
@@ -20,9 +21,11 @@ process PANEL_PREPARE {
 
     script:
     def args = task.ext.args ?: ''
+    def panel_arg = panel ? "--panel-amplicons ${panel}" : ''
+    def taxa_arg = panel_taxa ? "--panel-taxa ${panel_taxa} --db-taxonomy ${taxonomy}" : ''
     """
     build_panel_kernel.py prepare \\
-        --panel-amplicons ${panel} \\
+        ${panel_arg} ${taxa_arg} \\
         --db-amplicons ${db_amplicons} \\
         -o ${meta.id}_prepared \\
         $args
