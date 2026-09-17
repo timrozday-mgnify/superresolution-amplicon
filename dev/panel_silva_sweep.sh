@@ -29,7 +29,7 @@ for m in trained_s0 cal; do map work/panel_kernel/sim_$m.fasta $S/sim/sim_$m.mse
 # 3. Panels, their home labels, and simulated reads for the taxon sources (flat, calibrated;
 #    1,000 per source rather than 5,000: 9,100 sources).
 [ -s $S/taxa/sim_sources.fasta ] || python dev/panel_silva_sweep.py prepare --silva $S
-for p in genome taxa; do map $S/$p/sources.fasta $S/$p/home.mseq; done
+for p in genome taxa species; do map $S/$p/sources.fasta $S/$p/home.mseq; done
 if [ ! -s $S/sim/sim_taxa_cal.mseq ]; then
     python - "$S" <<'PY'
 import sys
@@ -60,4 +60,6 @@ kernel genome trained_s0 $S/sim/sim_trained_s0.mseq
 kernel genome cal $S/sim/sim_cal.mseq
 [ -s $S/sim/sim_taxa_all_cal.mseq ] || cat $S/sim/sim_cal.mseq $S/sim/sim_taxa_cal.mseq > $S/sim/sim_taxa_all_cal.mseq
 kernel taxa cal $S/sim/sim_taxa_all_cal.mseq
+# Species sources are a subset of the genus panel's, so they reuse its simulated reads.
+kernel species cal $S/sim/sim_taxa_all_cal.mseq
 echo "kernels built"

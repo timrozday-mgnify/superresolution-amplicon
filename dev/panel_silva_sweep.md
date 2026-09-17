@@ -13,8 +13,10 @@ benchmark's BAM, because the sweep directory with `truth.tsv` is not on this mac
 two truths differ slightly: GTDB trained/no gate is TV 0.0127 here against 0.0149 in the
 Phase 5 table. Compare rows within this file only.
 
-Entry TV scores every fit over the taxon panel's entries: the *B. uniformis* pair as
-genomes and the other 20 genomes rolled up into their 17 SILVA genera. BU split is the
+Entry TV scores every fit over the genus panel's entries: the *B. uniformis* pair as
+genomes and the other 20 genomes rolled up into their 17 SILVA genera. The **species panel**
+keeps the pair as genomes and makes each other genome a taxon entry for its SILVA species, so
+it scores per genome like the genome panel. BU split is the
 error in strain2's share of the pair, per entry.
 
 ## Database
@@ -41,10 +43,14 @@ error in strain2's share of the pair, per entry.
 | SILVA genome panel, calibrated flat, no gate | 0.0300 / 0.038 | 0.0291 / 0.037 | 0.096 / 0.630 | 0/20 |
 | GTDB, home labels only, no gate | 0.0336 / 0.034 | 0.0336 / 0.034 | 0.007 / 0.025 | 0/20 |
 | SILVA genome panel, home labels only, no gate | 0.0482 / 0.050 | 0.0461 / 0.048 | 0.185 / 0.709 | 0/20 |
-| SILVA **taxon panel**, calibrated flat, gate | – | 0.2727 / 0.291 | 0.265 / 0.405 | **20/20** |
-| SILVA taxon panel, calibrated flat, no gate | – | 0.3504 / 0.357 | 0.275 / 0.720 | 20/20 |
-| SILVA taxon panel, calibrated flat, horseshoe | – | 0.3133 / 0.376 | 0.428 / 0.503 | 20/20 |
-| SILVA taxon panel, home labels only, horseshoe | – | 0.2066 / 0.225 | 0.445 / 0.487 | 20/20 |
+| SILVA **species panel**, calibrated flat, horseshoe | 0.0340 / 0.047 | 0.0322 / 0.046 | 0.191 / 0.984 | 0/20 |
+| SILVA species panel, calibrated flat, no gate | 0.0386 / 0.048 | 0.0368 / 0.048 | 0.098 / 0.662 | 0/20 |
+| SILVA species panel, calibrated flat, gate | 0.0418 / 0.055 | 0.0391 / 0.054 | 0.205 / 0.981 | 10/20 |
+| SILVA species panel, home labels only, horseshoe | 0.0460 / 0.054 | 0.0448 / 0.052 | 0.172 / 0.968 | 0/20 |
+| SILVA **genus panel**, calibrated flat, gate | – | 0.2727 / 0.291 | 0.265 / 0.405 | **20/20** |
+| SILVA genus panel, calibrated flat, no gate | – | 0.3504 / 0.357 | 0.275 / 0.720 | 20/20 |
+| SILVA genus panel, calibrated flat, horseshoe | – | 0.3133 / 0.376 | 0.428 / 0.503 | 20/20 |
+| SILVA genus panel, home labels only, horseshoe | – | 0.2066 / 0.225 | 0.445 / 0.487 | 20/20 |
 
 1. **A genome panel over SILVA NR99 works, but about twice as badly as over GTDB** (best
    0.024 against 0.013 genome TV), once the simulated reads are trimmed (finding 2). The
@@ -91,12 +97,29 @@ error in strain2's share of the pair, per entry.
      54-member fit tracks truth on every entry it kept.
    - MLE is worse (entry TV 0.77): the α < 1 Dirichlet density is unbounded at the
      simplex boundary.
-4. **Seven Lachnospiraceae genera are `not_identifiable` on every sample**
+4. **Taxon panels work at species scale.** SILVA has no species rank, so
+   `work/silva/species/silva_nr99_species.tax` adds one (`panel_silva_sweep.species_taxonomy`):
+   a genus-level Bacteria/Archaea lineage gains `<genus> <epithet>` when the organism name
+   is a binomial (not `sp.`, `bacterium`, `uncultured …`). 119,124 of 510,495 NR99
+   sequences get one; synonyms fold into the SILVA genus (*[Clostridium] bolteae* →
+   *Enterocloster bolteae*). The 20 species resolve to 1–24 V4 groups each (84 members plus
+   the pair's 4 sources, against 8,587 at genus), all already simulated for the genus panel.
+   - Genome TV 0.034 (horseshoe) and 0.039 (no gate), 0/20 misfits, against 0.029–0.031
+     for the genome panel with the same calibrated flat kernel: about 0.005 lost to spreading
+     each species over its groups.
+   - The gate misfits on 10/20, as at genome level with fewer members; use no gate or
+     horseshoe.
+   - Home labels only without the gate collapses (0.170), unlike the genome panel (0.048):
+     members that share a home label are not identifiable without the kernel, and the
+     horseshoe (0.046) is what holds them.
+   - Not measured with the trained kernel (the model is not on this machine), which is worth
+     another ~0.006 on the genome panel.
+5. **Seven Lachnospiraceae genera are `not_identifiable` on every sample**
    (*Agathobacter, Coprococcus, Dorea, Enterocloster, Lachnoclostridium, Roseburia,
    [Ruminococcus] gnavus group*): NR99 V4 groups whose sequences span these genera are
    shared sources (rule 2). Even with working inference, V4 does not separate these genera
    in SILVA.
-5. **SILVA data issues found on the way**, now handled in `build_panel_kernel.py prepare`:
+6. **SILVA data issues found on the way**, now handled in `build_panel_kernel.py prepare`:
    587 of 9,126 genus groups contain an ambiguous base, and 15 of them get no MAPseq hit at
    all, which fails `PANEL_KERNEL` ("no home label"). Taxon sources now exclude groups with
    any non-ACGT base.
@@ -105,9 +128,12 @@ error in strain2's share of the pair, per entry.
 
 - ~~Fix read prep for simulated reads~~ done (`--trim-primers`, finding 2). Confirm it by
   resimulating the panel with `sc2200627.model.pt` where that model lives.
-- Do not start benchmark Phase 4 (`generic_taxa` arm). Taxon entries are correct at the
-  prepare/aggregation level (unit tests) but inference does not scale past a few hundred
-  members. Options, in order of cost:
+- Benchmark Phase 4 is limited to **species** taxon entries (finding 4). Genus entries stay
+  unsupported: inference does not scale past a few hundred members. Species entries need a
+  species rank in the database `.tax`; `build_mapseq_database.py --silva-fasta` now writes
+  it, with the same rule (the sweep's `species_taxonomy` calls its header parser and
+  reproduces the file these results used). If broader taxa are needed later, options in
+  order of cost:
   1. Collapse each taxon's members that share a MAPseq home label into one member with a
      read-weighted kernel row (members with the same home are nearly indistinguishable
      anyway).
