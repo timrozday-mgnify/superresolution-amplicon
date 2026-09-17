@@ -1,0 +1,4 @@
+run	columns_ok	columns	rows_read	same_dbhit_as_aap	changed_same_v4	changed_no_amplicon	changed_different_v4
+aap_build_aap_args	True	15	517399	1.00000	0.00000	0.00000	0.00000
+sr_build_aap_args	True	15	517399	1.00000	0.00000	0.00000	0.00000
+sr_build_sr_default_args	True	38	517399	0.79813	0.16844	0.00536	0.02807
