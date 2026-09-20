@@ -74,11 +74,21 @@ _COMP = str.maketrans("ACGTRYSWKMBDHVN", "TGCAYRSWMKVHDBN")
 # ── FASTA / headers / primers ────────────────────────────────────────────────
 
 
+# SILVA and other rRNA references ship in the RNA alphabet, whose U never matches the T
+# in a primer or a read - in-silico PCR then yields zero amplicons across millions of
+# entries. Fold it here, where every FASTA in the pipeline is read, and say so once.
+_RNA_TO_DNA = str.maketrans("U", "T")
+
+
 def read_fasta(path: Path) -> list[tuple[str, str]]:
-    """Return ``[(header, sequence)]``; header is the full id line (sans '>')."""
+    """Return ``[(header, sequence)]``; header is the full id line (sans '>').
+
+    Sequences are upper-cased, and an RNA alphabet is folded to DNA (U -> T) with a
+    warning, so RNA references behave like the DNA ones the primers are written for."""
     opener = gzip.open if str(path).endswith(".gz") else open
     records: list[tuple[str, str]] = []
     header, chunks = None, []
+    rna = False
     with opener(path, "rt") as fh:
         for line in fh:
             if line.startswith(">"):
@@ -86,9 +96,15 @@ def read_fasta(path: Path) -> list[tuple[str, str]]:
                     records.append((header, "".join(chunks)))
                 header, chunks = line[1:].strip().split()[0], []
             else:
-                chunks.append(line.strip().upper())
+                chunk = line.strip().upper()
+                if "U" in chunk:
+                    rna = True
+                    chunk = chunk.translate(_RNA_TO_DNA)
+                chunks.append(chunk)
     if header is not None:
         records.append((header, "".join(chunks)))
+    if rna:
+        log.warning("%s contains RNA sequence (U); folded U -> T so primers can match", path)
     return records
 
 
@@ -205,7 +221,11 @@ def stage_amplicons(args) -> None:
             amplicons.append(amp)
             genomes_of.append(genome_of_header(header))
     if not refseqs:
-        raise SystemExit("no reference produced an amplicon; check primers / DB fasta")
+        raise SystemExit(
+            f"no reference produced an amplicon in {len(records)} entries of {args.db_fasta}; "
+            f"check that the primers ({args.fwd_primer} / {args.rev_primer}) target the "
+            "region the DB fasta covers, and that its entries are full-length (not already "
+            "primer-trimmed) sequences")
     log.info("%d/%d entries amplifiable", len(refseqs), len(records))
 
     genomes = sorted(set(genomes_of))
