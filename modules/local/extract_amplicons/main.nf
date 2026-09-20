@@ -28,6 +28,7 @@ process EXTRACT_AMPLICONS {
     subspecies_infer.py amplicons \\
         --db-fasta ${references} \\
         -o ${prefix}_amplicons \\
+        --threads ${task.cpus} \\
         $args
 
     cat <<-END_VERSIONS > versions.yml
