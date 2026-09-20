@@ -59,3 +59,13 @@ def test_all_unamplifiable_still_fails(tmp_path: Path) -> None:
     panel = _panel(tmp_path, {"gA|0|partial": good[400:]})
     with pytest.raises(SystemExit):
         bpk.panel_copies(panel, FWD, REV, 3, {})
+
+
+def test_rna_reference_is_folded_to_dna(tmp_path: Path, caplog) -> None:
+    """SILVA ships RNA; U must fold to T or no primer ever matches."""
+    seq, v4 = _ssu()
+    rna = _panel(tmp_path, {"gA|0|silva": seq.replace("T", "U")})
+    with caplog.at_level("WARNING"):
+        records = si.read_fasta(rna)
+    assert "RNA" in caplog.text
+    assert si.extract_v4(records[0][1], FWD, REV, 3) == v4
