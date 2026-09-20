@@ -69,3 +69,23 @@ def test_rna_reference_is_folded_to_dna(tmp_path: Path, caplog) -> None:
         records = si.read_fasta(rna)
     assert "RNA" in caplog.text
     assert si.extract_v4(records[0][1], FWD, REV, 3) == v4
+
+
+def test_batched_extraction_matches_the_per_sequence_scan() -> None:
+    """The vectorised whole-DB path must be the per-sequence scan, only faster."""
+    rng = random.Random(7)
+    seqs = []
+    for seed in range(12):
+        good, _ = _ssu(seed)
+        seqs += [good,                                     # plus strand
+                 si.revcomp(good),                         # minus strand
+                 good[400:],                               # truncated past the fwd site
+                 good[:100] + "N" * 30 + good[130:],       # ambiguous bases
+                 "".join(rng.choice("ACGT") for _ in range(rng.randint(200, 1800)))]
+    expected = [si.extract_v4(s, FWD, REV, 3) for s in seqs]
+    assert any(expected) and not all(expected), "fixture must mix hits and misses"
+    assert si.extract_v4_all(seqs, FWD, REV, 3, progress=False) == expected
+    assert si.extract_v4_all(seqs, FWD, REV, 3, threads=2, progress=False) == expected
+    # Batch boundaries must not change any call.
+    assert [a for b in si._batches(seqs, max_cells=4000) for a in
+            si.extract_v4_batch(b, FWD, REV, 3)] == expected

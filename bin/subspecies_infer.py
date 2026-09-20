@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import logging
+import multiprocessing
 from collections import Counter
 from pathlib import Path
 
@@ -162,6 +163,103 @@ def _amplify(seq: str, fwd: str, rev: str, max_mismatch: int) -> str | None:
     return amplicon or None
 
 
+# ── vectorised in-silico PCR (whole-DB scale) ────────────────────────────────
+
+# The per-sequence scan above is fine for a read or a panel, but a reference DB is
+# millions of entries and a python-level window scan costs ~1 ms each (worse for a
+# non-amplifiable entry, which scans both strands in full). The functions below do the
+# same scan one batch of sequences at a time, in numpy: ~20x, and the results are
+# identical (`tests/test_extract_v4.py` asserts that).
+
+_CODE = np.full(256, 4, np.uint8)          # non-ACGT (and padding) matches no primer base
+for _i, _base in enumerate(b"ACGT"):
+    _CODE[_base] = _i
+
+
+def _primer_mask(primer: str) -> np.ndarray:
+    """``(len(primer), 5)`` bool: the base codes each IUPAC primer position accepts."""
+    mask = np.zeros((len(primer), 5), bool)
+    for j, char in enumerate(primer):
+        for base in _IUPAC.get(char, "ACGT"):
+            mask[j, "ACGT".index(base)] = True
+    return mask
+
+
+def _first_match(codes: np.ndarray, mask: np.ndarray, max_mismatch: int,
+                 min_start: np.ndarray | None = None) -> np.ndarray:
+    """Per row of ``codes``, the earliest window index matching ``mask`` within the
+    mismatch budget (at or after ``min_start``), or -1 — ``_find_primer``, vectorised."""
+    lp, width = len(mask), codes.shape[1] - len(mask) + 1
+    if width <= 0:
+        return np.full(len(codes), -1)
+    mismatches = np.zeros((len(codes), width), np.uint8)
+    for j in range(lp):
+        mismatches += ~mask[j][codes[:, j:j + width]]
+    ok = mismatches <= max_mismatch
+    if min_start is not None:
+        ok &= np.arange(width) >= min_start[:, None]
+    return np.where(ok.any(1), ok.argmax(1), -1)
+
+
+def _amplify_batch(seqs: list[str], fwd: str, rev: str, max_mismatch: int) -> list[str | None]:
+    """``_amplify`` over a batch of same-orientation sequences."""
+    codes = np.full((len(seqs), max(map(len, seqs))), 4, np.uint8)
+    for i, seq in enumerate(seqs):
+        codes[i, :len(seq)] = _CODE[np.frombuffer(seq.encode(), np.uint8)]
+    f = _first_match(codes, _primer_mask(fwd), max_mismatch)
+    # A row without a forward hit gets a start past every window, so it finds no reverse.
+    starts = np.where(f < 0, codes.shape[1], f + len(fwd))
+    r = _first_match(codes, _primer_mask(revcomp(rev)), max_mismatch, min_start=starts)
+    return [seqs[i][starts[i]:r[i]] or None if r[i] >= 0 else None for i in range(len(seqs))]
+
+
+def extract_v4_batch(seqs: list[str], fwd: str, rev: str, max_mismatch: int) -> list[str | None]:
+    """``extract_v4`` over a batch: the minus strand is retried for the misses only."""
+    out = _amplify_batch(seqs, fwd, rev, max_mismatch)
+    misses = [i for i, amp in enumerate(out) if amp is None]
+    if misses:
+        flipped = _amplify_batch([revcomp(seqs[i]) for i in misses], fwd, rev, max_mismatch)
+        for i, amp in zip(misses, flipped):
+            out[i] = amp
+    return out
+
+
+def _batches(seqs: list[str], max_cells: int = 4_000_000) -> list[list[str]]:
+    """Group sequences so each (padded) batch array stays near ``max_cells`` bytes."""
+    batches, batch, longest = [], [], 0
+    for seq in seqs:
+        if batch and (len(batch) + 1) * max(longest, len(seq)) > max_cells:
+            batches.append(batch)
+            batch, longest = [], 0
+        batch.append(seq)
+        longest = max(longest, len(seq))
+    return batches + ([batch] if batch else [])
+
+
+def _batch_worker(batch: list[str]) -> list[str | None]:
+    """``extract_v4_batch`` with the primers a pool was initialised with."""
+    return extract_v4_batch(batch, *_PRIMERS)
+
+
+def _init_worker(primers: tuple[str, str, int]) -> None:
+    global _PRIMERS
+    _PRIMERS = primers
+
+
+def extract_v4_all(seqs: list[str], fwd: str, rev: str, max_mismatch: int,
+                   threads: int = 1, progress: bool = True) -> list[str | None]:
+    """``extract_v4`` over a whole reference DB: batched, and forked over ``threads``."""
+    batches = _batches(seqs)
+    bar = lambda it: _progress(it, total=len(batches), desc="amplicons",  # noqa: E731
+                               unit="batch", enabled=progress)
+    _init_worker((fwd, rev, max_mismatch))
+    if threads <= 1:
+        return [amp for batch in bar(batches) for amp in _batch_worker(batch)]
+    with multiprocessing.Pool(threads, initializer=_init_worker,
+                              initargs=((fwd, rev, max_mismatch),)) as pool:
+        return [amp for out in bar(pool.imap(_batch_worker, batches)) for amp in out]
+
+
 def trim_read_primers(seq: str, fwd: str, rev: str, max_mismatch: int) -> str:
     """Return ``seq`` cut down to its primer-free amplicon, trying both orientations.
 
@@ -211,8 +309,10 @@ def stage_amplicons(args) -> None:
     amplicons: list[str] = []
     genomes_of: list[str] = []
     idx_rows: list[dict] = []
-    for header, seq in records:
-        amp = extract_v4(seq, args.fwd_primer, args.rev_primer, args.primer_mismatches)
+    all_amplicons = extract_v4_all([seq for _, seq in records], args.fwd_primer,
+                                   args.rev_primer, args.primer_mismatches,
+                                   threads=getattr(args, "threads", 1))
+    for (header, _), amp in zip(records, all_amplicons):
         amplifiable = amp is not None
         idx_rows.append({"refseq": header, "genome": genome_of_header(header),
                          "amplicon_len": len(amp) if amp else 0, "amplifiable": amplifiable})
@@ -1081,6 +1181,8 @@ def main() -> None:
     m.add_argument("--fwd-primer", default=DEFAULT_FWD_PRIMER)
     m.add_argument("--rev-primer", default=DEFAULT_REV_PRIMER)
     m.add_argument("--primer-mismatches", type=int, default=3)
+    m.add_argument("--threads", type=int, default=1,
+                   help="processes to extract amplicons over (default 1).")
     m.add_argument("-o", "--output-dir", type=Path)
     m.add_argument("--demo", action="store_true")
     m.add_argument("--verbose", "-v", action="store_true", help="DEBUG-level step logging")
