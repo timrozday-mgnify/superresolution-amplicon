@@ -1,4 +1,6 @@
 #!/usr/bin/env python
+# UNMAINTAINED: imports code removed with the square mis-mapping path (panel-only
+# pipeline). Kept as the record behind its .md; it no longer runs against bin/.
 """Which all-vs-all alignment backend should build ``M``?
 
 The tie-cluster kernel needs, for every reference, the set of references within ``tau``

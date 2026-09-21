@@ -1,4 +1,6 @@
 #!/usr/bin/env python
+# UNMAINTAINED: imports code removed with the square mis-mapping path (panel-only
+# pipeline). Kept as the record behind its .md; it no longer runs against bin/.
 """How much should an ambiguous reference be demoted inside its tie cluster?
 
 ``dev/alignment_mismapping.md`` found that mapseq is not ambiguity-agnostic: an N-bearing

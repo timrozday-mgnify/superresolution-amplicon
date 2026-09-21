@@ -1,4 +1,6 @@
 #!/usr/bin/env python
+# UNMAINTAINED: imports code removed with the square mis-mapping path (panel-only
+# pipeline). Kept as the record behind its .md; it no longer runs against bin/.
 """Benchmark sparse mis-mapping matrix generation on a reference FASTA.
 
 Each point uses a deterministic prefix of the supplied reference database, extracts

@@ -30,7 +30,7 @@ def test_ties_are_reported_and_cut_to_lca(tmp_path: Path) -> None:
     tax = tmp_path / "refs.tax"
     tax.write_text("#cutoff: 0.00:0 0.80:0 0.80:0\n#name: refdb\n#levels: Kingdom Genus Genome\n")
 
-    a = SimpleNamespace(sample_id="S", output_dir=tmp_path, taxonomy=tax, infer_space="genome")
+    a = SimpleNamespace(sample_id="S", output_dir=tmp_path, taxonomy=tax)
     infer_composition._uncertainty_outputs(a, ids, draws, n_reads, lineage_of)
 
     pairs = pd.read_csv(tmp_path / "ambiguity_pairs.csv")

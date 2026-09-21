@@ -1,3 +1,5 @@
+# UNMAINTAINED: imports code removed with the square mis-mapping path (panel-only
+# pipeline). Kept as the record behind its .md; it no longer runs against bin/.
 """Label observed reads without MAPseq: nearest distinct SILVA V4 amplicon by edit distance.
 
 Question (benchmark repo, SILVA sweep): MAPseq needs a `.mscluster` for the whole reference

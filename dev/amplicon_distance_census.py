@@ -1,4 +1,6 @@
 #!/usr/bin/env python
+# UNMAINTAINED: imports code removed with the square mis-mapping path (panel-only
+# pipeline). Kept as the record behind its .md; it no longer runs against bin/.
 """Step 1 of the alignment-based mis-mapping plan: can pairwise amplicon distance alone
 predict the mis-mapping matrix's diagonal?
 

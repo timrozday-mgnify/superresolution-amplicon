@@ -1,4 +1,6 @@
 #!/usr/bin/env python
+# UNMAINTAINED: imports code removed with the square mis-mapping path (panel-only
+# pipeline). Kept as the record behind its .md; it no longer runs against bin/.
 """Was a failed GTDB-scale fit the forward model's fault, or the inference's?
 
 Evidence §1–2 of ``docs/gtdb_inference_recovery_plan.md``. Both subcommands take an

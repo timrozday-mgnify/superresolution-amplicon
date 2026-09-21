@@ -16,8 +16,9 @@ nextflow_pipeline {
         then {
             assertAll(
                 { assert workflow.success },
-                // 1 sample: extraction, reference fingerprinting, observed mapping,
-                // a canonical matrix build/publish path, inference, and fit check = 12.
+                // 1 sample, whole-database panel: extraction, clustering, observed mapping,
+                // matrix key, panel prepare, home map, simulate, simulated map, kernel,
+                // inference, fit check and reads-to-fasta = 12.
                 // No SKIVER_*: the error model is only used by the read simulator.
                 { assert workflow.trace.succeeded().size() == 12 },
                 { assert workflow.trace.tasks().every { !it.name.contains('SKIVER') } },
@@ -31,28 +32,7 @@ nextflow_pipeline {
         }
     }
 
-    test("v4_group space publishes the group table - stub") {
-        tag "stub"
-        options "-stub"
-        when {
-            params {
-                input       = "${projectDir}/assets/samplesheet.example.yml"
-                outdir      = "$outputDir"
-                infer_space = "v4_group"
-            }
-        }
-        then {
-            assertAll(
-                { assert workflow.success },
-                { assert workflow.trace.succeeded().size() == 12 },
-                { assert path("${params.outdir}/composition/demo/demo.inferred_v4_groups.csv").exists() },
-                { assert path("${params.outdir}/composition/demo/demo.inferred_composition.csv").exists() },
-                { assert path("${params.outdir}/composition/demo/demo.fit_diagnostics.json").exists() }
-            )
-        }
-    }
-
-    test("panel_references builds a panel kernel instead of a square matrix - stub") {
+    test("panel_references builds a genome-panel kernel - stub") {
         tag "stub"
         options "-stub"
         when {
@@ -64,8 +44,7 @@ nextflow_pipeline {
         then {
             assertAll(
                 { assert workflow.success },
-                // The square matrix path (cluster, simulate, map, build, publish) is replaced
-                // by prepare, home map, simulate, simulated map, kernel: still 12 tasks.
+                // The same tasks as the whole-database panel, over the named genomes.
                 { assert workflow.trace.succeeded().size() == 12 },
                 { assert workflow.trace.tasks().every { !it.name.contains('BUILD_MISMAPPING') } },
                 { assert workflow.trace.tasks().any { it.name.contains('MAPSEQ_PANEL_HOME') } },
@@ -319,6 +298,70 @@ nextflow_pipeline {
                 { assert workflow.trace.tasks().every { !it.name.contains('BUILD_MISMAPPING') } },
                 { assert file("${params.outdir}/mismapping").listFiles().find { it.name.startsWith('panel_') }
                          .toPath().resolve('stub_db_amplicons.txt').text.trim() == 'amplicons.fasta' }
+            )
+        }
+    }
+
+    test("a genome panel under align builds its kernel by alignment - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input             = "${projectDir}/tests/data/samplesheet.panel.yml"
+                outdir            = "$outputDir"
+                mismapping_method = "align"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.succeeded().size() == 10 },
+                { assert workflow.trace.tasks().every { !it.name.contains('SIMULATE') } },
+                { assert workflow.trace.tasks().any { it.name.contains('PANEL_ALIGN') } },
+                { assert path("${params.outdir}/composition/demo/demo.fit_diagnostics.json").exists() }
+            )
+        }
+    }
+
+    test("taxon panels under align build their kernels by alignment - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input             = "${projectDir}/tests/data/samplesheet.panel_taxa.yml"
+                taxonomy          = "${projectDir}/tests/data/refs.tax"
+                outdir            = "$outputDir"
+                mismapping_method = "align"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.tasks().every { !it.name.contains('SIMULATE') } },
+                { assert workflow.trace.tasks().count { it.name.contains('PANEL_ALIGN') } == 2 },
+                { assert path("${params.outdir}/composition/taxa_only/taxa_only.inferred_composition.csv").exists() },
+                { assert path("${params.outdir}/composition/mixed/mixed.fit_diagnostics.json").exists() }
+            )
+        }
+    }
+
+    test("the whole-database panel infers the bundled fixture - e2e") {
+        tag "e2e"
+        when {
+            params {
+                input  = "${projectDir}/assets/samplesheet.example.yml"
+                outdir = "$outputDir"
+            }
+        }
+        then {
+            def comp = file("${params.outdir}/composition/demo/demo.inferred_composition.csv").readLines()
+            def fit = new groovy.json.JsonSlurper().parse(
+                file("${params.outdir}/composition/demo/demo.fit_diagnostics.json"))
+            assertAll(
+                { assert workflow.success },
+                { assert comp[0].split(',').contains('resolution') },
+                { assert comp.drop(1).any { it.split(',')[1] == 'background' } },
+                { assert fit.gate == 'label' && fit.fit_status == 'ok' }
             )
         }
     }

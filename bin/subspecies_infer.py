@@ -10,14 +10,15 @@ Library + the ``amplicons`` CLI stage. The pipeline is:
     DB that ships none. MAPseq maps against the DB FASTA itself, not the amplicons.
 
 *simulate -> map* (``simulate_amplicon_reads.py`` + mapseq, driven by Nextflow)
-    Reads are sampled from each reference amplicon under a sequencing error model and
-    mapped with **the same mapper used for the real reads**, so the mis-mapping matrix
-    ``M[a,j] = P(a read truly from a is assigned to j)`` is measured, not modelled.
+    Reads are sampled from each panel source under a sequencing error model and mapped
+    with **the same mapper used for the real reads**, so the panel kernel
+    ``K[s,l] = P(a read truly from s is labelled l)`` is measured, not modelled
+    (``tally_kernel``, ``build_panel_kernel.py``).
 
 ``infer_composition.py``
     Bayesian inference (Pyro: NUTS / VI / MLE) on the latent *true genome* composition
     ``theta``: ``theta ~ Dirichlet(alpha)`` -> ``r_true = theta @ T`` ->
-    ``r_obs = r_true @ M`` -> Dirichlet-Multinomial on the observed per-reference mapseq
+    ``r_obs = r_true @ K`` -> Dirichlet-Multinomial on the observed per-label mapseq
     counts. Started from the observed composition.
 
 Note: inference uses **Pyro**, not NumPyro, because the skiver error model
@@ -382,63 +383,6 @@ def iter_mseq(path: Path, min_identity: float | None = None):
             yield f[_MSEQ_QUERY], f[_MSEQ_HIT]
 
 
-def observed_refseq_counts(mseq_paths, refseqs: list[str],
-                           min_identity: float | None = None) -> Counter:
-    """Per-reference observed read counts from mapseq output (field 2 == DB header).
-
-    Only hits to references in our amplifiable set are counted; anything else is
-    off-target background."""
-    keep = set(refseqs)
-    counts: Counter = Counter()
-    for path in mseq_paths:
-        for _, hit in iter_mseq(path, min_identity):
-            if hit in keep:
-                counts[hit] += 1
-    return counts
-
-
-def build_mismapping(sim_mseq_paths, refseqs: list[str],
-                     min_identity: float | None = None) -> sparse.csr_array:
-    """``M[a,j]`` = fraction of reads simulated from reference ``a`` that mapseq assigns
-    to reference ``j``; row-stochastic.
-
-    The simulator names each read ``<source header>:<i>``, so the true source survives
-    mapping (same trick as superresolution-shotgun's chunk ids). A reference whose reads
-    all failed to map gets an identity row, i.e. ``r_true`` passes through uncorrected.
-    """
-    idx = {r: i for i, r in enumerate(refseqs)}
-    n = len(refseqs)
-    counts: Counter[tuple[int, int]] = Counter()
-    unknown = 0
-    for path in sim_mseq_paths:
-        for query, hit in iter_mseq(path, min_identity):
-            a = idx.get(query.rsplit(":", 1)[0])
-            j = idx.get(hit)
-            if a is None or j is None:
-                unknown += 1
-                continue
-            counts[a, j] += 1
-    if unknown:
-        log.warning("%d simulated hits with an unrecognised source/target reference", unknown)
-    totals = np.zeros(n, dtype=np.float64)
-    for (source, _), count in counts.items():
-        totals[source] += count
-    empty = totals == 0
-    if empty.any():
-        log.warning("%d reference(s) had no mapped simulated read; using an identity row",
-                    int(empty.sum()))
-        for source in np.flatnonzero(empty):
-            counts[source, source] = 1
-            totals[source] = 1.0
-    if not counts:
-        return sparse.eye(n, format="csr", dtype=np.float64)
-    rows, columns, values = zip(*(
-        (source, target, count / totals[source])
-        for (source, target), count in counts.items()
-    ))
-    return sparse.csr_array((values, (rows, columns)), shape=(n, n))
-
-
 def tally_kernel(sim_mseq_paths, source_of_query: dict[str, int], label_of_hit: dict[str, int],
                  n_src: int, n_lab: int, min_identity: float | None = None
                  ) -> tuple[sparse.csr_array, np.ndarray]:
@@ -470,44 +414,6 @@ def tally_kernel(sim_mseq_paths, source_of_query: dict[str, int], label_of_hit: 
     keys = np.array(list(counts), dtype=np.int64).reshape(-1, 2)
     values = np.array(list(counts.values()), dtype=np.float64)
     return sparse.csr_array((values, (keys[:, 0], keys[:, 1])), shape=(n_src, n_lab)), seen
-
-
-def build_mismapping_grouped(sim_mseq_paths, refseqs: list[str], group: np.ndarray,
-                             min_identity: float | None = None,
-                             active: np.ndarray | None = None) -> sparse.csr_array:
-    """Measured ``M`` at V4-group level, in the grouped (unique-amplicon kernel) format.
-
-    ``S[A, B]`` is the fraction of reads simulated from group ``A`` that mapseq labels
-    *anywhere* in group ``B``, divided by ``size(B)`` — the grouped format's convention, so
-    ``sum_B S[A, B] * size(B) == 1`` and every member of a group shares the row its
-    representative was simulated from. That is what lets one simulation per distinct
-    amplicon stand in for its duplicates, and it is the granularity the ``v4_group`` fit
-    uses: which identical member mapseq happened to name carries no information.
-
-    A group whose simulated reads all failed to map keeps an identity row, as does any
-    group in ``active`` that produced no read at all — the simulator skips a sequence it
-    cannot draw from (IUPAC codes), and a group meant to be a source must not silently
-    become one no read can come from. Every other group gets an empty row, so it prunes
-    away in inference rather than pretending to be unconfusable.
-    """
-    n = int(group.max()) + 1 if len(group) else 0
-    size = np.bincount(group, minlength=n).astype(np.float64)
-    group_of = {r: int(g) for r, g in zip(refseqs, group)}
-    counts, seen = tally_kernel(sim_mseq_paths, group_of, group_of, n, n, min_identity)
-    simulated = set(np.flatnonzero(seen).tolist())
-    expected = simulated | (set(active.tolist()) if active is not None else set())
-    empty = sorted(expected - set(np.flatnonzero(np.diff(counts.indptr)).tolist()))
-    if empty:
-        log.warning("%d group(s) had no mapped simulated read; using an identity row",
-                    len(empty))
-        counts = counts + sparse.csr_array((np.ones(len(empty)), (empty, empty)), shape=(n, n))
-    log.info("measured %d of %d groups (%d rows stay empty)",
-             len(simulated), n, n - len(simulated | set(empty)))
-    counts = counts.tocoo()
-    totals = np.bincount(counts.row, counts.data, minlength=n)
-    return sparse.csr_array(
-        (counts.data / totals[counts.row] / size[counts.col], (counts.row, counts.col)),
-        shape=(n, n))
 
 
 # ── Pyro inference ────────────────────────────────────────────────────────────
@@ -633,7 +539,7 @@ def _apply_mismapping(r_true, M, scale, decay=None):
 
     ``M`` is a dense tensor, a ``(sparse, diagonal)`` pair over references, a
     ``(sparse, diagonal, group)`` triple whose sparse factor is over the *distinct*
-    amplicons (see ``sparse_matrix.write_grouped``), a ``(sparse, diagonal, None, home)``
+    amplicons, a ``(sparse, diagonal, None, home)``
     rectangular sources x labels kernel with ``diagonal = M[a, home[a]]`` (see
     ``sparse_matrix.write_kernel``; the result is then over labels), or a ``DecayKernel``,
     which builds that kernel at the sampled ``decay`` first.
@@ -1004,24 +910,6 @@ def demo_amplicons() -> None:
         assert genome_of_header("AB1.1.1500") == "AB1.1.1500"
         assert dict(read_fasta(td / "out" / "amplicons.fasta"))["gA|0|x"] == payload
 
-        # build_mismapping: source ref from the read name, target from mseq field 2.
-        mseq = td / "sim.mseq"
-        rows = ([("gA|0|x", "gA|0|x")] * 7 + [("gA|0|x", "gA|1|y")] * 3   # copies confused
-                + [("gA|1|y", "gA|1|y")] * 10
-                + [("gB|0|z", "gB|0|z")] * 10)
-        with open(mseq, "w") as fh:
-            fh.write("# comment\n")
-            for i, (src, hit) in enumerate(rows):
-                fh.write(f"{src}:{i}\t{hit}\t500\t0.99\n")
-        M = build_mismapping([mseq], headers)
-        assert np.allclose(M.sum(axis=1), 1.0), M
-        assert np.allclose(M.toarray()[0], [0.7, 0.3, 0.0]), M
-        assert np.allclose(M.diagonal()[1:], 1.0), M
-        # identity threshold drops everything -> identity rows, not a crash
-        assert np.allclose(build_mismapping([mseq], headers, min_identity=1.5).toarray(),
-                           np.eye(3))
-        counts = observed_refseq_counts([mseq], headers)
-        assert counts["gA|1|y"] == 13 and counts["gB|0|z"] == 10, counts
     print("demo amplicons: OK")
 
 

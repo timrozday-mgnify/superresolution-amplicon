@@ -27,27 +27,10 @@ This is a heavy, multi-stage analysis extracted from the
 
 ## GTDB-scale safety
 
-Do not use the genome-space fit against the full GTDB V4 reference set. The archived
-full-GTDB run failed its posterior-predictive check because of the *inference*, not the
-forward model: tens of thousands of genomes share each V4 sequence, so the prior, the
-initial point, and the presence gate act on dimensions the data cannot separate, and the
-genome-space fit fails its own check even on data generated from the model. A V4 read
-cannot tell those genomes apart, so no genome or strain call inside a shared V4 sequence
-is possible. Run GTDB-scale sets with `--infer_space v4_group` (one parameter per
-distinct V4 sequence), `--infer_presence false`, and a kernel-version-2 matrix. With the
-presence gate on, 40% of replayed samples fail the fit check; with it off, 2%.
-
-**Not yet validated for production at GTDB scale.** On the batch's *real* GTDB MAPseq
-output every sample still fails the fit check, and the group profile sits TV 0.33 from an
-exact-match ASV profile — the posterior reproduces MAPseq's labels faithfully, but the
-alignment-built kernel does not describe what MAPseq does against a million references
-(it relabels exact hits onto one-edit neighbours, splits ties over a subset of identical
-members, and ignores IUPAC ties). A measured, simulate-and-map matrix is required first. See
-[the GTDB inference recovery plan](docs/gtdb_inference_recovery_plan.md). Read
-`<id>.inferred_v4_groups.csv` with `fit_diagnostics.json`, which gates release on the
-V4-group check; the genome table in that mode is a labelled split, not an estimate. Until
-Phases 4–5 of that plan validate it on real GTDB MAPseq output, treat full-GTDB outputs as
-diagnostic only.
+Against a generic database (GTDB, SILVA) always name a panel (`panel_references` or
+`panel_taxa`). A V4 read cannot tell apart the tens of thousands of genomes that share
+each GTDB V4 sequence, so without a panel the default, whole-database panel fits a genome
+space the reads cannot identify. The whole-database panel is for small reference sets.
 
 ## Quick start
 
@@ -187,11 +170,11 @@ python bin/build_mapseq_database.py \
 
 nextflow run main.nf --input samples.yml \
     --references db/silva_138_2_ssu_nr99.fasta --taxonomy db/silva_138_2_ssu_nr99.tax \
-    --infer_space v4_group
+    --panel_taxa taxa.tsv
 ```
 
-A SILVA reference is a sequence, not a genome, so genome-space inference against it has no
-biological reading. Use it through `v4_group` or a panel (`panel_references`).
+A SILVA reference is a sequence, not a genome, so inference over it has no biological
+reading. Use it through a panel (`panel_references` or `panel_taxa`).
 
 ### The MAPseq database
 
@@ -248,14 +231,11 @@ Mis-mapping — how `M` is built:
 
 | param | default | description |
 |-------|---------|-------------|
-| `--mismapping_method` | `simulate` | `simulate` (sample errored reads from every reference and map them with the same mapper the real reads go through — `M` is *measured*) or `align` (indexed minimap2 reference-to-reference alignment, with PAF distances re-scored for IUPAC — no read simulation, mapseq, or error model). |
+| `--mismapping_method` | `simulate` | `simulate` (sample errored reads from every panel source and map them with the same mapper the real reads go through — the kernel is *measured*) or `align` (each source aligned to the database labels within `--align_tau`, IUPAC-aware — no read simulation, mapseq, or error model). |
 | `--align_tau` | `0` | `align` only: cluster references within this edit distance. `0` (exact duplicate amplicons) beat every larger value tested until `--align_distance_decay` existed; with a decay set, `tau >= 1` is finally softer rather than worse. |
 | `--align_distance_decay` | `1.0` | `align` only: a cluster member `d` edits away takes `c**d` of a uniform share. A no-op at `--align_tau 0` (every member is at distance 0), and the whole story at larger `tau`: `c = 1` treats a reference one edit away as an exact duplicate, which is why `tau > 0` used to lose. On the benchmark's two-strain *B. uniformis* V4 set — two exact-duplicate clusters one edit apart, 0.5% flat error — `c = 1` puts `0.2` of a row where the `simulate` measurement puts `0.002`–`0.006`; `c = 0.007` reproduces it, and at that value `kmer --align_tau 1` fits the measured matrix slightly *better* than `exact-hash` does (mean row L1 0.079 vs 0.080). Reaching a distance-1 reference costs one sequencing error at that position, so set `c` to about the per-base error rate. Left at `1` with `tau >= 1` the run warns rather than fails, so a pre-existing matrix stays reproducible. Set it to **`auto`** to measure that rate off an error model instead of guessing it, or leave it and set `--infer_distance_decay` to fit it per sample. |
 | `--align_decay_model` | `null` | `--align_distance_decay auto` only: a **pre-trained** skiver `model.pt` whose per-base error rate is measured (by applying it and taking the mean edit rate) instead of the flat rates. Nothing is trained for this — `align` mode never runs the skiver subworkflow. `null` measures `--flat_sub_rate + --flat_ins_rate + --flat_del_rate`, which at the defaults gives `c = 0.0059`. |
-| `--align_backend` | `minimap2` | `align` only: `minimap2` runs all-vs-all alignment and writes a reference-square matrix — fine to a few thousand references. `exact-hash` (requires `--align_tau 0`) groups byte-identical amplicons in one streaming pass. `kmer` (requires `--align_tau >= 1`) widens those groups with a pigeonhole block filter over the *distinct* amplicons, verified by an IUPAC-aware bounded edit distance. The last two write the **grouped** matrix and are the database-scale path: the full 1,001,241-reference GTDB SSU r232 V4 set takes 2 s / 0.5 GB at `exact-hash`, 75 s / 0.8 GB at `kmer --align_tau 1`, and 195 s / 1.3 GB at `--align_tau 2`. |
-| `--max_ambiguous_bases` / `--max_postings` | `4` / `4096` | `kmer` only. `max_ambiguous_bases` is how many IUPAC positions a pair may carry *between them* before the filter is allowed to miss it; each one costs a block, so raising it shortens the blocks and widens the search. `max_postings` skips a block shared by more than that many distinct amplicons — the conserved windows either side of the variable region, which are quadratic to enumerate. It is the filter's only source of false negatives, and it is not reached on GTDB SSU at either tau. |
-| `--minimap2_args` | `-p 0 -N 1000 --secondary=yes -c` | `align` only: minimap2 mapping flags. The reference set is indexed once, then aligned all-vs-all. No preset or score-ratio filter retains near-identical hits; `-c` supplies CIGAR. The parser re-scores CIGAR columns with IUPAC overlap rather than trusting `NM`. `-k`/`-w` are rejected here — they belong to the index. |
-| `--minimap2_index_args` | `-k 11 -w 5` | `align` only: minimap2 index flags. Small minimizers, because presets like `asm5` discard everything past ~5% divergence. |
+| `--max_ambiguous_bases` / `--max_postings` | `4` / `4096` | `align` at `--align_tau >= 1` only. `max_ambiguous_bases` is how many IUPAC positions a pair may carry *between them* before the filter is allowed to miss it; each one costs a block, so raising it shortens the blocks and widens the search. `max_postings` skips a block shared by more than that many distinct amplicons — the conserved windows either side of the variable region, which are quadratic to enumerate. It is the filter's only source of false negatives, and it is not reached on GTDB SSU at either tau. |
 | `--align_ambiguity_weight` | `0.3` | `align` only: a cluster member carrying `k` IUPAC ambiguity codes takes `w**k` of a uniform share, since mapseq scores an `N` as a mismatch and prefers a clean duplicate. No-op on reference sets without ambiguity codes; `1` disables. The real penalty varies (0.18–0.97), so this is a compromise — see [the sweep](dev/ambiguity_weight_sweep.md). |
 
 | `--min_pair_overlap` | `20` | Paired samples: shortest mate overlap accepted when merging R1/R2. Unmergeable pairs are dropped and counted; past 20% the run warns that the fragments do not cover the amplicon, and `--mismapping_method simulate --sim_read_len` is the right choice for that sample. |
@@ -273,7 +253,7 @@ simulates reads, so nothing needs an error model and the skiver subworkflow neve
 | `--flat_sub_rate` | `0.005` | Flat model: per-base substitution probability. |
 | `--flat_ins_rate` | `0.0005` | Flat model: per-base insertion probability. |
 | `--flat_del_rate` | `0.0005` | Flat model: per-base deletion probability. |
-| `--sim_n_per_ref` | `500` | Simulated reads per reference (sampling depth for `M`). |
+| `--sim_n_per_ref` | `5000` | Simulated reads per distinct panel V4 source (sampling depth for the kernel). |
 | `--panel_kernel` | – | A `mismapping/panel_<key>/` directory published by an earlier run. Skips building the kernel: no panel preparation, error-model training, simulation or panel mapping. Refused unless its `provenance.json` names the same extracted amplicons (`reference_sha256`), MAPseq database (`mapseq_db`), `panel` and `panel_taxa` as every sample's. |
 
 In-silico PCR and the mapseq clustering run once per distinct `references` file,
@@ -292,44 +272,6 @@ The run refuses the bundle unless it was built against the same extracted amplic
 MAPseq database (the FASTA's path, size and mtime, and its `.mscluster`) and panel. Its
 simulation or alignment settings are not checked, because they are the bundle's own:
 the kernel is used as it was built.
-
-For a matrix outside Nextflow, run minimap2 with an index first, then pass its PAF:
-
-```bash
-minimap2 -k 11 -w 5 -d amplicons.mmi sample_amplicons/amplicons.fasta
-minimap2 -p 0 -N 1000 --secondary=yes -c amplicons.mmi sample_amplicons/amplicons.fasta > allvsall.paf
-bin/build_mismapping_align.py --amplicons sample_amplicons/amplicons.fasta --paf allvsall.paf \
-  -o mismapping_matrix.npz
-```
-
-The grouped backends need no mapper and no PAF:
-
-```bash
-bin/build_mismapping_align.py --backend exact-hash --tau 0 \
-  --amplicons sample_amplicons/amplicons.fasta -o mismapping_matrix.npz
-bin/build_mismapping_align.py --backend kmer --tau 1 \
-  --amplicons sample_amplicons/amplicons.fasta -o mismapping_matrix.npz
-```
-
-### The grouped matrix
-
-A tie-cluster `M` is constant on exact-duplicate groups — two references with the same
-amplicon are interchangeable — so `M[a, j] = S[group[a], group[j]]` for an `S` over the
-*distinct* amplicons. The reference-square CSR stores one entry per reference pair inside
-a cluster, i.e. the sum of the squared group sizes. On GTDB SSU V4 that is 24.2 billion
-nonzeros (~290 GB) for 1,001,241 references; the grouped form is 86,557 x 86,557 with
-~264k nonzeros, and the file is 11 MB. Row-stochasticity becomes
-`sum_b S[a, b] * size[b] == 1`, and `r_true @ M` becomes a sum over duplicate groups, one
-sparse product, and a scatter back — so inference never materialises the square matrix
-either. `sparse_matrix.is_grouped` tells the two apart; consumers accept both.
-
-For a simulation-only pre-computation outside Nextflow, use the inference utility's
-matrix-build mode:
-
-```bash
-bin/infer_composition.py --amplicon-dir sample_amplicons \
-  --sim-mseq sample.sim.mseq.gz --build-mismapping -o mismapping_only
-```
 
 Read mapping (mapseq):
 
@@ -355,14 +297,11 @@ Composition inference (Pyro):
 | `--infer_presence_temp` | `1.0` | Concrete relaxation temperature for the gate. Below ~1 the gate barely moves off its initialisation and no prior can sparsify it. |
 | `--infer_distance_decay` | `false` | Fit the tie-cluster distance decay `c` per sample instead of taking the one the matrix was built with. Needs `--mismapping_method align --align_tau >= 1`: only those builds record the distance behind each nonzero, and at `tau 0` every distance is 0 and `c` cancels. The matrix is **not** rebuilt — `M(c) = rownorm(M(c0) * (c/c0)**d)` — so one build still serves the whole matrix group while each sample fits its own error rate. Reported as `distance_decay` in `inference_diagnostics.csv`. |
 | `--infer_decay_sigma` | `1.2` | Prior width in logs of that decay, centred on the built one. |
-| `--infer_space` | `genome` | `genome` \| `v4_group`. `v4_group` fits one parameter per exact distinct V4 amplicon (`v4g_<sha256 prefix>`) and publishes `<id>.inferred_v4_groups.csv`, which the fit check reads. The genome table then splits each group evenly over its member references, marks genomes sharing a group `not_identifiable`, and leaves their intervals and `presence_prob` empty. Required for GTDB-scale sets; genome space logs a warning when one fitted V4 sequence spans more than 100 genomes. |
-| `--taxonomy` | `null` | MAPseq `.tax` (`header<TAB>lineage`) for the `lca` column of the v4-group table (longest common rank prefix of the members). Without it every group is `unclassified_v4_group`. Its sha256 is recorded in `inference_diagnostics.csv`. |
+| `--taxonomy` | `null` | MAPseq `.tax` (`header<TAB>lineage`) that `--panel_taxa` entries are resolved against. |
 | `--infer_horseshoe` | `false` | `vi` only, needs `--infer_presence false`: horseshoe shrinkage on unnormalised weights in place of the Dirichlet (`--infer_alpha` is ignored). |
 | `--panel_references` | – | Genome panel (same header convention as `--references`, or a directory of `<genome>.amplicons.fasta`). Per-sample override via the samplesheet. See [Panel reinterpretation](#panel-reinterpretation). |
 | `--panel_taxa` | – | TSV `id<TAB>taxon`: panel entries that are taxa. Needs `--taxonomy`. Per-sample override via the samplesheet. See [Taxon entries](#taxon-entries). |
 | `--panel_taxon_max_sources` | `200` | Fail a taxon entry that resolves to more database V4 groups than this; every group is a simulated source. |
-| `--panel_sim_n_per_ref` | `5000` | Simulated reads per distinct panel V4 source. |
-| `--infer_prune` | `true` | Fit only the genomes the sample's reads can reach — those owning an observed reference, or one byte-identical to it — instead of the whole reference set. Pruned genomes are still reported, at zero. Against a database-scale set this is most of the per-sample cost; set `false` to fit everything. |
 
 > **The distance decay, fixed or fitted.** `c` is a property of the *sample* — roughly
 > its per-base error rate — but the matrix is built once per reference set and shared by
@@ -427,7 +366,7 @@ A sample with `panel_references` is still mapped against `--references` (e.g. GT
 its composition is inferred over the panel genomes plus a `background` row. The panel's
 distinct V4 amplicons are MAPseq'd against that database (each source's home label) and
 reads simulated from them are mapped the same way, giving a rectangular kernel (panel
-sources × database V4 groups). No reference-square matrix is built for such a sample.
+sources × database V4 groups).
 Validated on 20 mock samples against GTDB r232 (median genome TV 0.015, see
 [dev/panel_reinterpretation.md](dev/panel_reinterpretation.md)) with:
 
@@ -442,7 +381,7 @@ nextflow run main.nf -profile singularity -c your_hpc.config \
 The flat error model misses context-specific relabels and scores no better than home labels
 alone; the presence gate collapses at long runs. Mapping reads directly against the panel
 (a panel-only `--references`) was more accurate on every sample; use reinterpretation when
-that is not possible. Requires `--infer_space genome` and `--mismapping_method simulate`.
+that is not possible. Requires `--mismapping_method simulate`.
 
 #### Taxon entries
 
@@ -494,20 +433,14 @@ results/
   mapseq/<id>/
     <id>.obs.mseq.gz                 mapseq classification of the real reads
   mismapping/
-    groups.tsv                       index of canonical matrix bundles
-    <matrix-key>/
-      mismapping_matrix.npz          reference->reference mis-mapping M (CSR or grouped)
-      provenance.json                 simulator, mapper, and member-sample metadata
-      samples.tsv                     samples consuming this matrix
-      reference/                      amplicons + mapseq/inference sidecars
-    panel_<key>/                     panel samples: rectangular kernel (mismapping_matrix.npz),
+    panel_<key>/                     rectangular kernel (mismapping_matrix.npz),
                                      panel_sources.tsv, panel_translation.tsv, sources.tsv,
                                      provenance.json (what --panel_kernel checks)
   composition/<id>/
     <id>.inferred_composition.csv    inferred vs observed genome abundances
-    <id>.inference_diagnostics.csv   matrix ID/path, fit status, and two diagonal summaries
+    <id>.inference_diagnostics.csv   kernel ID/path, fit settings and status, background share
     <id>.posterior_draws.npz         theta_eff and fitted nuisance posterior draws
-    <id>.fit_diagnostics.json        raw/grouped posterior-predictive forward-fit gate
+    <id>.fit_diagnostics.json        posterior-predictive forward-fit gate
     <id>.loss_trace.csv              (vi/mle)
     <id>.inferred_panel_members.csv  panel with taxon entries: the fitted per-member table
   pipeline_info/                     trace, report, timeline, dag, software versions
@@ -518,13 +451,12 @@ results/
 and `presence_prob` (posterior probability the genome is present; empty when
 `--infer_presence false`). Call a genome present at `presence_prob >= 0.5`.
 
-`fit_diagnostics.json` is calculated from the real MAPseq counts, the exact sparse matrix,
+`fit_diagnostics.json` is calculated from the real MAPseq counts, the exact panel kernel,
 and retained posterior draws. It reports observed-versus-expected total-variation distance
-and posterior-predictive percentiles at both raw-reference and exact-V4-group resolution.
+and a posterior-predictive percentile over the fitted labels (observed database V4 groups,
+a zero-count sink, and the background label), under `label`.
 `fit_status=model_misfit` is a release gate; `low_depth` is not a biological composition.
-`inference_diagnostics.csv` distinguishes the unweighted unique-kernel
-`mean_kernel_diagonal` from `mean_reference_diagonal`, which expands groups back to their
-member references. Treat `fit_diagnostics.json`, rather than the composition CSV alone,
+Treat `fit_diagnostics.json`, rather than the composition CSV alone,
 as the result's release status.
 
 ## Benchmarking
@@ -548,15 +480,14 @@ Because the benchmark builds the matrix once per reference set and then supplies
 every sample, **the mis-mapping mode is a property of the matrix-build run only**. The
 modes worth comparing:
 
-| `--mismapping_method` | `--align_backend` | `--align_tau` | what it costs |
-|---|---|---|---|
-| `simulate` | – | – | Reads simulated from every reference and mapped with mapseq. The measurement; the most expensive. |
-| `align` | `minimap2` | `0` | All-vs-all alignment. Reference-square matrix; quadratic in references. |
-| `align` | `exact-hash` | `0` | Byte-identical amplicons grouped. One streaming pass. |
-| `align` | `kmer` | `>= 1` | Those groups widened by verified neighbours within `tau`, each discounted by `--align_distance_decay ** d`. Leave the decay at `1` and this mode understates how well the mapper separates near-identical references. |
+| `--mismapping_method` | `--align_tau` | what it costs |
+|---|---|---|
+| `simulate` | – | Reads simulated from every panel source and mapped with mapseq. The measurement; the most expensive. |
+| `align` | `0` | A literal hash join of sources onto byte-identical labels. One pass. |
+| `align` | `>= 1` | Also verified neighbours within `tau` (pigeonhole candidates), each discounted by `--align_distance_decay ** d`. Leave the decay at `1` and this mode understates how well the mapper separates near-identical references. |
 
-The benchmark exposes each of these as `--sr_amplicon_mismapping_method`,
-`--sr_amplicon_align_backend` and `--sr_amplicon_align_tau`, with
+The benchmark exposes these as `--sr_amplicon_mismapping_method` and
+`--sr_amplicon_align_tau`, with
 `--sr_amplicon_matrix_args` for the remaining flags
 (`--align_distance_decay`, `--align_ambiguity_weight`, `--max_ambiguous_bases`,
 `--max_postings`, `--sim_n_per_ref`, …). See its README for how to sweep them.
@@ -608,7 +539,6 @@ nextflow run main.nf -profile docker --input assets/samplesheet.example.yml --ou
 python bin/subspecies_infer.py amplicons --demo   # in-silico PCR, T, M-from-mseq
 python bin/simulate_amplicon_reads.py --demo      # fragment sampler + flat error model
 python bin/reads_to_fasta.py --demo
-python bin/infer_composition.py --demo            # needs numpy/torch/pyro (use the container)
 
 # Build a custom database, then verify MAPseq accepts its FASTA/tax pair.
 pytest tests/test_build_mapseq_database.py         # needs Docker; pulls the pinned MAPseq image

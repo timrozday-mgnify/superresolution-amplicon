@@ -1,4 +1,6 @@
 #!/usr/bin/env python
+# UNMAINTAINED: imports code removed with the square mis-mapping path (panel-only
+# pipeline). Kept as the record behind its .md; it no longer runs against bin/.
 """Does MAPseq's leak onto a one-edit neighbour grow with that neighbour's copy count?
 
 Evidence §3 of ``docs/gtdb_inference_recovery_plan.md``. Reads simulated from one GTDB V4
