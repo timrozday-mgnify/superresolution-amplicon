@@ -1,4 +1,5 @@
-"""Simulated reads get the observed reads' primer trim, so read-start errors fall away."""
+"""Simulated reads are prepared like the observed ones: primer-trimmed, or carrying primers
+drawn from the oligo mix."""
 from __future__ import annotations
 
 import sys
@@ -14,15 +15,16 @@ import subspecies_infer as si  # noqa: E402  (needs local bin directory)
 AMPLICON = "TACGGAGGATCCGAGCGTTATCCGGATTTATTGGGTTTAAAGGGAGCGTAGGCGGACGCTTAAGTCAGTTGTGAAAGTTTGCGGCTCAACCGTAAAATTGCAGTTGATACTGGGTGTCTTGAGTACAGTAGAGGCAGGCGGAATTCGTGG"
 
 
-def _simulate(tmp_path: Path, trim: bool) -> list[str]:
+def _simulate(tmp_path: Path, trim: bool, primer_mix: Path | None = None,
+              n: int = 50) -> list[str]:
     amplicons = tmp_path / "amplicons.fasta"
     amplicons.write_text(f">ref|0|ref\n{AMPLICON}\n")
     out = tmp_path / f"sim_{trim}.fasta"
-    a = SimpleNamespace(amplicons=amplicons, output=out, n_per_ref=50, read_len=None, seed=0,
+    a = SimpleNamespace(amplicons=amplicons, output=out, n_per_ref=n, read_len=None, seed=0,
                         error_model="flat", model_pt=None, sub_rate=0.0, ins_rate=0.0,
                         del_rate=0.0, use_vi=False, trim_primers=trim,
                         fwd_primer=si.DEFAULT_FWD_PRIMER, rev_primer=si.DEFAULT_REV_PRIMER,
-                        primer_mismatches=3)
+                        primer_mismatches=3, primer_mix=primer_mix)
     # A model that prepends two bases to every read: a read-start error.
     real_sampler = sar.sampler
     sar.sampler = lambda *args: lambda records, rng: [
@@ -36,6 +38,42 @@ def _simulate(tmp_path: Path, trim: bool) -> list[str]:
 
 def test_primer_trim_removes_read_start_errors(tmp_path: Path) -> None:
     untrimmed = _simulate(tmp_path, trim=False)
-    assert set(untrimmed) == {"GA" + AMPLICON}
+    assert all(r.startswith("GA") and AMPLICON in r for r in untrimmed)
     trimmed = _simulate(tmp_path, trim=True)
     assert len(trimmed) == 50 and set(trimmed) == {AMPLICON}
+
+
+MIX = ROOT / "assets" / "primer_mix_emp_v4.tsv"
+
+
+def _oligos(read: str) -> tuple[str, str]:
+    """(fwd, rev) oligos of an error-free simulated read, rev on its own strand."""
+    body = read[2:]   # the fake model's "GA"
+    lf, lr = len(si.DEFAULT_FWD_PRIMER), len(si.DEFAULT_REV_PRIMER)
+    assert body[lf:len(body) - lr] == AMPLICON
+    return body[:lf], si.revcomp(body[len(body) - lr:])
+
+
+def test_untrimmed_reads_carry_the_measured_oligo_mix(tmp_path: Path) -> None:
+    reads = _simulate(tmp_path, trim=False, primer_mix=MIX, n=4000)
+    fwd, rev = zip(*map(_oligos, reads))
+    # 515F position 8 (M) is A in 0.618 of reads; 806R position 7 (N) is never G.
+    assert abs(sum(f[8] == "A" for f in fwd) / len(fwd) - 0.618) < 0.03
+    assert not any(r[7] == "G" for r in rev)
+    pairs, _ = sar.read_primer_mix(MIX, si.DEFAULT_FWD_PRIMER, si.DEFAULT_REV_PRIMER)
+    assert set(zip(fwd, rev)) <= set(pairs)
+
+
+def test_uniform_fallback_draws_every_option(tmp_path: Path) -> None:
+    reads = _simulate(tmp_path, trim=False, n=400)
+    fwd, rev = zip(*map(_oligos, reads))
+    assert {f[3] for f in fwd} == {"C", "T"} and {r[7] for r in rev} == set("ACGT")
+
+
+def test_mix_for_another_primer_is_refused(tmp_path: Path) -> None:
+    try:
+        sar.read_primer_mix(MIX, "CCTACGGGNGGCWGCAG", si.DEFAULT_REV_PRIMER)
+    except ValueError as e:
+        assert "not an instance" in str(e)
+    else:
+        raise AssertionError("a V3 primer accepted a V4 mix")

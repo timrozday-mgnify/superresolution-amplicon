@@ -284,7 +284,8 @@ workflow SUPERRESOLUTION_AMPLICON {
             SIMULATE_PANEL_READS(PANEL_PREPARE.out.sources
                 .map { meta, sources -> [ meta.id, meta, sources ] }
                 .join(ch_panel_groups.map { meta, panel, d, model -> [ meta.id, model ] })
-                .map { id, meta, sources, model -> [ meta, sources, model ] })
+                .map { id, meta, sources, model -> [ meta, sources, model ] },
+                params.primer_mix ? file(params.primer_mix, checkIfExists: true) : [])
             MAPSEQ_PANEL_SIM(SIMULATE_PANEL_READS.out.reads
                 .map { meta, reads -> [ meta.id, reads ] }
                 .join(ch_panel_db.map { meta, sources, fasta, tax, mscluster -> [ meta.id, meta, fasta, tax, mscluster ] })
