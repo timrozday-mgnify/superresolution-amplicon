@@ -157,18 +157,40 @@ workflow SUPERRESOLUTION_AMPLICON {
     // clustering: once per distinct reference FASTA, however many samples name it. At GTDB
     // scale each is hours. The set's meta holds only its id, so adding or removing a
     // sample leaves both tasks cached.
-    // ponytail: keyed by the file's location. The same bytes at two paths are extracted
-    // twice. Key by a content digest if that happens, which costs a hash of the whole
-    // FASTA per run.
+    // The id is also the --amplicon_cache key (conf/modules.config), shared across runs,
+    // so it names everything that shapes the amplicons: the FASTA, the primers and the
+    // extractor's code.
+    // ponytail: the FASTA by location, size and mtime, not content. The same bytes at two
+    // paths are extracted twice. Key by a content digest if that happens, which costs a
+    // hash of the whole FASTA per run.
+    def extractor = file("${projectDir}/bin/subspecies_infer.py").text.md5()
     ch_refs_by_set = ch_refs.map { meta, refs ->
-        [ "refs_" + refs.toUriString().md5().take(12), meta, refs ]
+        def key = [refs.toUriString(), refs.size(), refs.lastModified(), params.fwd_primer,
+                   params.rev_primer, params.primer_mismatches, extractor].join('|')
+        [ "refs_" + key.md5().take(12), meta, refs ]
     }
     EXTRACT_AMPLICONS(ch_refs_by_set
         .unique { it[0] }
         .map { set, meta, refs -> [ [ id: set ], refs ] })
     ch_versions = ch_versions.mix(EXTRACT_AMPLICONS.out.versions)
+    // [ set meta, amplicons.fasta, amplicons.tax ]: the mapseq reference set.
+    ch_set_refs = EXTRACT_AMPLICONS.out.dir.map { meta, d ->
+        [ meta, d.resolve('amplicons.fasta'), d.resolve('amplicons.tax') ] }
 
-    MAPSEQ_CLUSTER(EXTRACT_AMPLICONS.out.refs)
+    // Cluster only a set something maps against with mapseq: a sample's own reads (no
+    // `mseq:`) or a panel's sources. An align-mode matrix never reads the .mscluster, so a
+    // sweep over supplied classifications skips it; ch_db then holds only the samples that
+    // use it.
+    ch_cluster_sets = ch_refs_by_set
+        .map { set, meta, refs -> [ meta.id, set, meta ] }
+        .join(ch_reads.map { meta, reads -> [ meta.id, !meta.mseq ] })
+        .filter { id, set, meta, maps_reads -> maps_reads || meta.panel || meta.panel_taxa }
+        .map { id, set, meta, maps_reads -> [ set ] }
+        .unique()
+    MAPSEQ_CLUSTER(ch_set_refs
+        .map { meta, fasta, tax -> [ meta.id, meta, fasta, tax ] }
+        .join(ch_cluster_sets)
+        .map { set, meta, fasta, tax -> [ meta, fasta, tax ] })
     ch_versions = ch_versions.mix(MAPSEQ_CLUSTER.out.versions)
 
     // Fan the shared results back out to samples by set id. combine, not join: join is
@@ -180,7 +202,7 @@ workflow SUPERRESOLUTION_AMPLICON {
         .map { set, meta, d -> [ meta, d ] }
     // [ sample id, fasta, tax, mscluster ] — the mapseq DB slots, shared by both mappings.
     ch_db = ch_sample_sets
-        .combine(EXTRACT_AMPLICONS.out.refs
+        .combine(ch_set_refs
             .map { meta, fasta, tax -> [ meta.id, fasta, tax ] }
             .join(MAPSEQ_CLUSTER.out.mscluster.map { meta, mscluster -> [ meta.id, mscluster ] }), by: 0)
         .map { set, meta, fasta, tax, mscluster -> [ meta.id, fasta, tax, mscluster ] }

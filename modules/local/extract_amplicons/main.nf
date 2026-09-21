@@ -12,11 +12,10 @@ process EXTRACT_AMPLICONS {
     tuple val(meta), path(references)
 
     output:
+    // The directory only: storeDir (--amplicon_cache) moves each output in turn, and a
+    // file declared inside an already-moved directory fails that move.
     tuple val(meta), path("${meta.id}_amplicons"), emit: dir
-    tuple val(meta), path("${meta.id}_amplicons/amplicons.fasta"),
-                     path("${meta.id}_amplicons/amplicons.tax"),         emit: refs
-    tuple val(meta), path("${meta.id}_amplicons/translation_table.tsv"), emit: translation
-    path "versions.yml",                                                 emit: versions
+    path "versions.yml",                           emit: versions
 
     when:
     task.ext.when == null || task.ext.when
