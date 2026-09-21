@@ -197,6 +197,49 @@ nextflow_pipeline {
         }
     }
 
+    test("pairs merges simulated mates with fastp and keeps their yield - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input              = "${projectDir}/tests/data/samplesheet.aap.yml"
+                outdir             = "$outputDir"
+                references         = "${projectDir}/tests/data/refs.fasta"
+                trim_primers       = false
+                sim_read_structure = "pairs"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.succeeded().findAll { it.name.contains('FASTP_MERGE') }.size() == 1 },
+                { assert workflow.trace.succeeded().findAll { it.name.contains('MAPSEQ_PANEL_SIM') }.size() == 1 },
+                { assert file("${params.outdir}/mismapping").listFiles().any { new File(it, 'yield.tsv').exists() } }
+            )
+        }
+    }
+
+    test("pairs refuses --trim_primers true and an untrained mate model - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input              = "${projectDir}/tests/data/samplesheet.aap.yml"
+                outdir             = "$outputDir"
+                references         = "${projectDir}/tests/data/refs.fasta"
+                trim_primers       = false
+                sim_read_structure = "pairs"
+                sim_error_model    = "trained"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.failed },
+                { assert workflow.stdout.any { it.contains('must be a mate model') } }
+            )
+        }
+    }
+
     test("merged reads refuse --trim_primers true - stub") {
         tag "stub"
         options "-stub"
@@ -345,6 +388,48 @@ nextflow_pipeline {
         }
     }
 
+    test("a separate indel decay reaches the alignment kernel - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input             = "${projectDir}/assets/samplesheet.example.yml"
+                outdir            = "$outputDir"
+                mismapping_method = "align"
+                align_tau         = 1
+                align_distance_decay = 0.007
+                align_indel_decay = "auto"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.succeeded().any { it.name.contains('PANEL_ALIGN') } }
+            )
+        }
+    }
+
+    test("align refuses merged reads whose merge lost reads - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                // run_b's merge_rate is 0.7
+                input             = "${projectDir}/tests/data/samplesheet.aap.yml"
+                outdir            = "$outputDir"
+                references        = "${projectDir}/tests/data/refs.fasta"
+                trim_primers      = false
+                mismapping_method = "align"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.failed },
+                { assert workflow.stdout.any { it.contains('merge_rate 0.7 < 0.8') } }
+            )
+        }
+    }
+
     test("a genome panel under align builds its kernel by alignment - stub") {
         tag "stub"
         options "-stub"
@@ -476,6 +561,27 @@ nextflow_pipeline {
                 { assert workflow.trace.succeeded().findAll { it.name.contains('SIMULATE_PANEL_READS') }.size() == 1 },
                 { assert path("${params.outdir}/composition/demo_a/demo_a.inference_diagnostics.csv").exists() },
                 { assert path("${params.outdir}/composition/demo_b/demo_b.inference_diagnostics.csv").exists() }
+            )
+        }
+    }
+
+    test("AAP merged rows train one pooled model by default - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input           = "${projectDir}/tests/data/samplesheet.aap.yml"
+                outdir          = "$outputDir"
+                references      = "${projectDir}/tests/data/refs.fasta"
+                trim_primers    = false
+                sim_error_model = "trained"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.succeeded().findAll { it.name.contains('POOL_TRAINING_READS') }.size() == 1 },
+                { assert workflow.trace.succeeded().findAll { it.name.contains('SKIVER_TRAIN') }.size() == 1 }
             )
         }
     }

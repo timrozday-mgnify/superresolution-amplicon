@@ -26,6 +26,13 @@ workflow {
         error "Samplesheet ${params.input} must be a YAML list of samples (or a map with 'samples:')"
     }
 
+    if (!(params.sim_read_structure in ['merged', 'pairs'])) {
+        error "--sim_read_structure must be 'merged' or 'pairs'"
+    }
+    if (params.sim_read_structure == 'pairs' && params.trim_primers.toString() == 'true') {
+        error "--sim_read_structure pairs simulates AAP merged reads, which keep their primers: set --trim_primers false"
+    }
+
     ch_rows = Channel.fromList(rows)
 
     // [ meta, [ reads ] ]
@@ -60,9 +67,20 @@ workflow {
         // for the whole run.
         if (row.merged?.toString() == 'true') {
             if (paired) error "Sample ${row.id}: 'merged: true' reads are one file, not a pair"
+            // A low merge rate means pairs were lost to the merge unevenly across sources
+            // (long amplicons first), which edit distances cannot describe.
+            if (params.mismapping_method == 'align' && row.merge_rate != null
+                    && (row.merge_rate as double) < 0.8) {
+                error "Sample ${row.id}: merge_rate ${row.merge_rate} < 0.8, so merging lost reads; " +
+                      "--mismapping_method align cannot account for that. Use simulate with --sim_read_structure pairs"
+            }
             if (params.trim_primers.toString() == 'true') {
                 error "Sample ${row.id}: 'merged: true' needs --trim_primers false (merged reads keep their primers)"
             }
+        }
+        if (params.sim_read_structure == 'pairs' && params.sim_error_model == 'trained'
+                && !(row.error_model || params.error_model)) {
+            error "Sample ${row.id}: --sim_read_structure pairs simulates mates, so a trained model must be a mate model: set error_model"
         }
         def meta = [
             id:          row.id,
@@ -106,5 +124,10 @@ workflow {
         .filter { row -> row.error_model }
         .map { row -> [ row.id, resolveFile(row.error_model.toString()) ] }
 
-    SUPERRESOLUTION_AMPLICON(ch_reads, ch_refs, ch_pretrained)
+    // AAP batches (any `merged: true` row) default to one pooled model: every run went
+    // through the same read preparation, and pooling trains on all their reads at once.
+    def trained_scope = params.trained_error_model_scope
+        ?: (rows.any { it.merged?.toString() == 'true' } ? 'pooled' : 'per-sample')
+
+    SUPERRESOLUTION_AMPLICON(ch_reads, ch_refs, ch_pretrained, trained_scope)
 }

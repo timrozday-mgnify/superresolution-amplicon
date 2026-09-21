@@ -15,7 +15,8 @@ process PANEL_KERNEL {
     container "ghcr.io/timrozday-mgnify/sra-skiver:${params.sra_skiver_tag}"
 
     input:
-    tuple val(meta), path(prepared), path(db_amplicons), path(home_mseq), path(sim_mseq)
+    // sim_yield: FASTP_MERGE's per-source yield under --sim_read_structure pairs, else []
+    tuple val(meta), path(prepared), path(db_amplicons), path(home_mseq), path(sim_mseq), path(sim_yield)
 
     output:
     tuple val(meta), path("${meta.id}"), emit: kernel
@@ -29,6 +30,7 @@ process PANEL_KERNEL {
     """
     mkdir -p ${meta.id}
     cp ${prepared}/panel_translation.tsv ${prepared}/sources.tsv ${meta.id}/
+    ${sim_yield ? "cp ${sim_yield} ${meta.id}/yield.tsv" : ''}
     ${provenanceCmd(meta)}
     build_panel_kernel.py build \\
         --prepared ${prepared} \\
@@ -48,6 +50,7 @@ process PANEL_KERNEL {
     """
     mkdir -p ${meta.id}
     cp ${prepared}/panel_translation.tsv ${prepared}/sources.tsv ${meta.id}/
+    ${sim_yield ? "cp ${sim_yield} ${meta.id}/yield.tsv" : ''}
     ${provenanceCmd(meta)}
     touch ${meta.id}/mismapping_matrix.npz
     printf 'source\\thome_label\\n' > ${meta.id}/panel_sources.tsv

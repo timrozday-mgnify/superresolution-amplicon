@@ -22,6 +22,7 @@ process MATRIX_KEY {
         mismapping_method: params.mismapping_method,
         align_tau: params.align_tau,
         align_distance_decay: params.align_distance_decay,
+        align_indel_decay: params.align_indel_decay ?: '',
         align_ambiguity_weight: params.align_ambiguity_weight,
         max_ambiguous_bases: params.max_ambiguous_bases, max_postings: params.max_postings,
         sim_error_model: params.sim_error_model, sim_n_per_ref: params.sim_n_per_ref,
@@ -31,6 +32,7 @@ process MATRIX_KEY {
         primer_mismatches: params.primer_mismatches, trim_primers: params.trim_primers,
         // ponytail: keyed by path, like the reference set; hash it if mixes get edited in place.
         primer_mix: params.primer_mix ?: '',
+        sim_read_structure: params.sim_read_structure, sim_mate_len: params.sim_mate_len,
         mapseq_args: params.mapseq_args, mapseq_min_identity: params.mapseq_min_identity,
         mapseq_tag: params.mapseq_tag, mapseq_db: mapseq_db, seed: params.seed, identity: identity
     ].collect { k, v -> "${k}=${v}" }.sort().join('\n')

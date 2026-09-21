@@ -17,12 +17,14 @@ include { PANEL_KERNEL; PANEL_ALIGN } from '../modules/local/panel_kernel/build/
 include { SIMULATE_READS as SIMULATE_PANEL_READS } from '../modules/local/simulate_reads/main'
 include { MAPSEQ as MAPSEQ_PANEL_HOME } from '../modules/local/mapseq/map/main'
 include { MAPSEQ as MAPSEQ_PANEL_SIM  } from '../modules/local/mapseq/map/main'
+include { FASTP_MERGE           } from '../modules/local/fastp/merge/main'
 
 workflow SUPERRESOLUTION_AMPLICON {
     take:
     ch_reads      // [ meta, [ reads ] ]                (meta.id, meta.platform)
     ch_refs       // [ meta, references_fasta ]
     ch_pretrained // retained for the public workflow signature
+    trained_scope // 'per-sample' | 'pooled': params.trained_error_model_scope, resolved in main.nf
 
     main:
     ch_versions = Channel.empty()
@@ -39,8 +41,13 @@ workflow SUPERRESOLUTION_AMPLICON {
                          && (params.align_distance_decay as double) <= 1.0)) {
         error "--align_distance_decay must be in [0, 1], or 'auto'"
     }
-    if (params.align_decay_model && !auto_decay) {
-        error "--align_decay_model is only read by --align_distance_decay auto"
+    def indel_decay = params.align_indel_decay?.toString()
+    if (indel_decay != null && indel_decay != 'auto'
+        && !((indel_decay as double) > 0.0 && (indel_decay as double) <= 1.0)) {
+        error "--align_indel_decay must be in (0, 1], or 'auto'"
+    }
+    if (params.align_decay_model && !auto_decay && indel_decay != 'auto') {
+        error "--align_decay_model is only read by --align_distance_decay auto or --align_indel_decay auto"
     }
     // toString(): a command-line `--flag false` arrives as the truthy String "false".
     if (params.infer_distance_decay.toString() == 'true') {
@@ -92,7 +99,7 @@ workflow SUPERRESOLUTION_AMPLICON {
         ch_model = ch_reads.map { meta, reads -> [ meta.id, file("${projectDir}/assets/NO_MODEL"), 'flat' ] }
     }
     else {
-        if (!(params.trained_error_model_scope in ['per-sample', 'pooled'])) {
+        if (!(trained_scope in ['per-sample', 'pooled'])) {
             error "--trained_error_model_scope must be 'per-sample' or 'pooled'"
         }
         ch_reads
@@ -103,7 +110,7 @@ workflow SUPERRESOLUTION_AMPLICON {
             .set { ch_split }
 
         ch_supplied_model = ch_split.pretrained.map { meta, reads -> [ meta.id, meta.error_model, 'supplied' ] }
-        if (params.trained_error_model_scope == 'pooled') {
+        if (trained_scope == 'pooled') {
             ch_pool_input = ch_split.train
                 .flatMap { meta, reads -> reads.collect { read -> [ meta.platform, read ] } }
                 .groupTuple()
@@ -228,10 +235,13 @@ workflow SUPERRESOLUTION_AMPLICON {
                 panel: panel.toString(), panel_taxa: panel_taxa?.toString(), model_identity: rep[3],
                 mismapping_method: params.mismapping_method, align_tau: params.align_tau,
                 align_distance_decay: params.align_distance_decay,
+                align_indel_decay: params.align_indel_decay,
                 align_ambiguity_weight: params.align_ambiguity_weight,
                 max_ambiguous_bases: params.max_ambiguous_bases, max_postings: params.max_postings,
                 sim_error_model: params.sim_error_model,
                 sim_n_per_ref: params.sim_n_per_ref, sim_read_len: params.sim_read_len,
+                sim_read_structure: params.sim_read_structure, sim_mate_len: params.sim_mate_len,
+                primer_mix: params.primer_mix,
                 flat_sub_rate: params.flat_sub_rate, flat_ins_rate: params.flat_ins_rate,
                 flat_del_rate: params.flat_del_rate, mapseq_args: params.mapseq_args,
                 mapseq_min_identity: params.mapseq_min_identity, mapseq_tag: params.mapseq_tag,
@@ -286,7 +296,18 @@ workflow SUPERRESOLUTION_AMPLICON {
                 .join(ch_panel_groups.map { meta, panel, d, model -> [ meta.id, model ] })
                 .map { id, meta, sources, model -> [ meta, sources, model ] },
                 params.primer_mix ? file(params.primer_mix, checkIfExists: true) : [])
-            MAPSEQ_PANEL_SIM(SIMULATE_PANEL_READS.out.reads
+            // pairs: merge the simulated mates the way AAP merged the observed ones.
+            if (params.sim_read_structure == 'pairs') {
+                FASTP_MERGE(SIMULATE_PANEL_READS.out.pairs)
+                ch_versions = ch_versions.mix(FASTP_MERGE.out.versions)
+                ch_sim_reads = FASTP_MERGE.out.reads
+                ch_sim_yield = FASTP_MERGE.out.yield.map { meta, y -> [ meta.id, y ] }
+            }
+            else {
+                ch_sim_reads = SIMULATE_PANEL_READS.out.reads
+                ch_sim_yield = ch_sim_reads.map { meta, reads -> [ meta.id, [] ] }
+            }
+            MAPSEQ_PANEL_SIM(ch_sim_reads
                 .map { meta, reads -> [ meta.id, reads ] }
                 .join(ch_panel_db.map { meta, sources, fasta, tax, mscluster -> [ meta.id, meta, fasta, tax, mscluster ] })
                 .map { id, reads, meta, fasta, tax, mscluster -> [ meta, reads, fasta, tax, mscluster ] })
@@ -299,7 +320,8 @@ workflow SUPERRESOLUTION_AMPLICON {
                 .join(ch_db_amplicons)
                 .join(MAPSEQ_PANEL_HOME.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
                 .join(MAPSEQ_PANEL_SIM.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
-                .map { id, meta, prepared, fasta, home, sim -> [ meta, prepared, fasta, home, sim ] })
+                .join(ch_sim_yield)
+                .map { id, meta, prepared, fasta, home, sim, yld -> [ meta, prepared, fasta, home, sim, yld ] })
             ch_versions = ch_versions.mix(PANEL_KERNEL.out.versions)
             ch_panel_kernel = PANEL_KERNEL.out.kernel
         }
