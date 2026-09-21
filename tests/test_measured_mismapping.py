@@ -86,35 +86,6 @@ def test_active_groups_take_observed_labels_and_their_neighbours(tmp_path: Path)
     assert [sequences[g] for g in exact] == [A]
 
 
-def test_build_grouped_cli_path_writes_a_grouped_matrix(tmp_path: Path) -> None:
-    """--build-mismapping --build-grouped writes the measured kernel, active rows included."""
-    amplicon_dir = tmp_path / "amp"
-    amplicon_dir.mkdir()
-    _amplicons(amplicon_dir / "amplicons.fasta")
-    pd.DataFrame({"genome_id": [r.split("|")[0] for r in REFS], "refseq": REFS,
-                  "weight": 1.0}).to_csv(amplicon_dir / "translation_table.tsv", sep="\t",
-                                         index=False)
-    # Only group A was simulated from; C is active but the simulator skipped it.
-    active = tmp_path / "active.fasta"
-    active.write_text(f">g1|0|A\n{A}\n>g4|0|C\n{C}\n")
-    mseq = _write_mseq(tmp_path / "sim.mseq", [(f"g1|0|A:{i}", "g2|0|A") for i in range(100)])
-
-    ic.run(SimpleNamespace(
-        amplicon_dir=amplicon_dir, sim_mseq=[mseq], mismapping_matrix=None,
-        min_identity=None, build_mismapping=True, build_grouped=True,
-        active_amplicons=active, output_dir=tmp_path / "out"))
-
-    written = tmp_path / "out" / "mismapping_matrix.npz"
-    assert sm.is_grouped(written)
-    M, group, strata = sm.read_grouped(written, REFS, strata=True)
-    assert strata is None, "a measured matrix has no distances to re-decay"
-    size = np.bincount(group).astype(float)
-    rows = (M @ size)
-    a, c = group[REFS.index("g1|0|A")], group[REFS.index("g4|0|C")]
-    assert np.isclose(rows[a], 1.0) and np.isclose(rows[c], 1.0), rows
-    assert np.isclose(rows[group[REFS.index("g3|0|B")]], 0.0), "inactive group stays empty"
-
-
 # ── Rectangular kernels: sources (panel amplicons) x labels (database groups) ──
 
 
@@ -165,7 +136,7 @@ def test_rectangular_projection_sends_unscaled_mass_to_each_home_label() -> None
         dense = r @ ((1.0 - s) * E + s * K)
         got = si._apply_mismapping(torch.tensor(r), M, torch.tensor(s)).numpy()
         assert np.allclose(got, dense, atol=1e-12), (s, got, dense)
-        assert np.allclose(fit._apply_mismapping(r, csr, None, s, home), dense, atol=1e-12)
+        assert np.allclose(fit._apply_mismapping(r, csr, s, home), dense, atol=1e-12)
     assert np.allclose(r @ K, si._apply_mismapping(torch.tensor(r), M, torch.tensor(1.0)).numpy())
 
 

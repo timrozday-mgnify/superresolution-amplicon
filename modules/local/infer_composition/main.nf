@@ -6,11 +6,10 @@ process INFER_COMPOSITION {
 
     input:
     tuple val(meta), path(amplicon_dir), path(mismapping_matrix), path(obs_mseq), val(matrix_key)
-    path taxonomy   // MAPseq .tax for the v4-group lca column; [] when not supplied
+    path taxonomy   // MAPseq .tax for lca_composition.csv; [] when not supplied
 
     output:
     tuple val(meta), path("${meta.id}.inferred_composition.csv"),    emit: composition
-    tuple val(meta), path("${meta.id}.inferred_v4_groups.csv"), optional: true, emit: v4_groups
     tuple val(meta), path("${meta.id}.inference_diagnostics.csv"),   emit: diagnostics
     tuple val(meta), path("${meta.id}.posterior_draws.npz"),          emit: posterior
     tuple val(meta), path("${meta.id}.loss_trace.csv"), optional: true, emit: loss
@@ -43,7 +42,6 @@ process INFER_COMPOSITION {
     cp out/inferred_composition.csv  ${prefix}.inferred_composition.csv
     cp out/inference_diagnostics.csv ${prefix}.inference_diagnostics.csv
     cp out/posterior_draws.npz       ${prefix}.posterior_draws.npz
-    [ -f out/inferred_v4_groups.csv ] && cp out/inferred_v4_groups.csv ${prefix}.inferred_v4_groups.csv || true
     [ -f out/loss_trace.csv ] && cp out/loss_trace.csv ${prefix}.loss_trace.csv || true
     [ -f out/ambiguity_pairs.csv ] && cp out/ambiguity_pairs.csv ${prefix}.ambiguity_pairs.csv || true
     [ -f out/ambiguity_sets.csv ] && cp out/ambiguity_sets.csv ${prefix}.ambiguity_sets.csv || true
@@ -58,13 +56,10 @@ process INFER_COMPOSITION {
 
     stub:
     def prefix = task.ext.prefix ?: "${meta.id}"
-    def v4_groups = params.infer_space == 'v4_group'
-        ? "echo 'sample,v4_group_id,inferred_mean' > ${prefix}.inferred_v4_groups.csv" : ''
     """
     echo 'sample,genome_id,observed_rel_abundance,inferred_mean,inferred_lo,inferred_hi,presence_prob' > ${prefix}.inferred_composition.csv
     echo 'sample,mode,likelihood,n_reads,mismapping_group_id,mismapping_matrix_path' > ${prefix}.inference_diagnostics.csv
     touch ${prefix}.posterior_draws.npz
-    ${v4_groups}
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":

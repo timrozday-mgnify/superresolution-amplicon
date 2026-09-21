@@ -24,7 +24,7 @@ process MATRIX_KEY {
         align_distance_decay: params.align_distance_decay,
         align_ambiguity_weight: params.align_ambiguity_weight,
         max_ambiguous_bases: params.max_ambiguous_bases, max_postings: params.max_postings,
-        sim_error_model: params.sim_error_model, sim_n_per_ref: params.panel_sim_n_per_ref,
+        sim_error_model: params.sim_error_model, sim_n_per_ref: params.sim_n_per_ref,
         sim_read_len: params.sim_read_len, flat_sub_rate: params.flat_sub_rate,
         flat_ins_rate: params.flat_ins_rate, flat_del_rate: params.flat_del_rate,
         fwd_primer: params.fwd_primer, rev_primer: params.rev_primer,

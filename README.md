@@ -27,27 +27,10 @@ This is a heavy, multi-stage analysis extracted from the
 
 ## GTDB-scale safety
 
-Do not use the genome-space fit against the full GTDB V4 reference set. The archived
-full-GTDB run failed its posterior-predictive check because of the *inference*, not the
-forward model: tens of thousands of genomes share each V4 sequence, so the prior, the
-initial point, and the presence gate act on dimensions the data cannot separate, and the
-genome-space fit fails its own check even on data generated from the model. A V4 read
-cannot tell those genomes apart, so no genome or strain call inside a shared V4 sequence
-is possible. Run GTDB-scale sets with `--infer_space v4_group` (one parameter per
-distinct V4 sequence), `--infer_presence false`, and a kernel-version-2 matrix. With the
-presence gate on, 40% of replayed samples fail the fit check; with it off, 2%.
-
-**Not yet validated for production at GTDB scale.** On the batch's *real* GTDB MAPseq
-output every sample still fails the fit check, and the group profile sits TV 0.33 from an
-exact-match ASV profile — the posterior reproduces MAPseq's labels faithfully, but the
-alignment-built kernel does not describe what MAPseq does against a million references
-(it relabels exact hits onto one-edit neighbours, splits ties over a subset of identical
-members, and ignores IUPAC ties). A measured, simulate-and-map matrix is required first. See
-[the GTDB inference recovery plan](docs/gtdb_inference_recovery_plan.md). Read
-`<id>.inferred_v4_groups.csv` with `fit_diagnostics.json`, which gates release on the
-V4-group check; the genome table in that mode is a labelled split, not an estimate. Until
-Phases 4–5 of that plan validate it on real GTDB MAPseq output, treat full-GTDB outputs as
-diagnostic only.
+Against a generic database (GTDB, SILVA) always name a panel (`panel_references` or
+`panel_taxa`). A V4 read cannot tell apart the tens of thousands of genomes that share
+each GTDB V4 sequence, so without a panel the default, whole-database panel fits a genome
+space the reads cannot identify. The whole-database panel is for small reference sets.
 
 ## Quick start
 
@@ -187,11 +170,11 @@ python bin/build_mapseq_database.py \
 
 nextflow run main.nf --input samples.yml \
     --references db/silva_138_2_ssu_nr99.fasta --taxonomy db/silva_138_2_ssu_nr99.tax \
-    --infer_space v4_group
+    --panel_taxa taxa.tsv
 ```
 
-A SILVA reference is a sequence, not a genome, so genome-space inference against it has no
-biological reading. Use it through `v4_group` or a panel (`panel_references`).
+A SILVA reference is a sequence, not a genome, so inference over it has no biological
+reading. Use it through a panel (`panel_references` or `panel_taxa`).
 
 ### The MAPseq database
 
@@ -273,7 +256,7 @@ simulates reads, so nothing needs an error model and the skiver subworkflow neve
 | `--flat_sub_rate` | `0.005` | Flat model: per-base substitution probability. |
 | `--flat_ins_rate` | `0.0005` | Flat model: per-base insertion probability. |
 | `--flat_del_rate` | `0.0005` | Flat model: per-base deletion probability. |
-| `--sim_n_per_ref` | `500` | Simulated reads per reference (sampling depth for `M`). |
+| `--sim_n_per_ref` | `5000` | Simulated reads per distinct panel V4 source (sampling depth for the kernel). |
 | `--panel_kernel` | – | A `mismapping/panel_<key>/` directory published by an earlier run. Skips building the kernel: no panel preparation, error-model training, simulation or panel mapping. Refused unless its `provenance.json` names the same extracted amplicons (`reference_sha256`), MAPseq database (`mapseq_db`), `panel` and `panel_taxa` as every sample's. |
 
 In-silico PCR and the mapseq clustering run once per distinct `references` file,
@@ -323,14 +306,6 @@ nonzeros (~290 GB) for 1,001,241 references; the grouped form is 86,557 x 86,557
 sparse product, and a scatter back — so inference never materialises the square matrix
 either. `sparse_matrix.is_grouped` tells the two apart; consumers accept both.
 
-For a simulation-only pre-computation outside Nextflow, use the inference utility's
-matrix-build mode:
-
-```bash
-bin/infer_composition.py --amplicon-dir sample_amplicons \
-  --sim-mseq sample.sim.mseq.gz --build-mismapping -o mismapping_only
-```
-
 Read mapping (mapseq):
 
 | param | default | description |
@@ -355,14 +330,11 @@ Composition inference (Pyro):
 | `--infer_presence_temp` | `1.0` | Concrete relaxation temperature for the gate. Below ~1 the gate barely moves off its initialisation and no prior can sparsify it. |
 | `--infer_distance_decay` | `false` | Fit the tie-cluster distance decay `c` per sample instead of taking the one the matrix was built with. Needs `--mismapping_method align --align_tau >= 1`: only those builds record the distance behind each nonzero, and at `tau 0` every distance is 0 and `c` cancels. The matrix is **not** rebuilt — `M(c) = rownorm(M(c0) * (c/c0)**d)` — so one build still serves the whole matrix group while each sample fits its own error rate. Reported as `distance_decay` in `inference_diagnostics.csv`. |
 | `--infer_decay_sigma` | `1.2` | Prior width in logs of that decay, centred on the built one. |
-| `--infer_space` | `genome` | `genome` \| `v4_group`. `v4_group` fits one parameter per exact distinct V4 amplicon (`v4g_<sha256 prefix>`) and publishes `<id>.inferred_v4_groups.csv`, which the fit check reads. The genome table then splits each group evenly over its member references, marks genomes sharing a group `not_identifiable`, and leaves their intervals and `presence_prob` empty. Required for GTDB-scale sets; genome space logs a warning when one fitted V4 sequence spans more than 100 genomes. |
-| `--taxonomy` | `null` | MAPseq `.tax` (`header<TAB>lineage`) for the `lca` column of the v4-group table (longest common rank prefix of the members). Without it every group is `unclassified_v4_group`. Its sha256 is recorded in `inference_diagnostics.csv`. |
+| `--taxonomy` | `null` | MAPseq `.tax` (`header<TAB>lineage`) that `--panel_taxa` entries are resolved against. |
 | `--infer_horseshoe` | `false` | `vi` only, needs `--infer_presence false`: horseshoe shrinkage on unnormalised weights in place of the Dirichlet (`--infer_alpha` is ignored). |
 | `--panel_references` | – | Genome panel (same header convention as `--references`, or a directory of `<genome>.amplicons.fasta`). Per-sample override via the samplesheet. See [Panel reinterpretation](#panel-reinterpretation). |
 | `--panel_taxa` | – | TSV `id<TAB>taxon`: panel entries that are taxa. Needs `--taxonomy`. Per-sample override via the samplesheet. See [Taxon entries](#taxon-entries). |
 | `--panel_taxon_max_sources` | `200` | Fail a taxon entry that resolves to more database V4 groups than this; every group is a simulated source. |
-| `--panel_sim_n_per_ref` | `5000` | Simulated reads per distinct panel V4 source. |
-| `--infer_prune` | `true` | Fit only the genomes the sample's reads can reach — those owning an observed reference, or one byte-identical to it — instead of the whole reference set. Pruned genomes are still reported, at zero. Against a database-scale set this is most of the per-sample cost; set `false` to fit everything. |
 
 > **The distance decay, fixed or fitted.** `c` is a property of the *sample* — roughly
 > its per-base error rate — but the matrix is built once per reference set and shared by
@@ -442,7 +414,7 @@ nextflow run main.nf -profile singularity -c your_hpc.config \
 The flat error model misses context-specific relabels and scores no better than home labels
 alone; the presence gate collapses at long runs. Mapping reads directly against the panel
 (a panel-only `--references`) was more accurate on every sample; use reinterpretation when
-that is not possible. Requires `--infer_space genome` and `--mismapping_method simulate`.
+that is not possible. Requires `--mismapping_method simulate`.
 
 #### Taxon entries
 
@@ -507,7 +479,7 @@ results/
     <id>.inferred_composition.csv    inferred vs observed genome abundances
     <id>.inference_diagnostics.csv   matrix ID/path, fit status, and two diagonal summaries
     <id>.posterior_draws.npz         theta_eff and fitted nuisance posterior draws
-    <id>.fit_diagnostics.json        raw/grouped posterior-predictive forward-fit gate
+    <id>.fit_diagnostics.json        posterior-predictive forward-fit gate
     <id>.loss_trace.csv              (vi/mle)
     <id>.inferred_panel_members.csv  panel with taxon entries: the fitted per-member table
   pipeline_info/                     trace, report, timeline, dag, software versions
@@ -518,13 +490,12 @@ results/
 and `presence_prob` (posterior probability the genome is present; empty when
 `--infer_presence false`). Call a genome present at `presence_prob >= 0.5`.
 
-`fit_diagnostics.json` is calculated from the real MAPseq counts, the exact sparse matrix,
+`fit_diagnostics.json` is calculated from the real MAPseq counts, the exact panel kernel,
 and retained posterior draws. It reports observed-versus-expected total-variation distance
-and posterior-predictive percentiles at both raw-reference and exact-V4-group resolution.
+and a posterior-predictive percentile over the fitted labels (observed database V4 groups,
+a zero-count sink, and the background label), under `label`.
 `fit_status=model_misfit` is a release gate; `low_depth` is not a biological composition.
-`inference_diagnostics.csv` distinguishes the unweighted unique-kernel
-`mean_kernel_diagonal` from `mean_reference_diagonal`, which expands groups back to their
-member references. Treat `fit_diagnostics.json`, rather than the composition CSV alone,
+Treat `fit_diagnostics.json`, rather than the composition CSV alone,
 as the result's release status.
 
 ## Benchmarking
@@ -608,7 +579,6 @@ nextflow run main.nf -profile docker --input assets/samplesheet.example.yml --ou
 python bin/subspecies_infer.py amplicons --demo   # in-silico PCR, T, M-from-mseq
 python bin/simulate_amplicon_reads.py --demo      # fragment sampler + flat error model
 python bin/reads_to_fasta.py --demo
-python bin/infer_composition.py --demo            # needs numpy/torch/pyro (use the container)
 
 # Build a custom database, then verify MAPseq accepts its FASTA/tax pair.
 pytest tests/test_build_mapseq_database.py         # needs Docker; pulls the pinned MAPseq image

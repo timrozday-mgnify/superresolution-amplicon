@@ -31,27 +31,6 @@ nextflow_pipeline {
         }
     }
 
-    test("v4_group space publishes the group table - stub") {
-        tag "stub"
-        options "-stub"
-        when {
-            params {
-                input       = "${projectDir}/assets/samplesheet.example.yml"
-                outdir      = "$outputDir"
-                infer_space = "v4_group"
-            }
-        }
-        then {
-            assertAll(
-                { assert workflow.success },
-                { assert workflow.trace.succeeded().size() == 12 },
-                { assert path("${params.outdir}/composition/demo/demo.inferred_v4_groups.csv").exists() },
-                { assert path("${params.outdir}/composition/demo/demo.inferred_composition.csv").exists() },
-                { assert path("${params.outdir}/composition/demo/demo.fit_diagnostics.json").exists() }
-            )
-        }
-    }
-
     test("panel_references builds a panel kernel instead of a square matrix - stub") {
         tag "stub"
         options "-stub"

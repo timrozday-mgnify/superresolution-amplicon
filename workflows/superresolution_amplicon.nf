@@ -62,9 +62,6 @@ workflow SUPERRESOLUTION_AMPLICON {
                  "about the per-base error rate, or 'auto' to measure it, or set " +
                  "--infer_distance_decay to fit it per sample."
     }
-    if (!(params.infer_space in ['genome', 'v4_group'])) {
-        error "--infer_space must be 'genome' or 'v4_group'"
-    }
     if (params.infer_horseshoe.toString() == 'true'
         && (params.infer_presence.toString() == 'true' || params.infer_mode != 'vi')) {
         error "--infer_horseshoe replaces the presence gate and needs --infer_mode vi " +
@@ -234,7 +231,7 @@ workflow SUPERRESOLUTION_AMPLICON {
                 align_ambiguity_weight: params.align_ambiguity_weight,
                 max_ambiguous_bases: params.max_ambiguous_bases, max_postings: params.max_postings,
                 sim_error_model: params.sim_error_model,
-                sim_n_per_ref: params.panel_sim_n_per_ref, sim_read_len: params.sim_read_len,
+                sim_n_per_ref: params.sim_n_per_ref, sim_read_len: params.sim_read_len,
                 flat_sub_rate: params.flat_sub_rate, flat_ins_rate: params.flat_ins_rate,
                 flat_del_rate: params.flat_del_rate, mapseq_args: params.mapseq_args,
                 mapseq_min_identity: params.mapseq_min_identity, mapseq_tag: params.mapseq_tag,
@@ -363,13 +360,10 @@ workflow SUPERRESOLUTION_AMPLICON {
 
     // Reconstruct the observation-space forward fit for every sample. This remains
     // downstream of the depth gate so low-depth samples receive an explicit diagnostic
-    // rather than a silently interpretable composition. In v4_group space the group table
-    // is the fitted result; the genome table is only a labelled split of it.
-    ch_fit_composition = params.infer_space == 'v4_group'
-        ? INFER_COMPOSITION.out.v4_groups : INFER_COMPOSITION.out.composition
+    // rather than a silently interpretable composition.
     ch_fit_in = ch_infer_in
         .map { meta, d, matrix, obs, matrix_key -> [ meta.id, meta, d, matrix, obs ] }
-        .join(ch_fit_composition.map { meta, composition -> [ meta.id, composition ] })
+        .join(INFER_COMPOSITION.out.composition.map { meta, composition -> [ meta.id, composition ] })
         .join(INFER_COMPOSITION.out.posterior.map { meta, posterior -> [ meta.id, posterior ] })
         .map { id, meta, d, matrix, obs, composition, posterior ->
             [ meta, d, matrix, obs, composition, posterior ] }
