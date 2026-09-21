@@ -217,6 +217,7 @@ Reference amplicons (in-silico PCR):
 |-------|---------|-------------|
 | `--fwd_primer` / `--rev_primer` | V4 515F / 806R | Amplicon primers. |
 | `--primer_mismatches` | `3` | Allowed primer mismatches. |
+| `--amplicon_cache` | – | Directory that keeps each reference set's extracted amplicons and mapseq clustering (`storeDir`), keyed by the reference FASTA (path, size, mtime), primers and extractor code. Runs pointed at the same directory reuse them instead of rebuilding — at SILVA/GTDB scale the clustering alone is tens of minutes. The cache is unlocked: warm it with one run before starting several on the same set at once. |
 | `--trim_primers` | `true` | Trim primers off observed reads before mapping, and simulate the matrix and panel reads from primer-flanked amplicons trimmed the same way. Set `false` if reads are already primer-trimmed. |
 
 Mis-mapping — how `M` is built:
