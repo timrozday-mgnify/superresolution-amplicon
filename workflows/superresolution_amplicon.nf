@@ -23,6 +23,7 @@ workflow SUPERRESOLUTION_AMPLICON {
     ch_reads      // [ meta, [ reads ] ]                (meta.id, meta.platform)
     ch_refs       // [ meta, references_fasta ]
     ch_pretrained // retained for the public workflow signature
+    trained_scope // 'per-sample' | 'pooled': params.trained_error_model_scope, resolved in main.nf
 
     main:
     ch_versions = Channel.empty()
@@ -92,7 +93,7 @@ workflow SUPERRESOLUTION_AMPLICON {
         ch_model = ch_reads.map { meta, reads -> [ meta.id, file("${projectDir}/assets/NO_MODEL"), 'flat' ] }
     }
     else {
-        if (!(params.trained_error_model_scope in ['per-sample', 'pooled'])) {
+        if (!(trained_scope in ['per-sample', 'pooled'])) {
             error "--trained_error_model_scope must be 'per-sample' or 'pooled'"
         }
         ch_reads
@@ -103,7 +104,7 @@ workflow SUPERRESOLUTION_AMPLICON {
             .set { ch_split }
 
         ch_supplied_model = ch_split.pretrained.map { meta, reads -> [ meta.id, meta.error_model, 'supplied' ] }
-        if (params.trained_error_model_scope == 'pooled') {
+        if (trained_scope == 'pooled') {
             ch_pool_input = ch_split.train
                 .flatMap { meta, reads -> reads.collect { read -> [ meta.platform, read ] } }
                 .groupTuple()

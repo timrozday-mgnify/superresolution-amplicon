@@ -106,5 +106,10 @@ workflow {
         .filter { row -> row.error_model }
         .map { row -> [ row.id, resolveFile(row.error_model.toString()) ] }
 
-    SUPERRESOLUTION_AMPLICON(ch_reads, ch_refs, ch_pretrained)
+    // AAP batches (any `merged: true` row) default to one pooled model: every run went
+    // through the same read preparation, and pooling trains on all their reads at once.
+    def trained_scope = params.trained_error_model_scope
+        ?: (rows.any { it.merged?.toString() == 'true' } ? 'pooled' : 'per-sample')
+
+    SUPERRESOLUTION_AMPLICON(ch_reads, ch_refs, ch_pretrained, trained_scope)
 }

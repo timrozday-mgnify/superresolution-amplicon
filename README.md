@@ -249,11 +249,19 @@ simulates reads, so nothing needs an error model and the skiver subworkflow neve
 | param | default | description |
 |-------|---------|-------------|
 | `--sim_error_model` | `flat` | `flat` (constant per-base probability per mutation type; **no training at all**) or `trained` (skiver context model). See [the sensitivity result](dev/error_rate_sensitivity.md) for why `flat` is the default. |
-| `--trained_error_model_scope` | `per-sample` | With `trained`, fit one model per sample or one pooled model per platform. Explicit sample `error_model` files always win. |
+| `--trained_error_model_scope` | `per-sample`, or `pooled` if any row is `merged: true` | With `trained`, fit one model per sample or one pooled model per platform. Explicit sample `error_model` files always win. |
 | `--trained_error_model_max_reads` | `1000000` | Pooled mode: deterministic, uniformly sampled FASTQ records per platform (`0` = all). |
 | `--flat_sub_rate` | `0.005` | Flat model: per-base substitution probability. |
 | `--flat_ins_rate` | `0.0005` | Flat model: per-base insertion probability. |
 | `--flat_del_rate` | `0.0005` | Flat model: per-base deletion probability. |
+
+For amplicon-analysis-pipeline merged reads, a flat starting point is `--flat_sub_rate 3.4e-4
+--flat_ins_rate 4e-6 --flat_del_rate 4e-6`: the pooled interior rates of 20 Nov2025 runs
+(2×310 V4), measured against their mock community's genomes
+([dev/aap_merge_effects.md](dev/aap_merge_effects.md), 0.2). They are per-run numbers, not
+a property of AAP. `--sim_error_model trained` on `merged: true` rows trains on the merged
+reads themselves, pooled per platform. Position covariates (skiver's `Position(N)`) are not
+among the candidates: the pinned skiver cannot simulate from them.
 | `--sim_n_per_ref` | `5000` | Simulated reads per distinct panel V4 source (sampling depth for the kernel). |
 | `--panel_kernel` | – | A `mismapping/panel_<key>/` directory published by an earlier run. Skips building the kernel: no panel preparation, error-model training, simulation or panel mapping. Refused unless its `provenance.json` names the same extracted amplicons (`reference_sha256`), MAPseq database (`mapseq_db`), `panel` and `panel_taxa` as every sample's. |
 

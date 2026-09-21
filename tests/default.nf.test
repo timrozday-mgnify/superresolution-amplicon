@@ -480,6 +480,27 @@ nextflow_pipeline {
         }
     }
 
+    test("AAP merged rows train one pooled model by default - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input           = "${projectDir}/tests/data/samplesheet.aap.yml"
+                outdir          = "$outputDir"
+                references      = "${projectDir}/tests/data/refs.fasta"
+                trim_primers    = false
+                sim_error_model = "trained"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.succeeded().findAll { it.name.contains('POOL_TRAINING_READS') }.size() == 1 },
+                { assert workflow.trace.succeeded().findAll { it.name.contains('SKIVER_TRAIN') }.size() == 1 }
+            )
+        }
+    }
+
     test("distinct reference sets build distinct panel kernels - stub") {
         tag "stub"
         options "-stub"
