@@ -28,6 +28,7 @@ import argparse
 import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -152,10 +153,30 @@ def _v4_groups(amplicon_dir: Path, references: list[str]) -> tuple[list[str], np
     return ids.tolist(), group.astype(np.int64)
 
 
+_RANK_PREFIX = re.compile(r"^[a-z]+__")
+
+
+def _plain_lineage(lineage: str) -> str:
+    """An AAP-form lineage (``sk__Bacteria;k__;...;s__Genus_species``) in the plain form
+    SILVA's own .tax uses: prefixes dropped, the species as ``Genus species``, an empty
+    rank ``unclassified``. A lineage without ``__`` is returned unchanged."""
+    if "__" not in lineage:
+        return lineage
+    ranks = []
+    for rank in lineage.split(";"):
+        name = _RANK_PREFIX.sub("", rank.strip())
+        if rank.strip().startswith("s__"):
+            name = name.replace("_", " ")
+        ranks.append(name or "unclassified")
+    return ";".join(ranks)
+
+
 def _read_taxonomy(path: Path) -> dict[str, str]:
     """MAPseq ``.tax`` (``header<TAB>lineage``, ``#`` comments) -> header: lineage.
 
     Lineages stay unsplit: GTDB has ~1e6 of them and only fitted groups need ranks.
+    AAP's SILVA-SSU-tax.txt reads as the plain SILVA form (_plain_lineage), so panel taxa
+    and ``lca`` use bare names whichever tax file the database ships.
     """
     lineages = {}
     with open(path) as handle:
@@ -163,7 +184,7 @@ def _read_taxonomy(path: Path) -> dict[str, str]:
             if line.startswith("#") or "\t" not in line:
                 continue
             header, lineage = line.rstrip("\n").split("\t", 1)
-            lineages[header] = lineage
+            lineages[header] = _plain_lineage(lineage)
     return lineages
 
 

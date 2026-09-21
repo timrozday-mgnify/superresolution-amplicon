@@ -43,6 +43,8 @@ process PANEL_KERNEL {
     cp ${prepared}/panel_translation.tsv ${prepared}/sources.tsv ${meta.id}/
     touch ${meta.id}/mismapping_matrix.npz
     printf 'source\\thome_label\\n' > ${meta.id}/panel_sources.tsv
+    # Which file the labels were grouped from: the extracted amplicons, never the MAPseq FASTA.
+    printf '%s\\n' ${db_amplicons} > ${meta.id}/stub_db_amplicons.txt
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":
@@ -95,6 +97,8 @@ process PANEL_ALIGN {
     cp ${prepared}/panel_translation.tsv ${prepared}/sources.tsv ${meta.id}/
     touch ${meta.id}/mismapping_matrix.npz
     printf 'source\\thome_label\\n' > ${meta.id}/panel_sources.tsv
+    # Which file the labels were grouped from: the extracted amplicons, never the MAPseq FASTA.
+    printf '%s\\n' ${db_amplicons} > ${meta.id}/stub_db_amplicons.txt
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":

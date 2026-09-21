@@ -1,4 +1,4 @@
-// Classify reads against the amplicon reference set with mapseq. One process for both
+// Classify reads against the reference FASTA with mapseq. One process for both
 // simulated panel reads (-> the panel kernel) and real reads (-> observed per-reference
 // counts), aliased MAPSEQ_PANEL_SIM / MAPSEQ_OBS in the workflow and told apart only by
 // ext.prefix. Simulation uses the same mapper and settings as the real-read path.

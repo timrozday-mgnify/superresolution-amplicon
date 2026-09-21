@@ -1,0 +1,6 @@
+# The reference FASTA ships its MAPseq clustering beside it (prebuilt/refs.fasta.mscluster),
+# as AAP's SILVA-SSU does, so MAPSEQ_CLUSTER is skipped.
+- id: demo
+  reads: tests/data/sample.fastq.gz
+  platform: hq-illumina
+  references: tests/data/prebuilt/refs.fasta
