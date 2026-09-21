@@ -1,7 +1,7 @@
-// In-silico PCR over the reference DB: the primer-trimmed amplicons become the mapseq
-// reference set (fasta + the .tax sidecar mapseq requires), alongside the genome ->
-// reference translation table T. The downstream panel workflow uses these amplicons to
-// construct a panel-to-database kernel.
+// In-silico PCR over the reference DB: the primer-trimmed amplicons (the database's V4
+// groups, and the panel workflow's sources and alignment input), the genome -> reference
+// translation table T, and references.tax, the MAPseq tax for mapping against the DB
+// FASTA itself.
 process EXTRACT_AMPLICONS {
     tag "$meta.id"
     label 'process_medium'
@@ -43,7 +43,7 @@ process EXTRACT_AMPLICONS {
     mkdir -p ${prefix}_amplicons
     cd ${prefix}_amplicons
     printf '>%s\\nACGTACGTACGT\\n' "\$REF_ID" > amplicons.fasta
-    printf '#cutoff: 0.00:0.08\\n#name: refdb\\n#levels: Kingdom Genome Copy\\n%s\\tBacteria;ref;%s\\n' "\$REF_ID" "\$REF_ID" > amplicons.tax
+    printf '#cutoff: 0.00:0.08\\n#name: refdb\\n#levels: Kingdom Genome Copy\\n%s\\tBacteria;ref;%s\\n' "\$REF_ID" "\$REF_ID" > references.tax
     printf 'genome_id\\trefseq\\tweight\\nref\\t%s\\t1.0\\n' "\$REF_ID" > translation_table.tsv
     printf 'refseq,genome,amplicon_len,amplifiable\\n%s,ref,12,True\\n' "\$REF_ID" > refseq_index.csv
     cd ..

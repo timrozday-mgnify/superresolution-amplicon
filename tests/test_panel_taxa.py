@@ -200,3 +200,19 @@ def test_a_one_group_taxon_fits_like_the_genome_it_equals(tmp_path: Path) -> Non
     b = pd.read_csv(taxon / "inferred_composition.csv").inferred_mean.to_numpy()
     assert np.allclose(a, b, atol=1e-6), (a, b)
     assert not (genome / "inferred_panel_members.csv").exists()
+
+
+def test_aap_lineages_read_as_plain_silva(tmp_path):
+    """AAP's SILVA-SSU-tax.txt (rank prefixes, s__Genus_species, empty ranks) resolves
+    panel taxa by the same bare names as SILVA's own .tax."""
+    tax = tmp_path / "SILVA-SSU-tax.txt"
+    tax.write_text("#levels: Superkingdom Kingdom Phylum Genus Species\n"
+                   "AB1.1.1500\tsk__Bacteria;k__;p__Bacteroidota;g__Bacteroides;"
+                   "s__Bacteroides_fragilis\n"
+                   "AB2.1.1500\tBacteria;Bacillota\n")
+    lineage_of = ic._read_taxonomy(tax)
+    assert lineage_of["AB1.1.1500"] == ("Bacteria;unclassified;Bacteroidota;Bacteroides;"
+                                        "Bacteroides fragilis")
+    assert lineage_of["AB2.1.1500"] == "Bacteria;Bacillota"          # plain form untouched
+    prefixes = {bpk._ranks(lineage_of["AB1.1.1500"])[:i] for i in range(1, 6)}
+    assert bpk._resolve_taxon("Bacteroides fragilis", prefixes)[-1] == "Bacteroides fragilis"

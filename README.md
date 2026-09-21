@@ -4,7 +4,9 @@ Error-model-driven **sub-species genome composition inference** from amplicon (e
 16S V4) sequencing reads. Given fastq reads and a set of reference sequences, the
 pipeline:
 
-1. **Extracts the reference amplicons** by in-silico PCR, giving the mapseq reference set.
+1. **Extracts the reference amplicons** by in-silico PCR. They define the database's V4
+   groups and the sources reads are simulated from; reads are mapped against the
+   reference FASTA itself (see [The MAPseq database](#the-mapseq-database)).
 2. **Measures reference-to-reference mis-mapping** — how easily each reference's amplicon
    is confused for another — by **simulating reads from every reference under a
    sequencing error model and mapping them with the same mapper the real reads go
@@ -191,6 +193,28 @@ nextflow run main.nf --input samples.yml \
 A SILVA reference is a sequence, not a genome, so genome-space inference against it has no
 biological reading. Use it through `v4_group` or a panel (`panel_references`).
 
+### The MAPseq database
+
+Every MAPseq mapping in a run (observed reads, panel home and simulated reads) goes against
+the `references` FASTA itself, not its extracted amplicons. So a database the
+amplicon-analysis-pipeline ships is used as is, and its labels are AAP's:
+
+```
+SILVA-SSU/138.1/SILVA-SSU.fasta              --references
+SILVA-SSU/138.1/SILVA-SSU.fasta.mscluster    MAPseq's clustering, found beside the FASTA
+SILVA-SSU/138.1/SILVA-SSU-tax.txt            --taxonomy (AAP's sk__/s__ form reads as SILVA's)
+```
+
+- A `<fasta>.mscluster` beside the FASTA is used, never rebuilt. Without one, the run
+  clusters the FASTA once, cached under `--amplicon_cache`: seconds for a genome
+  collection, hours for 2M sequences.
+- The FASTA must be uncompressed: MAPseq cannot read a gzipped database.
+- MAPseq is given a generated `references.tax`. The tax file changes only MAPseq's
+  taxonomy columns, never the hit, which is all the pipeline reads. Lineages come from
+  `--taxonomy`.
+- A hit on an entry with no amplicon under the primers is off-target and dropped (0.29% of
+  reads against AAP's SILVA, `dev/aap_merge_effects.md` 0.6).
+
 ## Parameters
 
 Run mode / IO:
@@ -198,7 +222,7 @@ Run mode / IO:
 | param | default | description |
 |-------|---------|-------------|
 | `--input` | – | YAML samplesheet (required). |
-| `--references` | – | Default reference fasta (per-sample override in samplesheet). |
+| `--references` | – | Default reference fasta, also the MAPseq database (per-sample override in samplesheet). A `<fasta>.mscluster` beside it is used as is. |
 | `--outdir` | `./results` | Output directory. |
 | `--platform` | `hq-illumina` | Default platform (see samplesheet). |
 | `--error_model` | – | Global pre-trained model (per-sample override in samplesheet). |
@@ -217,7 +241,7 @@ Reference amplicons (in-silico PCR):
 |-------|---------|-------------|
 | `--fwd_primer` / `--rev_primer` | V4 515F / 806R | Amplicon primers. |
 | `--primer_mismatches` | `3` | Allowed primer mismatches. |
-| `--amplicon_cache` | – | Directory that keeps each reference set's extracted amplicons and mapseq clustering (`storeDir`), keyed by the reference FASTA (path, size, mtime), primers and extractor code. Runs pointed at the same directory reuse them instead of rebuilding — at SILVA/GTDB scale the clustering alone is tens of minutes. The cache is unlocked: warm it with one run before starting several on the same set at once. |
+| `--amplicon_cache` | – | Directory that keeps each reference set's extracted amplicons and, when no `.mscluster` ships beside the FASTA, its mapseq clustering (`storeDir`), keyed by the reference FASTA (path, size, mtime), primers and extractor code. Runs pointed at the same directory reuse them instead of rebuilding — at SILVA/GTDB scale the clustering alone is tens of minutes. The cache is unlocked: warm it with one run before starting several on the same set at once. |
 | `--trim_primers` | `true` | Trim primers off observed reads before mapping, and simulate the matrix and panel reads from primer-flanked amplicons trimmed the same way. Set `false` if reads are already primer-trimmed. |
 
 Mis-mapping — how `M` is built:
@@ -254,7 +278,7 @@ simulates reads, so nothing needs an error model and the skiver subworkflow neve
 
 In-silico PCR and the mapseq clustering run once per distinct `references` file,
 however many samples name it: 50 samples against one GTDB SSU FASTA extract and
-cluster it once. `amplicons/<id>_amplicons/` is still published per sample. The
+cluster it once (or not at all, when its `.mscluster` ships beside it). `amplicons/<id>_amplicons/` is still published per sample. The
 pipeline then fingerprints extracted amplicons and builds each compatible matrix once
 per run. Canonical reusable matrices are published under `mismapping/<matrix-key>/`:
 
@@ -463,8 +487,8 @@ results/
     <id>.context_model_aic.csv       AIC over candidate architectures
     <id>.error_model_report.html     diagnostic report
   amplicons/<id>_amplicons/
-    amplicons.fasta                  extracted reference amplicons (mapseq DB)
-    amplicons.tax                    mapseq taxonomy sidecar
+    amplicons.fasta                  extracted reference amplicons (the V4 groups)
+    references.tax                   mapseq tax over every reference, for the FASTA
     translation_table.tsv            compact genome->reference table T
     refseq_index.csv                 per-reference amplifiability
   mapseq/<id>/

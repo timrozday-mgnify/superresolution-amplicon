@@ -5,8 +5,9 @@ Library + the ``amplicons`` CLI stage. The pipeline is:
 
 ``amplicons`` (this CLI)
     In-silico PCR over the reference DB: extract each entry's amplicon between the
-    primers and write the mapseq reference set (``amplicons.fasta`` + ``amplicons.tax``)
-    plus the deterministic genome->reference translation table ``T``.
+    primers and write them (``amplicons.fasta``), the deterministic genome->reference
+    translation table ``T``, and a MAPseq ``references.tax`` over every DB entry for a
+    DB that ships none. MAPseq maps against the DB FASTA itself, not the amplicons.
 
 *simulate -> map* (``simulate_amplicon_reads.py`` + mapseq, driven by Nextflow)
     Reads are sampled from each reference amplicon under a sequencing error model and
@@ -348,7 +349,8 @@ def stage_amplicons(args) -> None:
     with open(out / "amplicons.fasta", "w") as fh:
         for h, s in zip(refseqs, amplicons):
             fh.write(f">{h}\n{s}\n")
-    write_mapseq_tax(refseqs, out / "amplicons.tax")
+    # Over every entry, amplifiable or not: MAPseq maps against the whole DB FASTA.
+    write_mapseq_tax([header for header, _ in records], out / "references.tax")
 
     print(f"amplicons: {len(refseqs)} amplifiable refs / {len(records)} DB entries, "
           f"{len(genomes)} genomes -> {out}")
@@ -985,6 +987,7 @@ def demo_amplicons() -> None:
         with open(db, "w") as fh:
             for i, h in enumerate(headers):
                 fh.write(f">{h}\n{seq[:-3] + 'ACG'[i]}\n")   # all amplifiable
+            fh.write(">AB1.1.1500\n" + "ACGT" * 20 + "\n")   # no primer sites
         args = argparse.Namespace(
             db_fasta=db, fwd_primer=DEFAULT_FWD_PRIMER, rev_primer=DEFAULT_REV_PRIMER,
             primer_mismatches=2, output_dir=td / "out")
@@ -993,9 +996,12 @@ def demo_amplicons() -> None:
         assert T["refseq"].tolist() == headers, T
         assert np.allclose(T.groupby("genome_id")["weight"].sum(), 1.0), T
         assert np.allclose(T.loc[T["genome_id"] == "gA", "weight"], [0.5, 0.5]), T
-        tax = (td / "out" / "amplicons.tax").read_text().splitlines()
-        assert tax[0].startswith("#cutoff:") and len(tax) == 3 + len(headers), tax
+        tax = (td / "out" / "references.tax").read_text().splitlines()
+        assert tax[0].startswith("#cutoff:") and len(tax) == 3 + len(headers) + 1, tax
         assert tax[3] == "gA|0|x\tBacteria;gA;gA|0|x", tax[3]
+        # A bare SILVA accession (no '|') is its own genome, amplicon or not.
+        assert tax[-1] == "AB1.1.1500\tBacteria;AB1.1.1500;AB1.1.1500", tax[-1]
+        assert genome_of_header("AB1.1.1500") == "AB1.1.1500"
         assert dict(read_fasta(td / "out" / "amplicons.fasta"))["gA|0|x"] == payload
 
         # build_mismapping: source ref from the read name, target from mseq field 2.
@@ -1176,7 +1182,7 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    m = sub.add_parser("amplicons", help="in-silico PCR -> mapseq reference set + T")
+    m = sub.add_parser("amplicons", help="in-silico PCR -> amplicons + T + references.tax")
     m.add_argument("--db-fasta", type=Path)
     m.add_argument("--fwd-primer", default=DEFAULT_FWD_PRIMER)
     m.add_argument("--rev-primer", default=DEFAULT_REV_PRIMER)

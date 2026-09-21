@@ -129,7 +129,7 @@ workflow SUPERRESOLUTION_AMPLICON {
         }
     }
 
-    // In-silico PCR -> the mapseq reference set (+ translation table T), then its mapseq
+    // In-silico PCR -> the V4 amplicons (+ translation table T), then the FASTA's mapseq
     // clustering: once per distinct reference FASTA, however many samples name it. At GTDB
     // scale each is hours. The set's meta holds only its id, so adding or removing a
     // sample leaves both tasks cached.
@@ -149,38 +149,72 @@ workflow SUPERRESOLUTION_AMPLICON {
         .unique { it[0] }
         .map { set, meta, refs -> [ [ id: set ], refs ] })
     ch_versions = ch_versions.mix(EXTRACT_AMPLICONS.out.versions)
-    // [ set meta, amplicons.fasta, amplicons.tax ]: the mapseq reference set.
-    ch_set_refs = EXTRACT_AMPLICONS.out.dir.map { meta, d ->
-        [ meta, d.resolve('amplicons.fasta'), d.resolve('amplicons.tax') ] }
 
-    // Every set is clustered: every sample has a panel (`database` by default), and its
-    // sources are mapped home against the database even when the sample supplies `mseq:`.
-    MAPSEQ_CLUSTER(ch_set_refs)
+    // The MAPseq database is the reference FASTA itself, not its amplicons: every mapping
+    // (observed reads, panel home and simulated reads) goes against it, so a database
+    // AAP ships (FASTA + .mscluster) labels reads exactly as AAP does. Its amplicon hits
+    // carry the FASTA's own headers; hits on an entry with no amplicon are off-target.
+    // MAPseq gets the generated references.tax: the tax file changes only the taxonomy
+    // columns, never the hit (400/400 SILVA queries identical under AAP's tax file).
+    // A `<fasta>.mscluster` beside the FASTA is used as is; otherwise it is built once.
+    // [ set, refs, tax, prebuilt mscluster | null, amplicon dir ]
+    ch_set_src = ch_refs_by_set
+        .map { set, meta, refs -> [ set, refs ] }
+        .unique { it[0] }
+        .join(EXTRACT_AMPLICONS.out.dir.map { meta, d -> [ meta.id, d ] })
+        .map { set, refs, d ->
+            if (refs.name.endsWith('.gz')) {
+                error "MAPseq maps against the reference FASTA itself and cannot read a " +
+                      "gzipped one: gunzip ${refs}"
+            }
+            def mscluster = refs.resolveSibling(refs.name + '.mscluster')
+            if (!mscluster.exists() && refs.size() > 100_000_000) {
+                log.warn "${refs} has no ${mscluster.name} beside it: clustering it here, " +
+                         "once per --amplicon_cache, can take hours"
+            }
+            [ set, refs, d.resolve('references.tax'), mscluster.exists() ? mscluster : null, d ]
+        }
+        .branch { set, refs, tax, mscluster, d ->
+            prebuilt: mscluster
+            cluster:  true
+        }
+    MAPSEQ_CLUSTER(ch_set_src.cluster.map { set, refs, tax, mscluster, d -> [ [ id: set ], refs, tax ] })
     ch_versions = ch_versions.mix(MAPSEQ_CLUSTER.out.versions)
+    // [ set, amplicon dir, fasta, tax, mscluster, database identity ]. The identity names
+    // the FASTA and where its clustering came from, not the clustering's work path, so the
+    // panel key is stable across runs.
+    ch_sets = ch_set_src.prebuilt
+        .map { set, refs, tax, mscluster, d ->
+            [ set, d, refs, tax, mscluster,
+              [refs.toUriString(), refs.size(), refs.lastModified(), mscluster.size(),
+               mscluster.lastModified()].join('|') ] }
+        .mix(ch_set_src.cluster
+            .map { set, refs, tax, mscluster, d -> [ set, refs, tax, d ] }
+            .join(MAPSEQ_CLUSTER.out.mscluster.map { meta, mscluster -> [ meta.id, mscluster ] })
+            .map { set, refs, tax, d, mscluster ->
+                [ set, d, refs, tax, mscluster,
+                  [refs.toUriString(), refs.size(), refs.lastModified(), 'clustered'].join('|') ] })
 
     // Fan the shared results back out to samples by set id. combine, not join: join is
     // 1:1 and would keep one sample per set.
     ch_sample_sets = ch_refs_by_set.map { set, meta, refs -> [ set, meta ] }
+    ch_sample_db = ch_sample_sets.combine(ch_sets, by: 0)
     // [ sample meta, amplicon_dir ]
-    ch_amplicons = ch_sample_sets
-        .combine(EXTRACT_AMPLICONS.out.dir.map { meta, d -> [ meta.id, d ] }, by: 0)
-        .map { set, meta, d -> [ meta, d ] }
-    // [ sample id, fasta, tax, mscluster ] — the mapseq DB slots, shared by both mappings.
-    ch_db = ch_sample_sets
-        .combine(ch_set_refs
-            .map { meta, fasta, tax -> [ meta.id, fasta, tax ] }
-            .join(MAPSEQ_CLUSTER.out.mscluster.map { meta, mscluster -> [ meta.id, mscluster ] }), by: 0)
-        .map { set, meta, fasta, tax, mscluster -> [ meta.id, fasta, tax, mscluster ] }
+    ch_amplicons = ch_sample_db.map { set, meta, d, fasta, tax, mscluster, db -> [ meta, d ] }
+    // [ sample id, fasta, tax, mscluster ] — the mapseq DB slots, shared by every mapping.
+    ch_db = ch_sample_db.map { set, meta, d, fasta, tax, mscluster, db ->
+        [ meta.id, fasta, tax, mscluster ] }
 
-    // Fingerprint every panel kernel. The hash includes the extracted database, panel
-    // identity, model identity, and every method setting that can affect the kernel.
-    MATRIX_KEY(ch_amplicons
-        .map { meta, d -> [ meta.id, meta, d ] }
+    // Fingerprint every panel kernel. The hash includes the extracted database, the MAPseq
+    // database, panel identity, model identity, and every method setting that can affect
+    // the kernel.
+    MATRIX_KEY(ch_sample_db
+        .map { set, meta, d, fasta, tax, mscluster, db -> [ meta.id, meta, d, db ] }
         .join(ch_model)
-        .map { id, meta, d, model, identity -> [ meta, d, model, identity ] })
+        .map { id, meta, d, db, model, identity -> [ meta, d, model, identity, db ] })
     ch_panel_groups = MATRIX_KEY.out.key
-        .map { meta, d, identity_file, identity, key_file, ref_file ->
-            [ key_file.text.trim(), [meta, d, identity_file, identity, ref_file.text.trim()] ]
+        .map { meta, d, identity_file, identity, key_file, ref_file, mapseq_db ->
+            [ key_file.text.trim(), [meta, d, identity_file, identity, ref_file.text.trim(), mapseq_db] ]
         }
         .groupTuple()
         .map { key, entries ->
@@ -190,7 +224,7 @@ workflow SUPERRESOLUTION_AMPLICON {
             def id = "panel_${key.take(16)}"
             def members = entries.collect { it[0].id }
             def provenance = [
-                matrix_key: id, reference_sha256: rep[4], panel: panel,
+                matrix_key: id, reference_sha256: rep[4], mapseq_db: rep[5], panel: panel,
                 panel_taxa: panel_taxa, model_identity: rep[3],
                 mismapping_method: params.mismapping_method, align_tau: params.align_tau,
                 align_distance_decay: params.align_distance_decay,
@@ -220,6 +254,8 @@ workflow SUPERRESOLUTION_AMPLICON {
         .combine(ch_db, by: 0)
         .map { db_id, meta, sources, fasta, tax, mscluster -> [ meta, sources, fasta, tax, mscluster ] }
     MAPSEQ_PANEL_HOME(ch_panel_db)
+    // [ panel id, database amplicons.fasta ]
+    ch_db_amplicons = ch_panel_groups.map { meta, panel, d, model -> [ meta.id, d.resolve('amplicons.fasta') ] }
     ch_versions = ch_versions.mix(MAPSEQ_PANEL_HOME.out.versions)
     if (params.mismapping_method == 'simulate') {
         SIMULATE_PANEL_READS(PANEL_PREPARE.out.sources
@@ -232,9 +268,11 @@ workflow SUPERRESOLUTION_AMPLICON {
             .map { id, reads, meta, fasta, tax, mscluster -> [ meta, reads, fasta, tax, mscluster ] })
         ch_versions = ch_versions.mix(SIMULATE_PANEL_READS.out.versions)
             .mix(MAPSEQ_PANEL_SIM.out.versions)
+        // The kernel's labels are the database's V4 groups, so it takes the extracted
+        // amplicons, never the MAPseq FASTA (whole SSU sequences would group nothing).
         PANEL_KERNEL(PANEL_PREPARE.out.prepared
             .map { meta, prepared -> [ meta.id, meta, prepared ] }
-            .join(ch_panel_db.map { meta, sources, fasta, tax, mscluster -> [ meta.id, fasta ] })
+            .join(ch_db_amplicons)
             .join(MAPSEQ_PANEL_HOME.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
             .join(MAPSEQ_PANEL_SIM.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
             .map { id, meta, prepared, fasta, home, sim -> [ meta, prepared, fasta, home, sim ] })
@@ -244,7 +282,7 @@ workflow SUPERRESOLUTION_AMPLICON {
     else {
         PANEL_ALIGN(PANEL_PREPARE.out.prepared
             .map { meta, prepared -> [ meta.id, meta, prepared ] }
-            .join(ch_panel_db.map { meta, sources, fasta, tax, mscluster -> [ meta.id, fasta ] })
+            .join(ch_db_amplicons)
             .join(MAPSEQ_PANEL_HOME.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
             .join(ch_panel_groups.map { meta, panel, d, model -> [ meta.id, model ] })
             .map { id, meta, prepared, fasta, home, model -> [ meta, prepared, fasta, home, model ] })

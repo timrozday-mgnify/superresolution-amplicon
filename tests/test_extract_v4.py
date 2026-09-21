@@ -89,3 +89,8 @@ def test_batched_extraction_matches_the_per_sequence_scan() -> None:
     # Batch boundaries must not change any call.
     assert [a for b in si._batches(seqs, max_cells=4000) for a in
             si.extract_v4_batch(b, FWD, REV, 3)] == expected
+
+
+def test_stage_amplicons_demo():
+    """T over amplifiable entries, references.tax over all of them, bare-accession genomes."""
+    si.demo_amplicons()

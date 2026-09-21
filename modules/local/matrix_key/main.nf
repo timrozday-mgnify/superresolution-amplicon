@@ -5,10 +5,12 @@ process MATRIX_KEY {
     container "ghcr.io/timrozday-mgnify/sra-skiver:${params.sra_skiver_tag}"
 
     input:
-    tuple val(meta), path(amplicon_dir), path(identity_file), val(identity)
+    // mapseq_db: the MAPseq database's identity (the workflow's ch_sets). Every label in the
+    // kernel comes from mapping against it, so it is part of the key.
+    tuple val(meta), path(amplicon_dir), path(identity_file), val(identity), val(mapseq_db)
 
     output:
-    tuple val(meta), path(amplicon_dir), path(identity_file), val(identity), path("matrix_key.txt"), path("reference_sha256.txt"), emit: key
+    tuple val(meta), path(amplicon_dir), path(identity_file), val(identity), path("matrix_key.txt"), path("reference_sha256.txt"), val(mapseq_db), emit: key
     path "versions.yml", emit: versions
 
     script:
@@ -28,7 +30,7 @@ process MATRIX_KEY {
         fwd_primer: params.fwd_primer, rev_primer: params.rev_primer,
         primer_mismatches: params.primer_mismatches, trim_primers: params.trim_primers,
         mapseq_args: params.mapseq_args, mapseq_min_identity: params.mapseq_min_identity,
-        mapseq_tag: params.mapseq_tag, seed: params.seed, identity: identity
+        mapseq_tag: params.mapseq_tag, mapseq_db: mapseq_db, seed: params.seed, identity: identity
     ].collect { k, v -> "${k}=${v}" }.sort().join('\n')
     """
     sha256sum ${amplicon_dir}/amplicons.fasta | awk '{print \$1}' > reference_sha256.txt
