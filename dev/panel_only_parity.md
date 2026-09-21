@@ -105,9 +105,11 @@ they give merged TV(P.0, panel) 0.071 and TV(truth, panel) 0.098.
   gap. P.0 halves *D. formicigenerans* (0.068 against 0.12 true, 0.13 observed), which the
   panel gets right (0.12). The *B. uniformis* strain split, which V4 cannot resolve, falls
   on opposite strains in the two codes.
-- **Both codes share a 0.06 floor to the truth.** *C. bolteae* (6% of the truth) is read
-  only through references outside the extracted amplicons: the 75 hits that both count
-  as foreign.
+- **Both codes share a floor to the truth.** *C. bolteae* is 6% of the truth and is
+  observed at 0 in both. Of its 75 reads, MAPseq puts 25 on its own full-length reference,
+  which is outside the extracted amplicons. It labels the other 50 *C. saccharolyticum*,
+  and neither code's kernel attributes them back. Together with 50 *C. ramosum* reads on
+  non-amplifiable references, that makes the 75 hits both codes drop as foreign.
 
 So the P.7 bar (genome TV <= 0.02 against P.0) is not met on *B. uniformis* at any
 depth. Where the two codes differ, the panel is the more accurate one. Below ~10,000
