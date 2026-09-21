@@ -311,7 +311,7 @@ Read mapping (mapseq):
 
 | param | default | description |
 |-------|---------|-------------|
-| `--mapseq_args` | – | Extra flags forwarded to **every** mapseq invocation (simulated and real alike — that identity is what makes `M` valid). |
+| `--mapseq_args` | `-seed 12 -tophits 80 -topotus 40 -outfmt simple` | Flags forwarded to **every** mapseq invocation (simulated and real alike — that identity is what makes `M` valid). The default is AAP's, verbatim; a replacement drops all of them. |
 | `--mapseq_min_identity` | – | Drop hits below this pairwise identity (off-target background). |
 | `--obs_max_reads` | `100000` | Reads mapped per sample (`0` = all). Detecting a low-abundance subspecies is a small-excess subtraction, so depth matters (8k is too few). |
 
