@@ -1,4 +1,6 @@
 #!/usr/bin/env python
+# UNMAINTAINED: imports code removed with the square mis-mapping path (panel-only
+# pipeline). Kept as the record behind its .md; it no longer runs against bin/.
 """Step 3: is the alignment-built ``M`` equivalent to the simulate-and-map one?
 
 ``dev/amplicon_distance_census.md`` showed the tie-cluster kernel reproduces the measured

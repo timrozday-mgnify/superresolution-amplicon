@@ -15,7 +15,7 @@ process MATRIX_KEY {
 
     script:
     def settings = [
-        // Must equal sparse_matrix.KERNEL_VERSION (tests/test_grouped_mismapping.py checks).
+        // Must equal sparse_matrix.KERNEL_VERSION (tests/test_measured_mismapping.py checks).
         kernel_version: 2,
         panel: meta.panel ?: 'database', panel_taxa: meta.panel_taxa ?: '',
         panel_taxon_max_sources: params.panel_taxon_max_sources,

@@ -354,12 +354,12 @@ def build(a) -> None:
              *kernel.shape, sum(label_ids[h] != s for s, h in zip(source_ids, home)))
 
 
-def _align_decay(a, bma) -> float:
+def _align_decay(a, ka) -> float:
     """Return the requested fixed or measured alignment distance-decay value."""
     requested = str(a.distance_decay)
     if requested == "auto":
         model_pt = getattr(a, "model_pt", None)
-        decay = bma.measure_error_rate(
+        decay = ka.measure_error_rate(
             "trained" if model_pt else "flat",
             model_pt,
             getattr(a, "flat_sub_rate", 0.005),
@@ -390,7 +390,7 @@ def align(a) -> None:
     (``2acb -> 81c3``) is not undone by alignment. At ``tau >= 1`` the distances are stored,
     so ``--infer-distance-decay`` can refit ``c`` per sample.
     """
-    import build_mismapping_align as bma
+    import kernel_align as ka
 
     sources = pd.read_csv(a.prepared / "sources.tsv", sep="\t")
     source_ids = sources.source.tolist()
@@ -409,12 +409,12 @@ def align(a) -> None:
                          "--home-mseq): " + ", ".join(np.asarray(source_ids)[home < 0]))
     if a.tau < 0:
         raise SystemExit("--tau must be non-negative")
-    a.distance_decay = _align_decay(a, bma)
-    max_ambiguous_bases = getattr(a, "max_ambiguous_bases", bma.DEFAULT_MAX_AMBIGUOUS_BASES)
-    max_postings = getattr(a, "max_postings", bma.DEFAULT_MAX_POSTINGS)
+    a.distance_decay = _align_decay(a, ka)
+    max_ambiguous_bases = getattr(a, "max_ambiguous_bases", ka.DEFAULT_MAX_AMBIGUOUS_BASES)
+    max_postings = getattr(a, "max_postings", ka.DEFAULT_MAX_POSTINGS)
     if max_ambiguous_bases < 0 or max_postings < 1:
         raise SystemExit("--max-ambiguous-bases must be non-negative and --max-postings >= 1")
-    ambiguity = bma.ambiguity_weights(label_seqs, a.ambiguity_weight)
+    ambiguity = ka.ambiguity_weights(label_seqs, a.ambiguity_weight)
 
     # Labels already contain one literal sequence per database group. Add only external
     # panel sequences, then use those sequence indexes as pigeonhole probes. At tau zero
@@ -447,7 +447,7 @@ def align(a) -> None:
 
     if a.tau >= 1:
         probes = np.fromiter(source_rows, dtype=np.int64)
-        pairs = bma.pigeonhole_candidates(
+        pairs = ka.pigeonhole_candidates(
             unique_sequences,
             a.tau,
             max_ambiguous_bases,
@@ -456,7 +456,7 @@ def align(a) -> None:
         )
         log.info("verifying %d panel-to-database alignment candidate pair(s)", len(pairs))
         for left, right in pairs:
-            distance = bma.bounded_iupac_distance(
+            distance = ka.bounded_iupac_distance(
                 unique_sequences[left], unique_sequences[right], a.tau)
             if distance > a.tau:
                 continue

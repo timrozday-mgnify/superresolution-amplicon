@@ -1,4 +1,6 @@
 #!/usr/bin/env python
+# UNMAINTAINED: imports code removed with the square mis-mapping path (panel-only
+# pipeline). Kept as the record behind its .md; it no longer runs against bin/.
 """Time and measure the grouped mis-mapping backends over prefixes of an amplicon set.
 
 Unlike ``benchmark_mismapping_scaling.py`` this starts from an *already extracted*

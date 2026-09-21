@@ -231,14 +231,11 @@ Mis-mapping — how `M` is built:
 
 | param | default | description |
 |-------|---------|-------------|
-| `--mismapping_method` | `simulate` | `simulate` (sample errored reads from every reference and map them with the same mapper the real reads go through — `M` is *measured*) or `align` (indexed minimap2 reference-to-reference alignment, with PAF distances re-scored for IUPAC — no read simulation, mapseq, or error model). |
+| `--mismapping_method` | `simulate` | `simulate` (sample errored reads from every panel source and map them with the same mapper the real reads go through — the kernel is *measured*) or `align` (each source aligned to the database labels within `--align_tau`, IUPAC-aware — no read simulation, mapseq, or error model). |
 | `--align_tau` | `0` | `align` only: cluster references within this edit distance. `0` (exact duplicate amplicons) beat every larger value tested until `--align_distance_decay` existed; with a decay set, `tau >= 1` is finally softer rather than worse. |
 | `--align_distance_decay` | `1.0` | `align` only: a cluster member `d` edits away takes `c**d` of a uniform share. A no-op at `--align_tau 0` (every member is at distance 0), and the whole story at larger `tau`: `c = 1` treats a reference one edit away as an exact duplicate, which is why `tau > 0` used to lose. On the benchmark's two-strain *B. uniformis* V4 set — two exact-duplicate clusters one edit apart, 0.5% flat error — `c = 1` puts `0.2` of a row where the `simulate` measurement puts `0.002`–`0.006`; `c = 0.007` reproduces it, and at that value `kmer --align_tau 1` fits the measured matrix slightly *better* than `exact-hash` does (mean row L1 0.079 vs 0.080). Reaching a distance-1 reference costs one sequencing error at that position, so set `c` to about the per-base error rate. Left at `1` with `tau >= 1` the run warns rather than fails, so a pre-existing matrix stays reproducible. Set it to **`auto`** to measure that rate off an error model instead of guessing it, or leave it and set `--infer_distance_decay` to fit it per sample. |
 | `--align_decay_model` | `null` | `--align_distance_decay auto` only: a **pre-trained** skiver `model.pt` whose per-base error rate is measured (by applying it and taking the mean edit rate) instead of the flat rates. Nothing is trained for this — `align` mode never runs the skiver subworkflow. `null` measures `--flat_sub_rate + --flat_ins_rate + --flat_del_rate`, which at the defaults gives `c = 0.0059`. |
-| `--align_backend` | `minimap2` | `align` only: `minimap2` runs all-vs-all alignment and writes a reference-square matrix — fine to a few thousand references. `exact-hash` (requires `--align_tau 0`) groups byte-identical amplicons in one streaming pass. `kmer` (requires `--align_tau >= 1`) widens those groups with a pigeonhole block filter over the *distinct* amplicons, verified by an IUPAC-aware bounded edit distance. The last two write the **grouped** matrix and are the database-scale path: the full 1,001,241-reference GTDB SSU r232 V4 set takes 2 s / 0.5 GB at `exact-hash`, 75 s / 0.8 GB at `kmer --align_tau 1`, and 195 s / 1.3 GB at `--align_tau 2`. |
-| `--max_ambiguous_bases` / `--max_postings` | `4` / `4096` | `kmer` only. `max_ambiguous_bases` is how many IUPAC positions a pair may carry *between them* before the filter is allowed to miss it; each one costs a block, so raising it shortens the blocks and widens the search. `max_postings` skips a block shared by more than that many distinct amplicons — the conserved windows either side of the variable region, which are quadratic to enumerate. It is the filter's only source of false negatives, and it is not reached on GTDB SSU at either tau. |
-| `--minimap2_args` | `-p 0 -N 1000 --secondary=yes -c` | `align` only: minimap2 mapping flags. The reference set is indexed once, then aligned all-vs-all. No preset or score-ratio filter retains near-identical hits; `-c` supplies CIGAR. The parser re-scores CIGAR columns with IUPAC overlap rather than trusting `NM`. `-k`/`-w` are rejected here — they belong to the index. |
-| `--minimap2_index_args` | `-k 11 -w 5` | `align` only: minimap2 index flags. Small minimizers, because presets like `asm5` discard everything past ~5% divergence. |
+| `--max_ambiguous_bases` / `--max_postings` | `4` / `4096` | `align` at `--align_tau >= 1` only. `max_ambiguous_bases` is how many IUPAC positions a pair may carry *between them* before the filter is allowed to miss it; each one costs a block, so raising it shortens the blocks and widens the search. `max_postings` skips a block shared by more than that many distinct amplicons — the conserved windows either side of the variable region, which are quadratic to enumerate. It is the filter's only source of false negatives, and it is not reached on GTDB SSU at either tau. |
 | `--align_ambiguity_weight` | `0.3` | `align` only: a cluster member carrying `k` IUPAC ambiguity codes takes `w**k` of a uniform share, since mapseq scores an `N` as a mismatch and prefers a clean duplicate. No-op on reference sets without ambiguity codes; `1` disables. The real penalty varies (0.18–0.97), so this is a compromise — see [the sweep](dev/ambiguity_weight_sweep.md). |
 
 | `--min_pair_overlap` | `20` | Paired samples: shortest mate overlap accepted when merging R1/R2. Unmergeable pairs are dropped and counted; past 20% the run warns that the fragments do not cover the amplicon, and `--mismapping_method simulate --sim_read_len` is the right choice for that sample. |
@@ -275,36 +272,6 @@ The run refuses the bundle unless it was built against the same extracted amplic
 MAPseq database (the FASTA's path, size and mtime, and its `.mscluster`) and panel. Its
 simulation or alignment settings are not checked, because they are the bundle's own:
 the kernel is used as it was built.
-
-For a matrix outside Nextflow, run minimap2 with an index first, then pass its PAF:
-
-```bash
-minimap2 -k 11 -w 5 -d amplicons.mmi sample_amplicons/amplicons.fasta
-minimap2 -p 0 -N 1000 --secondary=yes -c amplicons.mmi sample_amplicons/amplicons.fasta > allvsall.paf
-bin/build_mismapping_align.py --amplicons sample_amplicons/amplicons.fasta --paf allvsall.paf \
-  -o mismapping_matrix.npz
-```
-
-The grouped backends need no mapper and no PAF:
-
-```bash
-bin/build_mismapping_align.py --backend exact-hash --tau 0 \
-  --amplicons sample_amplicons/amplicons.fasta -o mismapping_matrix.npz
-bin/build_mismapping_align.py --backend kmer --tau 1 \
-  --amplicons sample_amplicons/amplicons.fasta -o mismapping_matrix.npz
-```
-
-### The grouped matrix
-
-A tie-cluster `M` is constant on exact-duplicate groups — two references with the same
-amplicon are interchangeable — so `M[a, j] = S[group[a], group[j]]` for an `S` over the
-*distinct* amplicons. The reference-square CSR stores one entry per reference pair inside
-a cluster, i.e. the sum of the squared group sizes. On GTDB SSU V4 that is 24.2 billion
-nonzeros (~290 GB) for 1,001,241 references; the grouped form is 86,557 x 86,557 with
-~264k nonzeros, and the file is 11 MB. Row-stochasticity becomes
-`sum_b S[a, b] * size[b] == 1`, and `r_true @ M` becomes a sum over duplicate groups, one
-sparse product, and a scatter back — so inference never materialises the square matrix
-either. `sparse_matrix.is_grouped` tells the two apart; consumers accept both.
 
 Read mapping (mapseq):
 
@@ -399,7 +366,7 @@ A sample with `panel_references` is still mapped against `--references` (e.g. GT
 its composition is inferred over the panel genomes plus a `background` row. The panel's
 distinct V4 amplicons are MAPseq'd against that database (each source's home label) and
 reads simulated from them are mapped the same way, giving a rectangular kernel (panel
-sources × database V4 groups). No reference-square matrix is built for such a sample.
+sources × database V4 groups).
 Validated on 20 mock samples against GTDB r232 (median genome TV 0.015, see
 [dev/panel_reinterpretation.md](dev/panel_reinterpretation.md)) with:
 
@@ -466,18 +433,12 @@ results/
   mapseq/<id>/
     <id>.obs.mseq.gz                 mapseq classification of the real reads
   mismapping/
-    groups.tsv                       index of canonical matrix bundles
-    <matrix-key>/
-      mismapping_matrix.npz          reference->reference mis-mapping M (CSR or grouped)
-      provenance.json                 simulator, mapper, and member-sample metadata
-      samples.tsv                     samples consuming this matrix
-      reference/                      amplicons + mapseq/inference sidecars
-    panel_<key>/                     panel samples: rectangular kernel (mismapping_matrix.npz),
+    panel_<key>/                     rectangular kernel (mismapping_matrix.npz),
                                      panel_sources.tsv, panel_translation.tsv, sources.tsv,
                                      provenance.json (what --panel_kernel checks)
   composition/<id>/
     <id>.inferred_composition.csv    inferred vs observed genome abundances
-    <id>.inference_diagnostics.csv   matrix ID/path, fit status, and two diagonal summaries
+    <id>.inference_diagnostics.csv   kernel ID/path, fit settings and status, background share
     <id>.posterior_draws.npz         theta_eff and fitted nuisance posterior draws
     <id>.fit_diagnostics.json        posterior-predictive forward-fit gate
     <id>.loss_trace.csv              (vi/mle)
@@ -519,15 +480,14 @@ Because the benchmark builds the matrix once per reference set and then supplies
 every sample, **the mis-mapping mode is a property of the matrix-build run only**. The
 modes worth comparing:
 
-| `--mismapping_method` | `--align_backend` | `--align_tau` | what it costs |
-|---|---|---|---|
-| `simulate` | – | – | Reads simulated from every reference and mapped with mapseq. The measurement; the most expensive. |
-| `align` | `minimap2` | `0` | All-vs-all alignment. Reference-square matrix; quadratic in references. |
-| `align` | `exact-hash` | `0` | Byte-identical amplicons grouped. One streaming pass. |
-| `align` | `kmer` | `>= 1` | Those groups widened by verified neighbours within `tau`, each discounted by `--align_distance_decay ** d`. Leave the decay at `1` and this mode understates how well the mapper separates near-identical references. |
+| `--mismapping_method` | `--align_tau` | what it costs |
+|---|---|---|
+| `simulate` | – | Reads simulated from every panel source and mapped with mapseq. The measurement; the most expensive. |
+| `align` | `0` | A literal hash join of sources onto byte-identical labels. One pass. |
+| `align` | `>= 1` | Also verified neighbours within `tau` (pigeonhole candidates), each discounted by `--align_distance_decay ** d`. Leave the decay at `1` and this mode understates how well the mapper separates near-identical references. |
 
-The benchmark exposes each of these as `--sr_amplicon_mismapping_method`,
-`--sr_amplicon_align_backend` and `--sr_amplicon_align_tau`, with
+The benchmark exposes these as `--sr_amplicon_mismapping_method` and
+`--sr_amplicon_align_tau`, with
 `--sr_amplicon_matrix_args` for the remaining flags
 (`--align_distance_decay`, `--align_ambiguity_weight`, `--max_ambiguous_bases`,
 `--max_postings`, `--sim_n_per_ref`, …). See its README for how to sweep them.

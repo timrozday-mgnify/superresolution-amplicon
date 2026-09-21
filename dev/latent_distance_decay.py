@@ -1,4 +1,6 @@
 #!/usr/bin/env python
+# UNMAINTAINED: imports code removed with the square mis-mapping path (panel-only
+# pipeline). Kept as the record behind its .md; it no longer runs against bin/.
 """Can the distance decay ``c`` be fitted per sample instead of chosen at build time?
 
 ``--align_distance_decay`` is a property of the *sample* (roughly its per-base error

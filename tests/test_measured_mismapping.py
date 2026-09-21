@@ -1,4 +1,4 @@
-"""Measuring M by simulation at V4-group level, on a batch's active groups only."""
+"""Panel kernels (sources x database labels): measuring, storing, projecting and aligning."""
 from __future__ import annotations
 
 import sys
@@ -16,7 +16,6 @@ import pandas as pd  # noqa: E402  (needs local bin directory)
 
 import check_composition_fit as fit  # noqa: E402  (needs local bin directory)
 import infer_composition as ic  # noqa: E402  (needs local bin directory)
-import select_active_amplicons as saa  # noqa: E402  (needs local bin directory)
 import sparse_matrix as sm  # noqa: E402  (needs local bin directory)
 import subspecies_infer as si  # noqa: E402  (needs local bin directory)
 
@@ -38,55 +37,17 @@ def _write_mseq(path: Path, rows: list[tuple[str, str]]) -> Path:
     return path
 
 
-def test_measured_matrix_rows_are_groups_and_stay_row_stochastic(tmp_path: Path) -> None:
-    """A group's row is measured once and shared; which duplicate mapseq named is ignored."""
-    group = np.array([0, 0, 1, 2])
-    # Reads simulated from group A's representative: 90% labelled on its *other* duplicate,
-    # 10% leaked to B. Nothing was simulated from C.
-    rows = [(f"g1|0|A:{i}", "g2|0|A") for i in range(90)]
-    rows += [(f"g1|0|A:{i}", "g3|0|B") for i in range(90, 100)]
-    rows += [(f"g3|0|B:{i}", "g3|0|B") for i in range(100)]
-    mseq = _write_mseq(tmp_path / "sim.mseq", rows)
-
-    S = si.build_mismapping_grouped([mseq], REFS, group).toarray()
-    size = np.bincount(group).astype(float)
-    assert np.allclose(S[0] * size, [0.9, 0.1, 0.0]), S[0]
-    assert np.allclose(S[1] * size, [0.0, 1.0, 0.0]), S[1]
-    assert not S[2].any(), "an unsimulated group must stay empty so inference prunes it"
-    assert np.allclose((S[:2] * size).sum(axis=1), 1.0)
-
-
-def test_a_group_whose_simulated_reads_all_failed_keeps_an_identity_row(tmp_path: Path) -> None:
-    group = np.array([0, 0, 1, 2])
-    mseq = _write_mseq(tmp_path / "sim.mseq", [(f"g1|0|A:{i}", "unknown|0|X") for i in range(10)])
-    S = si.build_mismapping_grouped([mseq], REFS, group).toarray()
-    assert np.allclose(S[0] * np.bincount(group), [1.0, 0.0, 0.0]), S[0]
-
-
-def test_an_active_group_the_simulator_skipped_keeps_an_identity_row(tmp_path: Path) -> None:
-    """A group with IUPAC codes draws no simulated read; it must stay a possible source."""
-    group = np.array([0, 0, 1, 2])
-    mseq = _write_mseq(tmp_path / "sim.mseq", [(f"g1|0|A:{i}", "g1|0|A") for i in range(10)])
-    S = si.build_mismapping_grouped([mseq], REFS, group, active=np.array([0, 2])).toarray()
-    assert np.allclose(S[2] * np.bincount(group), [0.0, 0.0, 1.0]), S[2]
-    assert not S[1].any(), "a group outside the active set still prunes away"
-
-
-def test_active_groups_take_observed_labels_and_their_neighbours(tmp_path: Path) -> None:
-    """Direct sequence comparison, not the mapper: B is active because it is one edit from A."""
-    amplicons = _amplicons(tmp_path / "amplicons.fasta")
-    obs = _write_mseq(tmp_path / "obs.mseq", [(f"read{i}", "g2|0|A") for i in range(50)])
-
-    refs, group, sequences, active = saa.active_groups(
-        amplicons, [obs], tau=1, min_identity=None, max_ambiguous_bases=4, max_postings=4096)
-    assert [sequences[g] for g in sorted(active)] == [A, B], "A observed, B its one-edit neighbour"
-
-    _, _, _, exact = saa.active_groups(
-        amplicons, [obs], tau=0, min_identity=None, max_ambiguous_bases=4, max_postings=4096)
-    assert [sequences[g] for g in exact] == [A]
-
-
-# ── Rectangular kernels: sources (panel amplicons) x labels (database groups) ──
+def test_kernel_version_is_stored_and_hashed_into_the_matrix_key(tmp_path: Path) -> None:
+    """A stale kernel must change MATRIX_KEY, and a file that predates versioning reads as 1."""
+    key_module = (ROOT / "modules" / "local" / "matrix_key" / "main.nf").read_text()
+    assert f"kernel_version: {sm.KERNEL_VERSION}," in key_module
+    path = tmp_path / "k.npz"
+    sm.write_kernel(path, sparse.csr_array(np.eye(1)), ["s"], ["l"], np.array([0]))
+    assert sm.read_kernel(path).kernel_version == sm.KERNEL_VERSION
+    with np.load(path) as archive:
+        legacy = {key: archive[key] for key in archive.files if key != "kernel_version"}
+    np.savez(path, **legacy)
+    assert sm.read_kernel(path).kernel_version == 1
 
 
 def test_tally_kernel_counts_panel_sources_against_database_labels(tmp_path: Path) -> None:
@@ -109,7 +70,7 @@ def test_rectangular_kernel_round_trips_and_rejects_a_bad_home(tmp_path: Path) -
     assert np.array_equal(k.kernel.toarray(), K.toarray()) and k.home.tolist() == [0, 2]
     assert k.ref_headers == REFS and k.label_of_ref.tolist() == [0, 0, 1, 2]
     assert k.n_simulated.tolist() == [100, 0] and k.n_unmapped is None
-    assert k.provenance == {"seed": 7} and not sm.is_grouped(path)
+    assert k.provenance == {"seed": 7}
     assert sm.home_entries(k.kernel, k.home).tolist() == [0.9, 0.0]
 
     sm.write_kernel(path, K, ["s0", "s1"], ["l0", "l1", "l2"], np.array([0, 3]))
@@ -138,34 +99,6 @@ def test_rectangular_projection_sends_unscaled_mass_to_each_home_label() -> None
         assert np.allclose(got, dense, atol=1e-12), (s, got, dense)
         assert np.allclose(fit._apply_mismapping(r, csr, s, home), dense, atol=1e-12)
     assert np.allclose(r @ K, si._apply_mismapping(torch.tensor(r), M, torch.tensor(1.0)).numpy())
-
-
-def test_rectangular_kernel_over_groups_reproduces_the_grouped_path() -> None:
-    """Sources = labels = groups with home = identity is the grouped model summed over each
-    group's members: a panel equal to the active set reduces to the existing case. The
-    model is the same function of theta and s, so the likelihood and fit are too."""
-    import torch
-
-    group = np.array([0, 0, 1, 2, 3, 3, 3])
-    n = int(group.max()) + 1
-    size = np.bincount(group).astype(float)
-    rng = np.random.default_rng(1)
-    raw = rng.random((n, n)) * (rng.random((n, n)) < 0.7)
-    np.fill_diagonal(raw, 6.0)              # keeps 1 - s + s*S[g, g] >= 0 at s = 1.3
-    S = raw / (raw @ size)[:, None]
-    K = S * size                            # row-stochastic over groups
-    grouped = (torch.tensor(S).to_sparse(),
-               torch.tensor(sm.grouped_diagonal(sparse.csr_array(S), group)),
-               torch.tensor(group))
-    rect = (torch.tensor(K).to_sparse(), torch.tensor(np.diag(K).copy()), None,
-            torch.arange(n))
-    r_ref = rng.random(len(group))
-    r_ref /= r_ref.sum()
-    for s in (0.5, 1.0, 1.3):
-        by_ref = si._apply_mismapping(torch.tensor(r_ref), grouped, torch.tensor(s)).numpy()
-        by_group = si._apply_mismapping(torch.tensor(np.bincount(group, r_ref)), rect,
-                                        torch.tensor(s)).numpy()
-        assert np.allclose(np.bincount(group, by_ref), by_group, atol=1e-8), s
 
 
 def test_rectangular_pruning_sends_dropped_labels_to_one_sink_exactly() -> None:
@@ -304,21 +237,21 @@ def test_panel_align_kernel_redecays_exactly_and_fits_a_latent_decay(tmp_path: P
 
 def test_panel_align_candidate_probes_and_auto_decay(monkeypatch) -> None:
     """Limit candidate search to panel sources without losing an ambiguous target."""
-    import build_mismapping_align as bma
+    import kernel_align as ka
     import build_panel_kernel as bpk
 
     sequences = [A, B, C, C[:-1] + "N"]
-    pairs = {tuple(pair) for pair in bma.pigeonhole_candidates(
+    pairs = {tuple(pair) for pair in ka.pigeonhole_candidates(
         sequences, tau=1, max_ambiguous_bases=4, max_postings=1 << 30,
         probes=np.array([0, 2], dtype=np.int64),
     )}
     assert (0, 1) in pairs and (2, 3) in pairs
 
-    monkeypatch.setattr(bma, "measure_error_rate", lambda *args: 0.013)
+    monkeypatch.setattr(ka, "measure_error_rate", lambda *args: 0.013)
     assert bpk._align_decay(SimpleNamespace(
         distance_decay="auto", model_pt=None, flat_sub_rate=0.005,
         flat_ins_rate=0.0005, flat_del_rate=0.0005,
-    ), bma) == 0.013
+    ), ka) == 0.013
 
 
 def test_panel_kernel_prepare_and_build(tmp_path: Path) -> None:

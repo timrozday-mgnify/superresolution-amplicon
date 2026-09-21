@@ -1,4 +1,6 @@
 #!/usr/bin/env python
+# UNMAINTAINED: imports code removed with the square mis-mapping path (panel-only
+# pipeline). Kept as the record behind its .md; it no longer runs against bin/.
 """Does the simulated error rate have to be *accurate*, or just big enough?
 
 The mis-mapping matrix ``M`` exists to say which references get confused for which. If

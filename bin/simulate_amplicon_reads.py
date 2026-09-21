@@ -92,7 +92,7 @@ def sampler(error_model: str, model_pt=None, sub_rate: float = 0.005,
 
     ``records`` are ``(name, sequence, True)`` triples, the shape skiver's ``apply_batch``
     takes. Both models are reached through one call so callers that only want to
-    *characterise* a model (``build_mismapping_align.measure_error_rate``) do not have to
+    *characterise* a model (``kernel_align.measure_error_rate``) do not have to
     re-implement the loading.
     """
     if error_model != "trained":
