@@ -247,11 +247,44 @@ def test_panel_align_candidate_probes_and_auto_decay(monkeypatch) -> None:
     )}
     assert (0, 1) in pairs and (2, 3) in pairs
 
-    monkeypatch.setattr(ka, "measure_error_rate", lambda *args: 0.013)
+    monkeypatch.setattr(ka, "measure_error_rate", lambda *args, **kw: 0.013)
     assert bpk._align_decay(SimpleNamespace(
         distance_decay="auto", model_pt=None, flat_sub_rate=0.005,
         flat_ins_rate=0.0005, flat_del_rate=0.0005,
     ), ka) == 0.013
+
+
+def test_indel_decay_weights_indels_apart_and_leaves_them_out_of_the_strata(
+        tmp_path: Path) -> None:
+    """A label one substitution away takes c_sub, one indel away takes c_indel. The strata
+    count substitutions only, so re-decaying moves c_sub and leaves the indel entry be."""
+    import build_panel_kernel as bpk
+    import kernel_align as ka
+
+    E = A[:20] + A[21:]                                     # one deletion from A
+    assert ka.indel_count(A, E) == 1 and ka.indel_count(A, B) == 0
+    a = bpk.v4g(A)
+    prep = tmp_path / "prep"
+    prep.mkdir()
+    pd.DataFrame({"source": [a], "genomes": ["gX"], "in_db": [True]}).to_csv(
+        prep / "sources.tsv", sep="\t", index=False)
+    (prep / "sources.fasta").write_text(f">{a}\n{A}\n")
+    pd.DataFrame({"genome_id": ["gX"], "source": [a], "weight": 1.0}).to_csv(
+        prep / "panel_translation.tsv", sep="\t", index=False)
+    db = tmp_path / "amplicons.fasta"
+    db.write_text(f">g1|0|A\n{A}\n>g3|0|B\n{B}\n>g5|0|E\n{E}\n")
+    kernel = prep / "align_kernel.npz"
+    bpk.align(SimpleNamespace(prepared=prep, db_amplicons=db, home_mseq=None, tau=1,
+                              distance_decay=0.1, indel_decay=0.01, ambiguity_weight=1.0,
+                              out=kernel))
+    k = sm.read_kernel(kernel)
+    lab = [k.label_ids.index(bpk.v4g(g)) for g in (A, B, E)]
+    assert np.allclose(k.kernel.toarray()[0, lab], np.array([1, 0.1, 0.01]) / 1.11)
+    assert k.strata[0].toarray()[0, lab].tolist() == [0, 1, 0]
+
+    rates = {kind: ka.measure_error_rate("flat", None, 0.01, 0.001, 0.001, n=400, kind=kind)
+             for kind in ("sub", "indel")}
+    assert 0.008 < rates["sub"] < 0.012 and 0.0015 < rates["indel"] < 0.0025, rates
 
 
 def test_panel_kernel_prepare_and_build(tmp_path: Path) -> None:

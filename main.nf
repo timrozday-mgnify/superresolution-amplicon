@@ -67,6 +67,13 @@ workflow {
         // for the whole run.
         if (row.merged?.toString() == 'true') {
             if (paired) error "Sample ${row.id}: 'merged: true' reads are one file, not a pair"
+            // A low merge rate means pairs were lost to the merge unevenly across sources
+            // (long amplicons first), which edit distances cannot describe.
+            if (params.mismapping_method == 'align' && row.merge_rate != null
+                    && (row.merge_rate as double) < 0.8) {
+                error "Sample ${row.id}: merge_rate ${row.merge_rate} < 0.8, so merging lost reads; " +
+                      "--mismapping_method align cannot account for that. Use simulate with --sim_read_structure pairs"
+            }
             if (params.trim_primers.toString() == 'true') {
                 error "Sample ${row.id}: 'merged: true' needs --trim_primers false (merged reads keep their primers)"
             }

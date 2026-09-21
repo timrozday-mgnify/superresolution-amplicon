@@ -10,6 +10,7 @@ down-weights ambiguous labels.
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from array import array
 from pathlib import Path
@@ -68,6 +69,18 @@ def bounded_iupac_distance(query: str, target: str, maximum: int) -> int:
     distance = edlib.align(query, target, mode="NW", task="distance", k=maximum,
                            additionalEqualities=_IUPAC_EQUALITIES)["editDistance"]
     return maximum + 1 if distance < 0 else distance
+
+
+def indel_count(query: str, target: str) -> int:
+    """Insertions plus deletions on one optimal IUPAC-aware alignment of the pair.
+
+    ponytail: one optimal path, Edlib's pick. Where a substitution-heavy and an
+    indel-heavy path tie, the split (and so the pair's weight) follows that pick. Enumerate
+    the co-optimal paths if a kernel ever turns out to hinge on it.
+    """
+    cigar = edlib.align(query, target, mode="NW", task="path",
+                        additionalEqualities=_IUPAC_EQUALITIES)["cigar"] or ""
+    return sum(int(n) for n, op in re.findall(r"(\d+)([=XID])", cigar) if op in "ID")
 
 
 def _block_pass(sequences: list[str], probes: np.ndarray, tau: int, blocks: int,
@@ -213,8 +226,11 @@ def pigeonhole_candidates(
 def measure_error_rate(error_model: str = "flat", model_pt: Path | None = None,
                        sub_rate: float = 0.005, ins_rate: float = 0.0005,
                        del_rate: float = 0.0005, length: int = 1000, n: int = 200,
-                       seed: int = 0) -> float:
+                       seed: int = 0, kind: str = "all") -> float:
     """Mean per-base edit rate of a sequencing-error model, measured by sampling it.
+
+    ``kind`` restricts the count to ``"sub"`` (edits that are not indels) or ``"indel"``;
+    ``--indel-decay auto`` is the ``"indel"`` rate.
 
     ``--distance-decay auto`` is this number. Reaching a distance-1 reference costs one
     error at the one position that separates them, so the decay is on the order of the
@@ -232,11 +248,14 @@ def measure_error_rate(error_model: str = "flat", model_pt: Path | None = None,
     sequence = "".join(rng.choice(list(_BASES), size=length))
     reads = sim.sampler(error_model, model_pt, sub_rate, ins_rate, del_rate)(
         [(str(i), sequence, True) for i in range(n)], rng)
-    edits = sum(edlib.align(read, sequence, mode="NW", task="distance")["editDistance"]
-                for _, read in reads)
+    edits = 0
+    for _, read in reads:
+        total = edlib.align(read, sequence, mode="NW", task="distance")["editDistance"]
+        indels = 0 if kind == "all" else indel_count(read, sequence)
+        edits += {"all": total, "sub": total - indels, "indel": indels}[kind]
     rate = edits / float(n * length)
-    log.info("measured per-base error rate %.5f (%s model, %d x %dbp)",
-             rate, error_model, n, length)
+    log.info("measured per-base %s error rate %.6f (%s model, %d x %dbp)",
+             kind, rate, error_model, n, length)
     return rate
 
 

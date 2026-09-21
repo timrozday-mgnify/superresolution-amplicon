@@ -354,9 +354,15 @@ def build(a) -> None:
              *kernel.shape, sum(label_ids[h] != s for s, h in zip(source_ids, home)))
 
 
-def _align_decay(a, ka) -> float:
-    """Return the requested fixed or measured alignment distance-decay value."""
-    requested = str(a.distance_decay)
+def _align_decay(a, ka, flag: str = "distance_decay", kind: str = "all") -> float:
+    """Return the requested fixed or measured alignment decay for ``flag``.
+
+    ``auto`` samples the error model: every edit for ``--distance-decay``, indels only for
+    ``--indel-decay``. Indels are ~100x rarer than substitutions in AAP merged reads
+    (dev/aap_merge_effects.md 0.2), so the indel rate is sampled over 10x more bases.
+    """
+    name = "--" + flag.replace("_", "-")
+    requested = str(getattr(a, flag))
     if requested == "auto":
         model_pt = getattr(a, "model_pt", None)
         decay = ka.measure_error_rate(
@@ -365,17 +371,19 @@ def _align_decay(a, ka) -> float:
             getattr(a, "flat_sub_rate", 0.005),
             getattr(a, "flat_ins_rate", 0.0005),
             getattr(a, "flat_del_rate", 0.0005),
+            n=2000 if kind == "indel" else 200,
+            kind=kind,
         )
         if decay <= 0.0:
-            raise SystemExit("--distance-decay auto measured a zero error rate; set it explicitly")
-        log.info("--distance-decay auto -> %.5f", decay)
+            raise SystemExit(f"{name} auto measured a zero error rate; set it explicitly")
+        log.info("%s auto -> %.6f", name, decay)
     else:
         try:
             decay = float(requested)
         except ValueError as exc:
-            raise SystemExit("--distance-decay must be a number or 'auto'") from exc
+            raise SystemExit(f"{name} must be a number or 'auto'") from exc
     if not 0.0 < decay <= 1.0:
-        raise SystemExit("--distance-decay must be in (0, 1]")
+        raise SystemExit(f"{name} must be in (0, 1]")
     return decay
 
 
@@ -409,7 +417,13 @@ def align(a) -> None:
                          "--home-mseq): " + ", ".join(np.asarray(source_ids)[home < 0]))
     if a.tau < 0:
         raise SystemExit("--tau must be non-negative")
-    a.distance_decay = _align_decay(a, ka)
+    # A separate indel decay weights a label s substitutions and i indels away by
+    # c_sub**s * c_indel**i, and --distance-decay auto then measures substitutions only.
+    # The strata hold s alone, so --infer-distance-decay refits c_sub and c_indel stays at
+    # its built value.
+    split = getattr(a, "indel_decay", None) is not None
+    a.distance_decay = _align_decay(a, ka, kind="sub" if split else "all")
+    a.indel_decay = _align_decay(a, ka, "indel_decay", "indel") if split else a.distance_decay
     max_ambiguous_bases = getattr(a, "max_ambiguous_bases", ka.DEFAULT_MAX_AMBIGUOUS_BASES)
     max_postings = getattr(a, "max_postings", ka.DEFAULT_MAX_POSTINGS)
     if max_ambiguous_bases < 0 or max_postings < 1:
@@ -435,10 +449,14 @@ def align(a) -> None:
     entries_by_source = [{} for _ in source_ids]
 
     def add_candidate(source_index: int, label: int, distance: int) -> None:
-        weight = (1.0 if ambiguity is None else ambiguity[label]) * a.distance_decay ** distance
+        indels = (ka.indel_count(unique_sequences[source_index], label_seqs[label])
+                  if split and distance else 0)
+        subs = distance - indels
+        weight = ((1.0 if ambiguity is None else ambiguity[label])
+                  * a.distance_decay ** subs * a.indel_decay ** indels)
         for row in source_rows.get(source_index, ()):
             if label != own.get(source_ids[row]):
-                entries_by_source[row][label] = (weight, distance)
+                entries_by_source[row][label] = (weight, subs)
 
     for source_index in source_rows:
         label = sequence_index.get(unique_sequences[source_index])
@@ -483,7 +501,8 @@ def align(a) -> None:
         distances.data -= 1.0
         strata = (distances, a.distance_decay)
     provenance = {"method": "align", "prepared": str(a.prepared), "tau": a.tau,
-                  "distance_decay": a.distance_decay, "ambiguity_weight": a.ambiguity_weight,
+                  "distance_decay": a.distance_decay, "indel_decay": a.indel_decay,
+                  "ambiguity_weight": a.ambiguity_weight,
                   "max_ambiguous_bases": max_ambiguous_bases, "max_postings": max_postings,
                   "home_mseq": None if a.home_mseq is None else str(a.home_mseq)}
     sm.write_kernel(a.out, kernel, source_ids, label_ids, home, ref_headers=headers,
@@ -559,6 +578,9 @@ def main() -> None:
     al.add_argument("--tau", type=int, default=1)
     al.add_argument("--distance-decay", default="0.007",
                     help="weight a label d edits away by c**d, or 'auto' to measure c")
+    al.add_argument("--indel-decay", default=None,
+                    help="weight each indel by this instead of --distance-decay, or 'auto' to "
+                         "measure the model's indel rate (default: --distance-decay)")
     al.add_argument("--model-pt", type=Path,
                     help="pre-trained skiver model for '--distance-decay auto'")
     al.add_argument("--flat-sub-rate", type=float, default=0.005,

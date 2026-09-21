@@ -41,8 +41,13 @@ workflow SUPERRESOLUTION_AMPLICON {
                          && (params.align_distance_decay as double) <= 1.0)) {
         error "--align_distance_decay must be in [0, 1], or 'auto'"
     }
-    if (params.align_decay_model && !auto_decay) {
-        error "--align_decay_model is only read by --align_distance_decay auto"
+    def indel_decay = params.align_indel_decay?.toString()
+    if (indel_decay != null && indel_decay != 'auto'
+        && !((indel_decay as double) > 0.0 && (indel_decay as double) <= 1.0)) {
+        error "--align_indel_decay must be in (0, 1], or 'auto'"
+    }
+    if (params.align_decay_model && !auto_decay && indel_decay != 'auto') {
+        error "--align_decay_model is only read by --align_distance_decay auto or --align_indel_decay auto"
     }
     // toString(): a command-line `--flag false` arrives as the truthy String "false".
     if (params.infer_distance_decay.toString() == 'true') {
@@ -230,6 +235,7 @@ workflow SUPERRESOLUTION_AMPLICON {
                 panel: panel.toString(), panel_taxa: panel_taxa?.toString(), model_identity: rep[3],
                 mismapping_method: params.mismapping_method, align_tau: params.align_tau,
                 align_distance_decay: params.align_distance_decay,
+                align_indel_decay: params.align_indel_decay,
                 align_ambiguity_weight: params.align_ambiguity_weight,
                 max_ambiguous_bases: params.max_ambiguous_bases, max_postings: params.max_postings,
                 sim_error_model: params.sim_error_model,
