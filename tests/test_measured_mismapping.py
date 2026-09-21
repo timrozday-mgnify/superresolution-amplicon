@@ -304,3 +304,38 @@ def test_panel_kernel_prepare_and_build(tmp_path: Path) -> None:
     table = pd.read_csv(prep / "panel_sources.tsv", sep="\t", index_col="source")
     assert np.isclose(table.home_mass[a], 0.8) and np.isclose(table.home_mass[d], 1 / 3, atol=1e-4)
     assert np.isclose(table.unmapped_fraction[d], 0.1) and table.block[a] != table.block[d]
+
+
+@pytest.mark.parametrize("tau", [1, 2])
+def test_pigeonhole_align_equals_brute_force_on_buniformis(tmp_path: Path, monkeypatch,
+                                                           tau: int) -> None:
+    """The whole-database panel over the 81-reference B. uniformis set: the aligned kernel
+    from pigeonhole candidates equals the one from verifying every pair."""
+    import build_panel_kernel as bpk
+    import kernel_align as ka
+
+    amplicons = ROOT / "tests" / "data" / "buniformis"
+    prep = tmp_path / "prep"
+    bpk.prepare(SimpleNamespace(
+        panel_amplicons=None, panel_taxa=None, whole_database=amplicons, db_amplicons=None,
+        db_taxonomy=None, alias=[], max_taxon_sources=200, fwd_primer="", rev_primer="",
+        max_mismatch=2, out=prep))
+
+    def kernel(name: str):
+        out = tmp_path / f"{name}.npz"
+        bpk.align(SimpleNamespace(prepared=prep, db_amplicons=amplicons / "amplicons.fasta",
+                                  home_mseq=None, tau=tau, distance_decay=0.005,
+                                  ambiguity_weight=0.3, out=out))
+        return sm.read_kernel(out)
+
+    fast = kernel("pigeonhole")
+    with monkeypatch.context() as m:
+        m.setattr(ka, "pigeonhole_candidates",
+                  lambda sequences, *args, **kw: np.array(
+                      [(i, j) for i in range(len(sequences))
+                       for j in range(i + 1, len(sequences))], dtype=np.int64))
+        brute = kernel("brute")
+    assert fast.source_ids == brute.source_ids and fast.label_ids == brute.label_ids
+    assert np.allclose(fast.kernel.toarray(), brute.kernel.toarray())
+    assert np.array_equal(fast.strata[0].toarray(), brute.strata[0].toarray())
+    assert (fast.kernel.toarray() > 0).sum() > len(fast.source_ids), "no neighbour within tau"
