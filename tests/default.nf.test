@@ -256,6 +256,50 @@ nextflow_pipeline {
         }
     }
 
+    test("home probes move each group's distance-0 mass to where MAPseq sends it - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input             = "${projectDir}/assets/samplesheet.example.yml"
+                outdir            = "$outputDir"
+                mismapping_method = "align"
+                align_backend     = "exact-hash"
+                align_tau         = 0
+                align_home_probes = 2
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                // exact-hash's 9 + HOME_PROBES + MAPSEQ_HOME = 11.
+                { assert workflow.trace.succeeded().size() == 11 },
+                { assert workflow.trace.tasks().any { it.name.contains('HOME_PROBES') } },
+                { assert workflow.trace.tasks().any { it.name.contains('MAPSEQ_HOME') } },
+                { assert path("${params.outdir}/mismapping/groups.tsv").exists() }
+            )
+        }
+    }
+
+    test("home probes need a grouped backend - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input             = "${projectDir}/assets/samplesheet.example.yml"
+                outdir            = "$outputDir"
+                mismapping_method = "align"
+                align_home_probes = 2
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.failed },
+                { assert workflow.stdout.any { it.contains('--align_home_probes needs a grouped backend') } }
+            )
+        }
+    }
+
     test("kmer widens the duplicate groups to tau >= 1 - stub") {
         tag "stub"
         options "-stub"

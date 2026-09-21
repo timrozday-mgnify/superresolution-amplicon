@@ -20,6 +20,7 @@ process MATRIX_KEY {
         align_distance_decay: params.align_distance_decay,
         align_decay_model: params.align_decay_model,
         align_ambiguity_weight: params.align_ambiguity_weight,
+        align_home_probes: params.align_home_probes,
         max_ambiguous_bases: params.max_ambiguous_bases,
         max_postings: params.max_postings,
         minimap2_args: params.minimap2_args,

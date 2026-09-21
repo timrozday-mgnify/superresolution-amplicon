@@ -73,6 +73,12 @@ Run:
     build_mismapping_align.py --amplicons out/amplicons.fasta --paf allvsall.paf \\
         -o mismapping_matrix.npz
     build_mismapping_align.py --demo   # self-check
+
+  Home probes (grouped backends): put each group's distance-0 mass where MAPseq sends it.
+    build_mismapping_align.py --amplicons out/amplicons.fasta --write-home-probes probes.fa
+    mapseq probes.fa out/amplicons.fasta out/amplicons.tax <--mapseq_args> > home.mseq
+    build_mismapping_align.py --backend exact-hash --tau 0 --amplicons out/amplicons.fasta \\
+        --home-mseq home.mseq -o mismapping_matrix.npz
 """
 from __future__ import annotations
 
@@ -221,7 +227,8 @@ def dedup(amplicons: Path, keep_sequences: bool = True
     return refseqs, np.frombuffer(group, dtype=np.int32).copy(), representatives
 
 
-def build_exact_grouped(amplicons: Path
+def build_exact_grouped(amplicons: Path, home_mseq: Path | None = None,
+                        error_rate: float = 0.0
                         ) -> tuple[list[str], sparse.csr_array, np.ndarray, np.ndarray]:
     """Build ``M`` from byte-identical amplicons alone: ``S = diag(1 / group size)``.
 
@@ -229,10 +236,20 @@ def build_exact_grouped(amplicons: Path
     much IUPAC ambiguity it carries relative to its partners, and the members of an
     exact-duplicate group carry *the same* ambiguity, so the weights cancel out of the
     normalisation and the split is uniform whatever the weight is.
+
+    ``home_mseq`` moves each group's mass to where MAPseq actually sends its reads
+    (``home_distribution``) instead of onto the group itself.
     """
-    refseqs, group, _ = dedup(amplicons, keep_sequences=False)
+    refseqs, group, sequences = dedup(amplicons, keep_sequences=home_mseq is not None)
     sizes = np.bincount(group)
     unique = len(sizes)
+    if home_mseq is not None:
+        home = home_distribution(home_mseq, sequences, refseqs, group, error_rate)
+        self_ = np.arange(unique)
+        cluster, _ = _grouped_kernel(unique, self_, self_, np.ones(unique), np.zeros(unique),
+                                     None, sizes, home)
+        return refseqs, cluster, group, np.where(sizes[group] > 1, 0, UNRESOLVED_DISTANCE
+                                                 ).astype(np.int32)
     cluster = sparse.csr_array(
         (1.0 / sizes, np.arange(unique, dtype=np.int32),
          np.arange(unique + 1, dtype=np.int32)),
@@ -367,6 +384,153 @@ def pigeonhole_candidates(sequences: list[str], tau: int, max_ambiguous_bases: i
     return np.stack(divmod(packed, total), axis=1)
 
 
+def _grouped_kernel(unique: int, rows: np.ndarray, columns: np.ndarray, edge: np.ndarray,
+                    distance: np.ndarray, weights: np.ndarray | None, sizes: np.ndarray,
+                    home: sparse.csr_array | None
+                    ) -> tuple[sparse.csr_array, sparse.csr_array]:
+    """Assemble the grouped kernel ``S`` and its strata from tie-cluster entries.
+
+    ``rows``/``columns``/``edge``/``distance`` list each group's members: itself at
+    distance 0 and every neighbour at ``c ** d``. A member's share is ``edge * w(column)``
+    (``w`` the ambiguity weight), normalised over the *distinct* members of the row, then
+    split over the column's duplicates (``/ sizes``): kernel version 2.
+
+    A row with a ``home`` (``home_distribution``) drops every distance-0 entry (itself, and
+    the IUPAC-compatible references the ambiguity weight used to arbitrate) and any
+    neighbour entry the home already covers, and takes the home's entries at distance 0
+    and total weight 1 instead. They are not ambiguity-weighted: MAPseq's own tie-break is what the
+    home measured. At distance 0 they are invariant under re-decay, as the self entry was.
+    """
+    rows, columns = rows.astype(np.int64), columns.astype(np.int64)
+    if weights is None:
+        weights = np.ones(unique)
+    share = edge * weights[columns]
+    if home is not None:
+        homed = np.diff(home.indptr) > 0
+        entries = home.tocoo()
+        covered = np.isin(rows * unique + columns,
+                          entries.row.astype(np.int64) * unique + entries.col)
+        keep = ~(homed[rows] & ((rows == columns) | covered | (distance == 0)))
+        rows = np.concatenate([rows[keep], entries.row])
+        columns = np.concatenate([columns[keep], entries.col])
+        share = np.concatenate([share[keep], entries.data])
+        edge = np.concatenate([edge[keep], entries.data])
+        distance = np.concatenate([distance[keep], np.zeros(len(entries.data))])
+    per_row = np.bincount(rows, weights=share, minlength=unique)
+    dead = per_row[rows] == 0
+    if dead.any():
+        # An all-ambiguous cluster has no tie left to break; fall back to the plain split
+        # rather than divide by zero (same convention as ``_normalise``).
+        share = np.where(dead, edge, share)
+        per_row = np.bincount(rows, weights=share, minlength=unique)
+    shape = (unique, unique)
+    cluster = sparse.csr_array((share / per_row[rows] / sizes[columns], (rows, columns)),
+                               shape=shape)
+    # Same COO structure, so the same pattern: ``d + 1`` (0 would be structural).
+    strata = sparse.csr_array((distance + 1.0, (rows, columns)), shape=shape)
+    strata.data -= 1.0
+    return cluster, strata
+
+
+# A home probe is "<v4g id>:e", the error-free amplicon, or "<v4g id>:<i>", one random
+# substitution away from it (``write_home_probes``). A query without either suffix is read
+# as error-free, which is what a plain mapping of the amplicons themselves is.
+HOME_ERROR_FREE = "e"
+
+
+def v4g(sequence: str) -> str:
+    """The V4 group id of a distinct amplicon (``build_panel_kernel.v4g``)."""
+    return "v4g_" + hashlib.sha256(sequence.encode()).hexdigest()[:16]
+
+
+def write_home_probes(sequences: list[str], out: Path, per_amplicon: int, seed: int = 0) -> int:
+    """Write each distinct amplicon once as-is and ``per_amplicon`` times one base off.
+
+    One substitution is the smallest change that re-draws MAPseq's tie-break. With a fixed
+    ``-seed`` the tie-break is a function of the query, so an identical copy only repeats
+    the error-free label; and a substitution leaves every exact-score tie intact (a
+    reference that contains the amplicon, or matches it through an IUPAC code, loses the
+    same point the amplicon does). Measured on the 26-source SILVA panel:
+    dev/mapseq_candidate_funnel.md.
+    """
+    rng = np.random.default_rng(seed)
+    written = 0
+    with open(out, "w") as fh:
+        for sequence in sequences:
+            key = v4g(sequence)
+            fh.write(f">{key}:{HOME_ERROR_FREE}\n{sequence}\n")
+            for i, position in enumerate(rng.integers(0, len(sequence), per_amplicon)):
+                base = rng.choice([b for b in _BASES if b != sequence[position]])
+                fh.write(f">{key}:{i}\n{sequence[:position]}{base}{sequence[position + 1:]}\n")
+            written += 1 + per_amplicon
+    return written
+
+
+def home_labels(mseq: Path | list[Path], source_of: dict[str, int], label_of_hit: dict[str, int]
+                ) -> tuple[dict[int, int], dict[int, Counter]]:
+    """``(error-free label, Counter of probe labels)`` per source, from a home mapping.
+
+    ``source_of`` maps a probe key (a v4g id, or a panel source id) to its row;
+    ``label_of_hit`` a MAPseq hit to its column. Unhit probes and unknown ids are skipped.
+    """
+    error_free: dict[int, int] = {}
+    probes: dict[int, Counter] = {}
+    for path in (mseq if isinstance(mseq, list) else [mseq]):
+        for query, hit in si.iter_mseq(path):
+            key, _, tag = query.rpartition(":")
+            if not (key in source_of and (tag == HOME_ERROR_FREE or tag.isdigit())):
+                key, tag = query, HOME_ERROR_FREE
+            if key not in source_of or hit not in label_of_hit:
+                continue
+            if tag == HOME_ERROR_FREE:
+                error_free[source_of[key]] = label_of_hit[hit]
+            else:
+                probes.setdefault(source_of[key], Counter())[label_of_hit[hit]] += 1
+    return error_free, probes
+
+
+def home_rows(error_free: dict[int, int], probes: dict[int, Counter], shape: tuple[int, int],
+              free_weight: np.ndarray) -> sparse.csr_array:
+    """Home distribution per source: ``free_weight`` on the error-free label, the rest by
+    probe frequency. Either part alone takes the whole row; a source with neither keeps an
+    empty row (its caller's own default, e.g. the self entry)."""
+    rows, columns, data = [], [], []
+    for source in set(error_free) | set(probes):
+        counts = probes.get(source, Counter())
+        total = sum(counts.values())
+        w0 = free_weight[source] if source in error_free and total else float(source in error_free)
+        if source in error_free:
+            rows.append(source); columns.append(error_free[source]); data.append(w0)
+        for label, count in counts.items():
+            rows.append(source); columns.append(label); data.append((1.0 - w0) * count / total)
+    home = sparse.csr_array((data, (rows, columns)), shape=shape)
+    home.sum_duplicates()
+    return home
+
+
+def home_distribution(mseq: Path, sequences: list[str], refseqs: list[str], group: np.ndarray,
+                      error_rate: float) -> sparse.csr_array:
+    """Where MAPseq sends each distinct amplicon's reads at distance 0: groups x groups.
+
+    A read of length ``L`` carries no error with probability ``(1 - e) ** L``; that share
+    goes to the error-free probe's label, and the rest is spread as the one-substitution
+    probes were. It is what a single MAPseq label for the amplicon cannot express: with
+    MAPseq's defaults the read often never reaches its own group, and under any settings a
+    tie at the top score is broken per read.
+    """
+    source_of = {v4g(s): i for i, s in enumerate(sequences)}
+    label_of_hit = dict(zip(refseqs, group.tolist()))
+    error_free, probes = home_labels(mseq, source_of, label_of_hit)
+    free_weight = (1.0 - error_rate) ** np.array([len(s) for s in sequences], dtype=np.float64)
+    home = home_rows(error_free, probes, (len(sequences), len(sequences)), free_weight)
+    homed = np.diff(home.indptr) > 0
+    moved = homed & (home.diagonal() < 0.5)
+    log.info("home distribution: %d of %d distinct amplicons measured, %d send most of "
+             "their reads elsewhere (e=%.5f)", int(homed.sum()), len(sequences),
+             int(moved.sum()), error_rate)
+    return home
+
+
 def build_kmer_grouped(
     amplicons: Path,
     tau: int,
@@ -374,6 +538,8 @@ def build_kmer_grouped(
     ambiguity_weight: float,
     max_postings: int,
     distance_decay: float = 1.0,
+    home_mseq: Path | None = None,
+    error_rate: float = 0.0,
 ) -> tuple[list[str], sparse.csr_array, np.ndarray, np.ndarray, sparse.csr_array]:
     """Build ``M`` from exact duplicates widened by verified neighbours within ``tau``.
 
@@ -381,6 +547,9 @@ def build_kmer_grouped(
     pattern, which is what lets inference re-decay ``M`` at another ``c`` without the
     sequences (``sparse_matrix``'s module docstring). ``build_exact_grouped`` has no
     counterpart because every distance there is 0 and ``c`` cancels.
+
+    ``home_mseq`` replaces each group's distance-0 self entry by MAPseq's measured home
+    distribution (``home_distribution``); the neighbours keep their ``c ** d`` entries.
     """
     if tau < 1:
         raise ValueError("kmer backend requires --tau >= 1; use exact-hash for tau=0")
@@ -396,39 +565,17 @@ def build_kmer_grouped(
     log.info("%d candidate pairs, %d within tau=%d", len(pairs), len(neighbours), tau)
 
     sizes = np.bincount(group, minlength=unique)
-    weights = ambiguity_weights(sequences, ambiguity_weight)
-    # ``adjacency`` carries the distance decay, so it is the membership matrix
-    # ``tie_cluster_matrix`` normalises densely, not a 0/1 pattern.
     verified = distances[distances <= tau].astype(np.float64)
     edge = np.float64(distance_decay) ** verified
-    rows = np.concatenate([np.arange(unique), neighbours[:, 0], neighbours[:, 1]])
-    columns = np.concatenate([np.arange(unique), neighbours[:, 1], neighbours[:, 0]])
-    adjacency = sparse.csr_array(
-        (np.concatenate([np.ones(unique), edge, edge]), (rows, columns)),
-        shape=(unique, unique))
-    adjacency.setdiag(1.0)                        # coo summed the duplicate self-entries
-    # Same COO structure, so the same pattern: ``d + 1`` (0 would be structural).
-    strata = sparse.csr_array(
-        (np.concatenate([np.ones(unique), verified + 1.0, verified + 1.0]), (rows, columns)),
-        shape=(unique, unique))
-    strata.setdiag(1.0)
-    strata.data -= 1.0
-    # Kernel version 2: a distinct neighbour is weighted once, not once per duplicate, and
-    # its share is split over its duplicates below (``/ sizes``).
-    weights = np.ones(unique) if weights is None else weights
-    per_row = adjacency @ weights
-    width = np.diff(adjacency.indptr)
-    share = adjacency.data * weights[adjacency.indices]
-    dead = per_row == 0
-    if dead.any():
-        # An all-ambiguous cluster has no tie left to break; fall back to the plain split
-        # rather than divide by zero (same convention as ``_normalise``).
-        source_of = np.repeat(np.arange(unique), width)
-        share = np.where(dead[source_of], adjacency.data, share)
-        per_row = np.where(dead, adjacency @ np.ones(unique), per_row)
-    data = share / sizes[adjacency.indices] / np.repeat(per_row, width)
-    cluster = sparse.csr_array((data, adjacency.indices, adjacency.indptr),
-                               shape=(unique, unique))
+    home = (None if home_mseq is None
+            else home_distribution(home_mseq, sequences, refseqs, group, error_rate))
+    cluster, strata = _grouped_kernel(
+        unique,
+        np.concatenate([np.arange(unique), neighbours[:, 0], neighbours[:, 1]]),
+        np.concatenate([np.arange(unique), neighbours[:, 1], neighbours[:, 0]]),
+        np.concatenate([np.ones(unique), edge, edge]),
+        np.concatenate([np.zeros(unique), verified, verified]),
+        ambiguity_weights(sequences, ambiguity_weight), sizes, home)
 
     nearest_unique = np.full(unique, UNRESOLVED_DISTANCE, dtype=np.int32)
     for (source, target), distance in zip(neighbours, distances[distances <= tau]):
@@ -999,6 +1146,18 @@ def main() -> None:
                          f"cluster member with k of them gets w**k (default "
                          f"{DEFAULT_AMBIGUITY_WEIGHT}, fitted; 1 disables). No-op on a "
                          "reference set with no ambiguity codes.")
+    ap.add_argument("--write-home-probes", type=Path, metavar="FASTA",
+                    help="write the home probes for --amplicons (each distinct amplicon "
+                         "error-free and --home-probes times one substitution off) and exit; "
+                         "map them with the same MAPseq database and flags as the reads")
+    ap.add_argument("--home-probes", type=int, default=20,
+                    help="one-substitution probes per distinct amplicon (default 20)")
+    ap.add_argument("--seed", type=int, default=0, help="probe substitution seed")
+    ap.add_argument("--home-mseq", type=Path,
+                    help="MAPseq output for --write-home-probes: each group's distance-0 mass "
+                         "goes where MAPseq sends its reads, (1-e)**L to the error-free label "
+                         "and the rest as the probes landed, e the error model's per-base "
+                         "rate. Grouped backends only.")
     ap.add_argument("-o", "--output", type=Path, help="output labelled CSR mismapping_matrix.npz")
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--verbose", "-v", action="store_true")
@@ -1007,17 +1166,30 @@ def main() -> None:
                         format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
     if a.demo:
         return demo()
+    if a.write_home_probes:
+        if a.amplicons is None or a.home_probes < 0:
+            ap.error("--write-home-probes needs --amplicons and --home-probes >= 0")
+        _, _, sequences = dedup(a.amplicons)
+        n = write_home_probes(sequences, a.write_home_probes, a.home_probes, a.seed)
+        print(f"build_mismapping_align: {n} home probes for {len(sequences)} distinct "
+              f"amplicons -> {a.write_home_probes}")
+        return
     required = ("amplicons", "output") if a.backend != "minimap2" else ("amplicons", "paf", "output")
     for req in required:
         if getattr(a, req) is None:
             ap.error(f"--{req.replace('_', '-')} is required (unless --demo)")
     if not 0.0 <= a.ambiguity_weight <= 1.0:
         ap.error("--ambiguity-weight must be in [0, 1]")
+    if a.home_mseq and a.backend == "minimap2":
+        ap.error("--home-mseq needs a grouped backend (kmer or exact-hash)")
+    if (a.distance_decay == "auto" or a.home_mseq) and a.error_model == "trained" \
+            and a.model_pt is None:
+        ap.error("--error-model trained needs --model-pt")
+    error_rate = (measure_error_rate(a.error_model, a.model_pt, a.sub_rate, a.ins_rate,
+                                     a.del_rate)
+                  if a.distance_decay == "auto" or a.home_mseq else None)
     if a.distance_decay == "auto":
-        if a.error_model == "trained" and a.model_pt is None:
-            ap.error("--distance-decay auto --error-model trained needs --model-pt")
-        a.distance_decay = measure_error_rate(a.error_model, a.model_pt, a.sub_rate,
-                                              a.ins_rate, a.del_rate)
+        a.distance_decay = error_rate
         if a.distance_decay <= 0.0:
             ap.error("--distance-decay auto measured a zero error rate; set it explicitly")
         log.info("--distance-decay auto -> %.5f", a.distance_decay)
@@ -1039,12 +1211,13 @@ def main() -> None:
     if a.backend == "kmer":
         refseqs, M, group, nearest, distances = build_kmer_grouped(
             a.amplicons, a.tau, a.max_ambiguous_bases, a.ambiguity_weight,
-            a.max_postings, a.distance_decay,
+            a.max_postings, a.distance_decay, a.home_mseq, error_rate or 0.0,
         )
     elif a.backend == "exact-hash":
         if a.tau != 0:
             ap.error("--backend exact-hash requires --tau 0")
-        refseqs, M, group, nearest = build_exact_grouped(a.amplicons)
+        refseqs, M, group, nearest = build_exact_grouped(a.amplicons, a.home_mseq,
+                                                         error_rate or 0.0)
     else:
         group = None
         refseqs, M, nearest, distances = build_sparse(

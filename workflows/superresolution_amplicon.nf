@@ -10,6 +10,8 @@ include { MAPSEQ_CLUSTER       } from '../modules/local/mapseq/cluster/main'
 include { MAPSEQ_CLUSTER as MAPSEQ_CLUSTER_MATRIX } from '../modules/local/mapseq/cluster/main'
 include { MAPSEQ as MAPSEQ_SIM } from '../modules/local/mapseq/map/main'
 include { MAPSEQ as MAPSEQ_OBS } from '../modules/local/mapseq/map/main'
+include { MAPSEQ as MAPSEQ_HOME } from '../modules/local/mapseq/map/main'
+include { HOME_PROBES          } from '../modules/local/home_probes/main'
 include { SIMULATE_READS       } from '../modules/local/simulate_reads/main'
 include { BUILD_MISMAPPING     } from '../modules/local/build_mismapping/main'
 include { ALIGN_MISMAPPING     } from '../modules/local/align_mismapping/main'
@@ -49,6 +51,9 @@ workflow SUPERRESOLUTION_AMPLICON {
     // to a number silently misjudges every backend check below.
     if (params.align_backend == 'kmer' && (params.align_tau as int) < 1) {
         error "--align_backend kmer requires --align_tau >= 1; use exact-hash for tau=0"
+    }
+    if ((params.align_home_probes as int) > 0 && params.align_backend == 'minimap2') {
+        error "--align_home_probes needs a grouped backend (--align_backend exact-hash or kmer)"
     }
     if (params.align_backend == 'exact-hash' && (params.align_tau as int) != 0) {
         error "--align_backend exact-hash requires --align_tau 0; use kmer for tau >= 1"
@@ -181,10 +186,14 @@ workflow SUPERRESOLUTION_AMPLICON {
     // `mseq:`) or a panel's sources. An align-mode matrix never reads the .mscluster, so a
     // sweep over supplied classifications skips it; ch_db then holds only the samples that
     // use it.
+    // Home probes map the square matrix's amplicons against their own set.
+    def home_probes = params.mismapping_method == 'align' && !params.mismapping_matrix &&
+        (params.align_home_probes as int) > 0
     ch_cluster_sets = ch_refs_by_set
         .map { set, meta, refs -> [ meta.id, set, meta ] }
         .join(ch_reads.map { meta, reads -> [ meta.id, !meta.mseq ] })
-        .filter { id, set, meta, maps_reads -> maps_reads || meta.panel || meta.panel_taxa }
+        .filter { id, set, meta, maps_reads ->
+            maps_reads || meta.panel || meta.panel_taxa || home_probes }
         .map { id, set, meta, maps_reads -> [ set ] }
         .unique()
     MAPSEQ_CLUSTER(ch_set_refs
@@ -237,6 +246,7 @@ workflow SUPERRESOLUTION_AMPLICON {
                 align_distance_decay: params.align_distance_decay,
                 align_decay_model: params.align_decay_model,
                 align_ambiguity_weight: params.align_ambiguity_weight,
+                align_home_probes: params.align_home_probes,
                 max_ambiguous_bases: params.max_ambiguous_bases,
                 max_postings: params.max_postings,
                 minimap2_args: params.minimap2_args,
@@ -269,7 +279,28 @@ workflow SUPERRESOLUTION_AMPLICON {
         // Index once, then align against it — the reference set is the target of its own
         // all-vs-all, so without this every run re-indexes the whole DB.
         if (params.align_backend in ['kmer', 'exact-hash']) {
-            GROUPED_MISMAPPING(ch_align_refs)
+            // [ meta, home mseq | NO_HOME ]. The probes map against the representative
+            // member's database, the same one its reads map against.
+            if (home_probes) {
+                HOME_PROBES(ch_matrix_groups.map { meta, d, model ->
+                    [ meta, d.resolve('amplicons.fasta') ] })
+                MAPSEQ_HOME(HOME_PROBES.out.probes
+                    .map { meta, probes -> [ meta.members[0].id, meta, probes ] }
+                    .combine(ch_db, by: 0)
+                    .map { id, meta, probes, fasta, tax, mscluster ->
+                        [ meta, probes, fasta, tax, mscluster ] })
+                ch_versions = ch_versions.mix(HOME_PROBES.out.versions)
+                                         .mix(MAPSEQ_HOME.out.versions)
+                ch_home = MAPSEQ_HOME.out.mseq
+            }
+            else {
+                ch_home = ch_matrix_groups.map { meta, d, model ->
+                    [ meta, file("${projectDir}/assets/NO_HOME", checkIfExists: true) ] }
+            }
+            GROUPED_MISMAPPING(ch_align_refs
+                .map { meta, fasta, model -> [ meta.id, meta, fasta, model ] }
+                .join(ch_home.map { meta, home -> [ meta.id, home ] })
+                .map { id, meta, fasta, model, home -> [ meta, fasta, model, home ] })
             ch_versions = ch_versions.mix(GROUPED_MISMAPPING.out.versions)
             ch_bundle_in = GROUPED_MISMAPPING.out.mismapping
                 .map { meta, matrix -> [ meta.id, meta, matrix ] }

@@ -26,7 +26,7 @@ are the same.
 
 1. **About half the reads match a SILVA amplicon byte-for-byte**: 49.6% at distance 0, 37%
    at 1, 11% at 2, and 0.13% unreached at 4.
-2. **MAPseq often puts an exact-match read somewhere else.** Of the reads that match a
+2. **MAPseq often puts an exact-match read somewhere else.** (Why: its candidate search never reaches the read's own cluster; see [mapseq_candidate_funnel.md](mapseq_candidate_funnel.md).) Of the reads that match a
    SILVA amplicon exactly, MAPseq labels 41% (S01) with a *different* V4 group. In 92% of
    those cases the read's own group is shared by several SILVA references, and MAPseq picks
    a single-reference group 1–2 edits away. The labels agree on 56–57% of all reads.

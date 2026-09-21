@@ -170,10 +170,20 @@ def taxon_members(taxa: list[tuple[str, str]], headers: list[str], label_ids: li
 
 
 def _home_labels(home_mseq: Path, src: dict[str, int], label_of_hit: dict[str, int]):
-    """Each source's MAPseq label (-1 when unhit) and identity, from the sources' own mapping."""
+    """Each source's MAPseq label (-1 when unhit) and identity, from the sources' own mapping.
+
+    A home-probe mapping (``build_mismapping_align.write_home_probes``) is read for its
+    error-free rows (``<source>:e``); the one-substitution rows (``<source>:<i>``) are not
+    the source's own label.
+    """
     home = np.full(len(src), -1, dtype=np.int64)
     identity = np.full(len(src), np.nan)
     for query, hit, hit_identity in _mseq_rows(home_mseq):
+        key, _, tag = query.rpartition(":")
+        if key in src and tag.isdigit():
+            continue
+        if key in src and tag == "e":
+            query = key
         if query in src and hit in label_of_hit:
             home[src[query]] = label_of_hit[hit]
             identity[src[query]] = float(hit_identity)
@@ -309,6 +319,11 @@ def align(a) -> None:
     source's own group is not an entry of its own, so a relabelled exact match
     (``2acb -> 81c3``) is not undone by alignment. At ``tau >= 1`` the distances are stored,
     so ``--infer-distance-decay`` can refit ``c`` per sample.
+
+    When ``--home-mseq`` maps home probes (``build_mismapping_align.py
+    --write-home-probes`` on ``sources.fasta``), that weight-1 entry is a distribution:
+    ``(1 - e) ** L`` on the error-free label, the rest as the one-substitution probes
+    landed (``build_mismapping_align.home_distribution``), ``e`` from ``--error-rate``.
     """
     import build_mismapping_align as bma
 
@@ -318,9 +333,18 @@ def align(a) -> None:
     sequence = dict(si.read_fasta(a.prepared / "sources.fasta"))
     headers, label_ids, label_of_ref, label_seqs = db_groups(a.db_amplicons)
     own = {label: i for i, label in enumerate(label_ids)}
+    home_dist = None
     if a.home_mseq:
-        home, home_identity = _home_labels(a.home_mseq, src,
-                                           dict(zip(headers, label_of_ref.tolist())))
+        label_of_hit = dict(zip(headers, label_of_ref.tolist()))
+        home, home_identity = _home_labels(a.home_mseq, src, label_of_hit)
+        error_free, probes = bma.home_labels(a.home_mseq, src, label_of_hit)
+        if probes:
+            if a.error_rate is None:
+                raise SystemExit("--home-mseq carries home probes; give --error-rate")
+            free = (1.0 - a.error_rate) ** np.array([len(sequence[s]) for s in source_ids],
+                                                    dtype=np.float64)
+            home_dist = bma.home_rows(error_free, probes, (len(source_ids), len(label_ids)),
+                                      free)
     else:
         home = np.array([own.get(s, -1) for s in source_ids], dtype=np.int64)
         home_identity = np.where(home >= 0, 1.0, np.nan)
@@ -341,7 +365,14 @@ def align(a) -> None:
             if d <= a.tau and label != own.get(source):
                 entries[label] = ((1.0 if ambiguity is None else ambiguity[label])
                                   * a.distance_decay ** d, d)
-        entries[home[s]] = (1.0, 0)       # overrides the home's own neighbour entry
+        if home_dist is None or home_dist.indptr[s] == home_dist.indptr[s + 1]:
+            entries[home[s]] = (1.0, 0)   # overrides the home's own neighbour entry
+        else:
+            # The measured home already says where distance-0 ties go.
+            entries = {label: wd for label, wd in entries.items() if wd[1] > 0}
+            span = slice(home_dist.indptr[s], home_dist.indptr[s + 1])
+            for label, w in zip(home_dist.indices[span], home_dist.data[span]):
+                entries[int(label)] = (float(w), 0)
         total = sum(w for w, _ in entries.values())
         for label, (w, d) in entries.items():
             rows.append(s)
@@ -358,7 +389,8 @@ def align(a) -> None:
         strata = (distances, a.distance_decay)
     provenance = {"method": "align", "prepared": str(a.prepared), "tau": a.tau,
                   "distance_decay": a.distance_decay, "ambiguity_weight": a.ambiguity_weight,
-                  "home_mseq": None if a.home_mseq is None else str(a.home_mseq)}
+                  "home_mseq": None if a.home_mseq is None else str(a.home_mseq),
+                  "home_error_rate": None if home_dist is None else a.error_rate}
     sm.write_kernel(a.out, kernel, source_ids, label_ids, home, ref_headers=headers,
                     label_of_ref=label_of_ref,
                     db_amplicons_sha256=hashlib.sha256(a.db_amplicons.read_bytes()).hexdigest(),
@@ -429,6 +461,8 @@ def main() -> None:
     al.add_argument("--tau", type=int, default=1)
     al.add_argument("--distance-decay", type=float, default=0.007)
     al.add_argument("--ambiguity-weight", type=float, default=0.3)
+    al.add_argument("--error-rate", type=float, default=None,
+                    help="per-base error rate e; needed when --home-mseq maps home probes")
     al.add_argument("-o", "--out", type=Path, required=True)
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")

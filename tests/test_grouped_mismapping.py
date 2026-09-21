@@ -305,3 +305,52 @@ def test_pruning_drops_unreachable_genomes_from_a_grouped_fit(tmp_path: Path) ->
     for genome in ("g1", "g2"):
         assert abs(float(rows[genome]["inferred_mean"])
                    - float(full[genome]["inferred_mean"])) < 0.05, (rows, full)
+
+
+def _home_mseq(tmp_path: Path, rows: list[tuple[str, str]]) -> Path:
+    path = tmp_path / "home.mseq"
+    path.write_text("#query\tdbhit\tbitscore\tidentity\n"
+                    + "".join(f"{q}\t{hit}\t25\t1\n" for q, hit in rows))
+    return path
+
+
+def test_home_probes_are_the_amplicon_and_single_substitutions(tmp_path: Path) -> None:
+    out = tmp_path / "probes.fasta"
+    assert bma.write_home_probes(SEQUENCES[:1], out, 5) == 6
+    records = list(bma.iter_fasta(out))
+    key = bma.v4g(SEQUENCES[0])
+    assert records[0] == (f"{key}:e", SEQUENCES[0])
+    for i, (header, sequence) in enumerate(records[1:]):
+        assert header == f"{key}:{i}"
+        assert sum(a != b for a, b in zip(sequence, SEQUENCES[0])) == 1
+
+
+def test_home_distribution_replaces_the_distance_zero_mass(tmp_path: Path) -> None:
+    """Group 0 (r0, r1) is sent to r2 when error-free and 3:1 to itself:r2 with one error."""
+    fasta = _fasta(tmp_path)
+    g0, g2 = bma.v4g(SEQUENCES[0]), bma.v4g(SEQUENCES[2])
+    mseq = _home_mseq(tmp_path, [(f"{g0}:e", "r2"), (f"{g0}:0", "r0"), (f"{g0}:1", "r1"),
+                                 (f"{g0}:2", "r0"), (f"{g0}:3", "r2"),
+                                 (g2, "r2")])               # suffix-less: error-free
+    e = 0.01
+    free = (1 - e) ** len(SEQUENCES[0])
+    _, cluster, group, _ = bma.build_exact_grouped(fasta, mseq, e)
+    M = cluster.toarray()[np.ix_(group, group)]
+    np.testing.assert_allclose(M.sum(axis=1), 1.0)
+    np.testing.assert_allclose(M[0], [(1 - free) * 3 / 8, (1 - free) * 3 / 8,
+                                      free + (1 - free) / 4, 0, 0])
+    np.testing.assert_allclose(M[2], [0, 0, 1, 0, 0])       # its own home
+    np.testing.assert_allclose(M[4], [0, 0, 0, 0, 1])       # unmeasured: the self entry
+
+    # tau 1: the homed row drops its distance-0 IUPAC partner (r3) and keeps its
+    # distance-1 neighbour only where the home does not already cover it.
+    _, cluster, group, _, strata = bma.build_kmer_grouped(fasta, 1, 4, 0.3, 1 << 30, 0.01,
+                                                          mseq, e)
+    M = cluster.toarray()[np.ix_(group, group)]
+    np.testing.assert_allclose(M.sum(axis=1), 1.0)
+    assert M[0, 3] == 0
+    home_share = np.array([(1 - free) * 3 / 8, (1 - free) * 3 / 8, free + (1 - free) / 4])
+    np.testing.assert_allclose(M[0, :3], home_share)
+    assert strata.toarray()[group[0], group[2]] == 0         # re-decay leaves it alone
+    base = bma.build_kmer_grouped(fasta, 1, 4, 0.3, 1 << 30, 0.01)[1].toarray()
+    np.testing.assert_allclose(cluster.toarray()[group[4]], base[group[4]])
