@@ -72,7 +72,61 @@ nextflow_pipeline {
                 { assert path("${params.outdir}/composition/demo/demo.inferred_composition.csv").exists() },
                 { assert path("${params.outdir}/composition/demo/demo.fit_diagnostics.json").exists() },
                 { assert file("${params.outdir}/mismapping").listFiles().any {
-                    it.name.startsWith('panel_') && new File(it, 'panel_sources.tsv').exists() } }
+                    it.name.startsWith('panel_') && new File(it, 'panel_sources.tsv').exists()
+                        && new File(it, 'provenance.json').text.contains('"reference_sha256"') } }
+            )
+        }
+    }
+
+    test("a supplied panel kernel skips building one - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                // The bundle a stub run of the example sheet publishes: its provenance names
+                // the stub amplicons' sha256 and the unclustered refs.fasta as the MAPseq db.
+                def refs = new File("${projectDir}/tests/data/refs.fasta")
+                def sha = { byte[] b -> java.security.MessageDigest.getInstance('SHA-256').digest(b).encodeHex().toString() }
+                def amplicons = ">ref|0|${sha(refs.bytes).take(12)}\nACGTACGTACGT\n"
+                def kdir = new File("$outputDir/panel_supplied")
+                kdir.mkdirs()
+                ['mismapping_matrix.npz', 'panel_translation.tsv', 'sources.tsv'].each { new File(kdir, it).text = '' }
+                new File(kdir, 'provenance.json').text = groovy.json.JsonOutput.toJson([
+                    matrix_key: 'panel_supplied', reference_sha256: sha(amplicons.bytes),
+                    mapseq_db: [refs.absolutePath, refs.length(), refs.lastModified(), 'clustered'].join('|'),
+                    panel: 'database', panel_taxa: null])
+                input        = "${projectDir}/assets/samplesheet.example.yml"
+                outdir       = "$outputDir"
+                panel_kernel = kdir.absolutePath
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                // The default run's 12 tasks less PANEL_PREPARE, MAPSEQ_PANEL_HOME,
+                // SIMULATE_PANEL_READS, MAPSEQ_PANEL_SIM and PANEL_KERNEL.
+                { assert workflow.trace.succeeded().size() == 7 },
+                { assert workflow.trace.tasks().every { !it.name.contains('PANEL') } },
+                { assert path("${params.outdir}/composition/demo/demo.inferred_composition.csv").exists() },
+                { assert !path("${params.outdir}/mismapping").exists() }
+            )
+        }
+    }
+
+    test("a panel kernel built against other amplicons is refused - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input        = "${projectDir}/assets/samplesheet.example.yml"
+                outdir       = "$outputDir"
+                panel_kernel = "${projectDir}/tests/data/panel_kernel_other"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.failed },
+                { assert workflow.stdout.any { it.contains('was built for a different reference_sha256') } }
             )
         }
     }

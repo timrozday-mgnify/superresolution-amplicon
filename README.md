@@ -261,7 +261,7 @@ Mis-mapping — how `M` is built:
 | `--min_pair_overlap` | `20` | Paired samples: shortest mate overlap accepted when merging R1/R2. Unmergeable pairs are dropped and counted; past 20% the run warns that the fragments do not cover the amplicon, and `--mismapping_method simulate --sim_read_len` is the right choice for that sample. |
 | `--sim_read_len` | – | Reads are this long, i.e. shorter than the amplicon (unmerged / short reads). **`simulate` only** — `align` builds `M` from whole-reference alignments and refuses this combination rather than understating confusion. Unset = reads span the whole amplicon, correct for merged reads. |
 
-The remaining `simulate` settings below (everything except `--mismapping_matrix`) are
+The remaining `simulate` settings below (everything except `--panel_kernel`) are
 ignored under `--mismapping_method align`, including `--sim_error_model trained` — nothing
 simulates reads, so nothing needs an error model and the skiver subworkflow never runs.
 
@@ -274,24 +274,24 @@ simulates reads, so nothing needs an error model and the skiver subworkflow neve
 | `--flat_ins_rate` | `0.0005` | Flat model: per-base insertion probability. |
 | `--flat_del_rate` | `0.0005` | Flat model: per-base deletion probability. |
 | `--sim_n_per_ref` | `500` | Simulated reads per reference (sampling depth for `M`). |
-| `--mismapping_matrix` | – | A previously generated `mismapping_matrix.npz` for the same amplicon reference set. Skips read simulation and simulated-read mapseq. Either form is accepted: the labelled compressed CSR, or the grouped form; legacy CSV matrices remain readable. |
+| `--panel_kernel` | – | A `mismapping/panel_<key>/` directory published by an earlier run. Skips building the kernel: no panel preparation, error-model training, simulation or panel mapping. Refused unless its `provenance.json` names the same extracted amplicons (`reference_sha256`), MAPseq database (`mapseq_db`), `panel` and `panel_taxa` as every sample's. |
 
 In-silico PCR and the mapseq clustering run once per distinct `references` file,
 however many samples name it: 50 samples against one GTDB SSU FASTA extract and
 cluster it once (or not at all, when its `.mscluster` ships beside it). `amplicons/<id>_amplicons/` is still published per sample. The
 pipeline then fingerprints extracted amplicons and builds each compatible matrix once
-per run. Canonical reusable matrices are published under `mismapping/<matrix-key>/`:
+per run. Each kernel is published as a bundle under `mismapping/panel_<key>/`, and a later
+run can reuse it:
 
 ```bash
 nextflow run main.nf --input samples.yml --references refs.fasta \
-  --mismapping_matrix results/mismapping/<matrix-key>/mismapping_matrix.npz
+  --panel_kernel results/mismapping/panel_<key>
 ```
 
-Each bundle also contains its reference sidecars and `provenance.json`. The matrix is
-tied to the extracted amplicon sequences, the mis-mapping method and its settings, and
-the mapseq settings; reuse it only with the same reference set and configuration. A
-matrix built by `align` and one built by `simulate` get different keys, so they are never
-silently interchanged.
+The run refuses the bundle unless it was built against the same extracted amplicons,
+MAPseq database (the FASTA's path, size and mtime, and its `.mscluster`) and panel. Its
+simulation or alignment settings are not checked, because they are the bundle's own:
+the kernel is used as it was built.
 
 For a matrix outside Nextflow, run minimap2 with an index first, then pass its PAF:
 
@@ -501,7 +501,8 @@ results/
       samples.tsv                     samples consuming this matrix
       reference/                      amplicons + mapseq/inference sidecars
     panel_<key>/                     panel samples: rectangular kernel (mismapping_matrix.npz),
-                                     panel_sources.tsv, panel_translation.tsv, sources.tsv
+                                     panel_sources.tsv, panel_translation.tsv, sources.tsv,
+                                     provenance.json (what --panel_kernel checks)
   composition/<id>/
     <id>.inferred_composition.csv    inferred vs observed genome abundances
     <id>.inference_diagnostics.csv   matrix ID/path, fit status, and two diagonal summaries
@@ -537,10 +538,10 @@ scores the result. The interface it depends on — keep these stable:
 |-----------|----------|
 | in | `--input` YAML samplesheet of `{id, reads, platform, references}` rows; `references` is one combined FASTA with `genome\|n\|orig` headers. |
 | in | `--fwd_primer` / `--rev_primer`, so the reference amplicons are cut from the same region the reads were amplified from. |
-| in | `--mismapping_matrix <file>`, a matrix built by an earlier run of this pipeline. All three forms load: labelled CSR `.npz`, grouped `.npz`, legacy dense `.csv`. |
+| in | `--panel_kernel <dir>`, a `mismapping/panel_<key>/` bundle built by an earlier run of this pipeline against the same amplicons, MAPseq database and panel. |
 | in | `--infer_presence`, `--infer_presence_prior`, `--infer_presence_temp`. |
 | out | `composition/<id>/<id>.inferred_composition.csv`, with `genome_id` and `inferred_mean` — the columns the benchmark's `normalize_sr_profile.py` reads. |
-| out | exactly one `mismapping/<matrix-key>/mismapping_matrix.npz` per run, with `provenance.json` beside it. The benchmark lifts both, and it requires the run to publish **one** bundle. |
+| out | exactly one `mismapping/panel_<key>/` bundle per run (`mismapping_matrix.npz`, `panel_translation.tsv`, `sources.tsv`, `provenance.json`). The benchmark lifts the directory, and it requires the run to publish **one** bundle. |
 | out | a sample whose reads hit no reference is an all-zero composition with `status=no_reference_hits`, not a failure. |
 
 Because the benchmark builds the matrix once per reference set and then supplies it to
