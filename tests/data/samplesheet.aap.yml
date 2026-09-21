@@ -1,0 +1,13 @@
+# bin/aap_samplesheet.py tests/data/aap --panel tests/data/refs.fasta, with the paths made
+# repo-relative (tests/test_aap_samplesheet.py keeps the two in step). Needs --trim_primers false.
+- id: run_a
+  reads: tests/data/aap/run_a/qc/run_a.merged.fastq.gz
+  merged: true
+  merge_rate: 0.95
+  mseq: tests/data/aap/run_a/taxonomy-summary/SILVA-SSU/run_a.mseq
+  panel_references: tests/data/refs.fasta
+- id: run_b
+  reads: tests/data/aap/run_b/qc/run_b.merged.fastq.gz
+  merged: true
+  merge_rate: 0.7
+  panel_references: tests/data/refs.fasta
