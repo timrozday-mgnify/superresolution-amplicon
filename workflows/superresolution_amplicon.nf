@@ -78,10 +78,11 @@ workflow SUPERRESOLUTION_AMPLICON {
               "reads shorter than the amplicon, or merge pairs so queries span it."
     }
 
-    if (params.mismapping_matrix) {
-        error "--mismapping_matrix is a square-matrix input and is not supported by the panel workflow; P.4 replaces it with --panel_kernel"
+    if (params.panel_kernel) {
+        // A supplied kernel: nothing is simulated or aligned, so nothing needs a model.
+        ch_model = ch_reads.map { meta, reads -> [ meta.id, file("${projectDir}/assets/NO_MODEL"), 'supplied-kernel' ] }
     }
-    if (params.mismapping_method == 'align') {
+    else if (params.mismapping_method == 'align') {
         // Alignment never trains an error model. `auto` can, however, measure a supplied
         // pre-trained model's error rate, so its content fingerprint enters the panel key.
         def decay_model = params.align_decay_model
@@ -223,9 +224,11 @@ workflow SUPERRESOLUTION_AMPLICON {
             def panel_taxa = rep[0].panel_taxa
             def id = "panel_${key.take(16)}"
             def members = entries.collect { it[0].id }
+            // Strings, not paths: this is written to the bundle's provenance.json, and
+            // --panel_kernel compares it field by field.
             def provenance = [
-                matrix_key: id, reference_sha256: rep[4], mapseq_db: rep[5], panel: panel,
-                panel_taxa: panel_taxa, model_identity: rep[3],
+                matrix_key: id, reference_sha256: rep[4], mapseq_db: rep[5],
+                panel: panel.toString(), panel_taxa: panel_taxa?.toString(), model_identity: rep[3],
                 mismapping_method: params.mismapping_method, align_tau: params.align_tau,
                 align_distance_decay: params.align_distance_decay,
                 align_ambiguity_weight: params.align_ambiguity_weight,
@@ -242,52 +245,76 @@ workflow SUPERRESOLUTION_AMPLICON {
               provenance: provenance], panel, rep[1], rep[2]]
         }
 
-    PANEL_PREPARE(
-        ch_panel_groups.map { meta, panel, d, model ->
-            [ meta, panel == 'database' ? [] : panel ?: [], meta.panel_taxa ?: [],
-              d.resolve('amplicons.fasta'), d ] },
-        params.taxonomy ? file(params.taxonomy, checkIfExists: true) : [])
-    ch_versions = ch_versions.mix(PANEL_PREPARE.out.versions)
-    // [ meta, sources, fasta, tax, mscluster ] against the representative's database.
-    ch_panel_db = PANEL_PREPARE.out.sources
-        .map { meta, sources -> [ meta.db_id, meta, sources ] }
-        .combine(ch_db, by: 0)
-        .map { db_id, meta, sources, fasta, tax, mscluster -> [ meta, sources, fasta, tax, mscluster ] }
-    MAPSEQ_PANEL_HOME(ch_panel_db)
-    // [ panel id, database amplicons.fasta ]
-    ch_db_amplicons = ch_panel_groups.map { meta, panel, d, model -> [ meta.id, d.resolve('amplicons.fasta') ] }
-    ch_versions = ch_versions.mix(MAPSEQ_PANEL_HOME.out.versions)
-    if (params.mismapping_method == 'simulate') {
-        SIMULATE_PANEL_READS(PANEL_PREPARE.out.sources
-            .map { meta, sources -> [ meta.id, meta, sources ] }
-            .join(ch_panel_groups.map { meta, panel, d, model -> [ meta.id, model ] })
-            .map { id, meta, sources, model -> [ meta, sources, model ] })
-        MAPSEQ_PANEL_SIM(SIMULATE_PANEL_READS.out.reads
-            .map { meta, reads -> [ meta.id, reads ] }
-            .join(ch_panel_db.map { meta, sources, fasta, tax, mscluster -> [ meta.id, meta, fasta, tax, mscluster ] })
-            .map { id, reads, meta, fasta, tax, mscluster -> [ meta, reads, fasta, tax, mscluster ] })
-        ch_versions = ch_versions.mix(SIMULATE_PANEL_READS.out.versions)
-            .mix(MAPSEQ_PANEL_SIM.out.versions)
-        // The kernel's labels are the database's V4 groups, so it takes the extracted
-        // amplicons, never the MAPseq FASTA (whole SSU sequences would group nothing).
-        PANEL_KERNEL(PANEL_PREPARE.out.prepared
-            .map { meta, prepared -> [ meta.id, meta, prepared ] }
-            .join(ch_db_amplicons)
-            .join(MAPSEQ_PANEL_HOME.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
-            .join(MAPSEQ_PANEL_SIM.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
-            .map { id, meta, prepared, fasta, home, sim -> [ meta, prepared, fasta, home, sim ] })
-        ch_versions = ch_versions.mix(PANEL_KERNEL.out.versions)
-        ch_panel_kernel = PANEL_KERNEL.out.kernel
+    if (params.panel_kernel) {
+        // Reuse a published bundle instead of building one. Its kernel is only valid for
+        // the label space (extracted amplicons), MAPseq database and panel it was built
+        // against, so each of those must match every sample's.
+        def kdir = file(params.panel_kernel, checkIfExists: true)
+        ['mismapping_matrix.npz', 'panel_translation.tsv', 'sources.tsv', 'provenance.json'].each {
+            if (!kdir.resolve(it).exists()) {
+                error "--panel_kernel ${kdir} is not a mismapping/panel_<key>/ bundle: no ${it}"
+            }
+        }
+        def supplied = new groovy.json.JsonSlurper().parseText(kdir.resolve('provenance.json').text)
+        ch_panel_kernel = ch_panel_groups.map { meta, panel, d, model ->
+            def diff = ['reference_sha256', 'mapseq_db', 'panel', 'panel_taxa'].findAll { k ->
+                supplied[k]?.toString() != meta.provenance[k]?.toString() }
+            if (diff) {
+                error "--panel_kernel ${kdir} was built for a different " +
+                      diff.collect { k -> "${k} (${supplied[k]}, not ${meta.provenance[k]})" }.join(', ') +
+                      " than sample(s) ${meta.members.join(', ')}"
+            }
+            [ meta + [matrix_key: supplied.matrix_key], kdir ]
+        }
     }
     else {
-        PANEL_ALIGN(PANEL_PREPARE.out.prepared
-            .map { meta, prepared -> [ meta.id, meta, prepared ] }
-            .join(ch_db_amplicons)
-            .join(MAPSEQ_PANEL_HOME.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
-            .join(ch_panel_groups.map { meta, panel, d, model -> [ meta.id, model ] })
-            .map { id, meta, prepared, fasta, home, model -> [ meta, prepared, fasta, home, model ] })
-        ch_versions = ch_versions.mix(PANEL_ALIGN.out.versions)
-        ch_panel_kernel = PANEL_ALIGN.out.kernel
+        PANEL_PREPARE(
+            ch_panel_groups.map { meta, panel, d, model ->
+                [ meta, panel == 'database' ? [] : panel ?: [], meta.panel_taxa ?: [],
+                  d.resolve('amplicons.fasta'), d ] },
+            params.taxonomy ? file(params.taxonomy, checkIfExists: true) : [])
+        ch_versions = ch_versions.mix(PANEL_PREPARE.out.versions)
+        // [ meta, sources, fasta, tax, mscluster ] against the representative's database.
+        ch_panel_db = PANEL_PREPARE.out.sources
+            .map { meta, sources -> [ meta.db_id, meta, sources ] }
+            .combine(ch_db, by: 0)
+            .map { db_id, meta, sources, fasta, tax, mscluster -> [ meta, sources, fasta, tax, mscluster ] }
+        MAPSEQ_PANEL_HOME(ch_panel_db)
+        // [ panel id, database amplicons.fasta ]
+        ch_db_amplicons = ch_panel_groups.map { meta, panel, d, model -> [ meta.id, d.resolve('amplicons.fasta') ] }
+        ch_versions = ch_versions.mix(MAPSEQ_PANEL_HOME.out.versions)
+        if (params.mismapping_method == 'simulate') {
+            SIMULATE_PANEL_READS(PANEL_PREPARE.out.sources
+                .map { meta, sources -> [ meta.id, meta, sources ] }
+                .join(ch_panel_groups.map { meta, panel, d, model -> [ meta.id, model ] })
+                .map { id, meta, sources, model -> [ meta, sources, model ] })
+            MAPSEQ_PANEL_SIM(SIMULATE_PANEL_READS.out.reads
+                .map { meta, reads -> [ meta.id, reads ] }
+                .join(ch_panel_db.map { meta, sources, fasta, tax, mscluster -> [ meta.id, meta, fasta, tax, mscluster ] })
+                .map { id, reads, meta, fasta, tax, mscluster -> [ meta, reads, fasta, tax, mscluster ] })
+            ch_versions = ch_versions.mix(SIMULATE_PANEL_READS.out.versions)
+                .mix(MAPSEQ_PANEL_SIM.out.versions)
+            // The kernel's labels are the database's V4 groups, so it takes the extracted
+            // amplicons, never the MAPseq FASTA (whole SSU sequences would group nothing).
+            PANEL_KERNEL(PANEL_PREPARE.out.prepared
+                .map { meta, prepared -> [ meta.id, meta, prepared ] }
+                .join(ch_db_amplicons)
+                .join(MAPSEQ_PANEL_HOME.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
+                .join(MAPSEQ_PANEL_SIM.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
+                .map { id, meta, prepared, fasta, home, sim -> [ meta, prepared, fasta, home, sim ] })
+            ch_versions = ch_versions.mix(PANEL_KERNEL.out.versions)
+            ch_panel_kernel = PANEL_KERNEL.out.kernel
+        }
+        else {
+            PANEL_ALIGN(PANEL_PREPARE.out.prepared
+                .map { meta, prepared -> [ meta.id, meta, prepared ] }
+                .join(ch_db_amplicons)
+                .join(MAPSEQ_PANEL_HOME.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
+                .join(ch_panel_groups.map { meta, panel, d, model -> [ meta.id, model ] })
+                .map { id, meta, prepared, fasta, home, model -> [ meta, prepared, fasta, home, model ] })
+            ch_versions = ch_versions.mix(PANEL_ALIGN.out.versions)
+            ch_panel_kernel = PANEL_ALIGN.out.kernel
+        }
     }
     // The kernel directory carries panel_translation.tsv and sources.tsv for inference.
     ch_mismapping = ch_panel_kernel

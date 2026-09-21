@@ -1,3 +1,9 @@
+// The bundle's provenance.json: what --panel_kernel checks a reused kernel against.
+def provenanceCmd(meta) {
+    def json = groovy.json.JsonOutput.toJson(meta.provenance).replace("'", "'\\''")
+    "printf '%s\\n' '${json}' > ${meta.id}/provenance.json"
+}
+
 // Tally the rectangular panel kernel K (panel sources x database V4 groups) from the
 // simulated reads' MAPseq labels, with each source's home label from its own mapping.
 // The output directory is what INFER_COMPOSITION and CHECK_COMPOSITION_FIT take as
@@ -23,6 +29,7 @@ process PANEL_KERNEL {
     """
     mkdir -p ${meta.id}
     cp ${prepared}/panel_translation.tsv ${prepared}/sources.tsv ${meta.id}/
+    ${provenanceCmd(meta)}
     build_panel_kernel.py build \\
         --prepared ${prepared} \\
         --db-amplicons ${db_amplicons} \\
@@ -41,6 +48,7 @@ process PANEL_KERNEL {
     """
     mkdir -p ${meta.id}
     cp ${prepared}/panel_translation.tsv ${prepared}/sources.tsv ${meta.id}/
+    ${provenanceCmd(meta)}
     touch ${meta.id}/mismapping_matrix.npz
     printf 'source\\thome_label\\n' > ${meta.id}/panel_sources.tsv
     # Which file the labels were grouped from: the extracted amplicons, never the MAPseq FASTA.
@@ -78,6 +86,7 @@ process PANEL_ALIGN {
     """
     mkdir -p ${meta.id}
     cp ${prepared}/panel_translation.tsv ${prepared}/sources.tsv ${meta.id}/
+    ${provenanceCmd(meta)}
     build_panel_kernel.py align \\
         --prepared ${prepared} \\
         --db-amplicons ${db_amplicons} \\
@@ -95,6 +104,7 @@ process PANEL_ALIGN {
     """
     mkdir -p ${meta.id}
     cp ${prepared}/panel_translation.tsv ${prepared}/sources.tsv ${meta.id}/
+    ${provenanceCmd(meta)}
     touch ${meta.id}/mismapping_matrix.npz
     printf 'source\\thome_label\\n' > ${meta.id}/panel_sources.tsv
     # Which file the labels were grouped from: the extracted amplicons, never the MAPseq FASTA.
