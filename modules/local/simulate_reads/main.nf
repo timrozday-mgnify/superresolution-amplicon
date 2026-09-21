@@ -11,6 +11,8 @@ process SIMULATE_READS {
 
     input:
     tuple val(meta), path(amplicons), path(model_pt)
+    // params.primer_mix, or [] when unset (see simulate_amplicon_reads.py --primer-mix)
+    path primer_mix
 
     output:
     tuple val(meta), path("${meta.id}.sim.fasta"), emit: reads
@@ -23,12 +25,14 @@ process SIMULATE_READS {
     def args      = task.ext.args ?: ''
     def prefix    = task.ext.prefix ?: "${meta.id}"
     def model_arg = model_pt.name == 'NO_MODEL' ? '' : "--model-pt ${model_pt}"
+    def mix_arg   = primer_mix ? "--primer-mix ${primer_mix}" : ''
     """
     export SKIVER_SCRIPTS=\${SKIVER_SCRIPTS:-/opt/skiver/scripts}
 
     simulate_amplicon_reads.py \\
         --amplicons ${amplicons} \\
         ${model_arg} \\
+        ${mix_arg} \\
         --seed ${params.seed} \\
         -o ${prefix}.sim.fasta \\
         $args

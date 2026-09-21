@@ -90,7 +90,7 @@ YAML list of samples (or a map with `samples:`). Per sample:
 | `references` | no | Per-sample reference fasta; overrides `--references`. |
 | `error_model` | no | Path to a pre-trained `.pt` model; **skips training** for this sample. |
 | `mseq` | no | Path to a mapseq classification of this sample's reads (a previous run's `mapseq/<id>/<id>.obs.mseq.gz`); **skips read mapping** for this sample. It must have been produced against the same reference set — the ids in it are matched to the extracted amplicons — and it carries the read-prep settings it was made with, so `--obs_max_reads`, `--trim_primers` and `--min_pair_overlap` no longer apply to that sample. Mapping is the expensive stage, so this is what makes a parameter sweep over the mis-mapping and inference knobs cheap. |
-| `merged` | no | `true` for reads that are already merged pairs, e.g. amplicon-analysis-pipeline's `qc/<id>.merged.fastq.gz`. They are never merged again or primer-trimmed, and the run needs `--trim_primers false` so the simulated reads keep their primers too. `bin/aap_samplesheet.py` writes such rows from an AAP output directory. |
+| `merged` | no | `true` for reads that are already merged pairs, e.g. amplicon-analysis-pipeline's `qc/<id>.merged.fastq.gz`. They are never merged again or primer-trimmed, and the run needs `--trim_primers false` so the simulated reads keep their primers too. Pass `--primer_mix assets/primer_mix_emp_v4.tsv` for AAP's EMP 515F/806R reads, so those primers carry the real oligo mix. `bin/aap_samplesheet.py` writes such rows from an AAP output directory. |
 | `panel_references` | no | Genome panel for this sample; overrides `--panel_references`. See [Panel reinterpretation](#panel-reinterpretation). |
 | `panel_taxa` | no | Taxon panel entries for this sample; overrides `--panel_taxa`. See [Panel reinterpretation](#panel-reinterpretation). |
 
@@ -226,6 +226,7 @@ Reference amplicons (in-silico PCR):
 | `--primer_mismatches` | `3` | Allowed primer mismatches. |
 | `--amplicon_cache` | – | Directory that keeps each reference set's extracted amplicons and, when no `.mscluster` ships beside the FASTA, its mapseq clustering (`storeDir`), keyed by the reference FASTA (path, size, mtime), primers and extractor code. Runs pointed at the same directory reuse them instead of rebuilding — at SILVA/GTDB scale the clustering alone is tens of minutes. The cache is unlocked: warm it with one run before starting several on the same set at once. |
 | `--trim_primers` | `true` | Trim primers off observed reads before mapping, and simulate the matrix and panel reads from primer-flanked amplicons trimmed the same way. Set `false` if reads are already primer-trimmed. |
+| `--primer_mix` | – | Table (`fwd`, `rev`, `reads`) of concrete primer oligos. Untrimmed simulated reads draw their primers from it, one row per read, because degenerate primer bases come from the oligo mix and not the template. [`assets/primer_mix_emp_v4.tsv`](assets/primer_mix_emp_v4.tsv) is the mix measured in AAP's Nov2025 EMP 515F/806R reads ([dev/aap_merge_effects.md](dev/aap_merge_effects.md), 0.3). Every oligo must fit `--fwd_primer`/`--rev_primer`. Without it, untrimmed reads draw each degenerate base uniformly. |
 
 Mis-mapping — how `M` is built:
 

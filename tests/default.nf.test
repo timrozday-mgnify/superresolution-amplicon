@@ -182,11 +182,13 @@ nextflow_pipeline {
                 outdir       = "$outputDir"
                 references   = "${projectDir}/tests/data/refs.fasta"
                 trim_primers = false
+                primer_mix   = "${projectDir}/assets/primer_mix_emp_v4.tsv"
             }
         }
         then {
             assertAll(
                 { assert workflow.success },
+                { assert workflow.trace.succeeded().findAll { it.name.contains('SIMULATE_PANEL_READS') }.size() == 1 },
                 { assert workflow.trace.tasks().findAll { it.name.contains('READS_TO_FASTA') }*.name == ['SUPERRESOLUTION_AMPLICON:READS_TO_FASTA (run_b)'] },
                 { assert workflow.trace.tasks().findAll { it.name.contains('MAPSEQ_OBS') }.size() == 1 },
                 { assert path("${params.outdir}/composition/run_a/run_a.inferred_composition.csv").exists() },

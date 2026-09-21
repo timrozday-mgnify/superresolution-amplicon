@@ -30,6 +30,15 @@ reads. Without it, an error the model places at the start of a read lands inside
 amplicon: 42% of the reads a trained model simulated from bare amplicons carried 1-3 extra
 5' bases, and against SILVA NR99's one-base near-ties MAPseq labels those reads differently
 from the trimmed observed reads (dev/panel_silva_sweep.md).
+
+Without ``--trim-primers`` the reads keep their primers, as observed reads that were never
+trimmed do (``merged: true`` rows from amplicon-analysis-pipeline). The primer bases come
+from the oligo mix, not the template, so ``--primer-mix`` draws each read's pair of
+concrete oligos from a measured table (``assets/primer_mix_emp_v4.tsv``). Without the
+table, untrimmed reads draw each degenerate position uniformly over its code's options.
+ponytail: the forward spacer and 3' overhang are not simulated. AAP's cmsearch clip removes
+most of both, keeping at most 2 spacer bases and some overhang (dev/aap_merge_effects.md,
+0.4); simulate them if the kernel fit shows those few bases matter.
 """
 from __future__ import annotations
 
@@ -115,19 +124,62 @@ def flank(seq: str, fwd: str, rev: str) -> str:
     return concrete(fwd) + seq + concrete(si.revcomp(rev))
 
 
+def read_primer_mix(path: Path, fwd: str, rev: str) -> tuple[list[tuple[str, str]], np.ndarray]:
+    """``([(fwd oligo, rev oligo)], probabilities)`` from a ``fwd rev reads`` table.
+
+    Refuses an oligo that is not a concrete instance of the configured primer: the table
+    was measured for one primer pair and means nothing for another."""
+    pairs, weights = [], []
+    with open(path) as fh:
+        rows = [line.rstrip("\n").split("\t") for line in fh if not line.startswith("#")]
+    for f, r, n in rows[1:]:
+        for oligo, primer in ((f, fwd), (r, rev)):
+            if len(oligo) != len(primer) or any(
+                    b not in si._IUPAC[c] for b, c in zip(oligo, primer)):
+                raise ValueError(f"{path}: oligo {oligo} is not an instance of primer {primer}")
+        pairs.append((f, r))
+        weights.append(float(n))
+    if not pairs:
+        raise ValueError(f"{path}: no primer pairs")
+    w = np.asarray(weights)
+    return pairs, w / w.sum()
+
+
+def uniform_primer_mix(fwd: str, rev: str):
+    """``f(rng, n) -> n oligo pairs``, each degenerate position uniform over its options."""
+    options = lambda p: [sorted(si._IUPAC[c]) for c in p]  # noqa: E731
+    fo, ro = options(fwd), options(rev)
+    one = lambda rng, opts: "".join(o[int(rng.integers(len(o)))] for o in opts)  # noqa: E731
+    return lambda rng, n: [(one(rng, fo), one(rng, ro)) for _ in range(n)]
+
+
 def run(a) -> None:
     rng = np.random.default_rng(a.seed)
     apply_error = sampler(a.error_model, a.model_pt, a.sub_rate, a.ins_rate, a.del_rate,
                           a.use_vi)
     trim = getattr(a, "trim_primers", False)
+    mix = getattr(a, "primer_mix", None)
+    if mix:
+        pairs, p = read_primer_mix(mix, a.fwd_primer, a.rev_primer)
+        draw_oligos = lambda rng, n: [pairs[i] for i in rng.choice(len(pairs), size=n, p=p)]  # noqa: E731
+    elif not trim:
+        log.warning("untrimmed reads without --primer-mix: degenerate primer bases are drawn "
+                    "uniformly, which is not what a real oligo mix looks like")
+        draw_oligos = uniform_primer_mix(a.fwd_primer, a.rev_primer)
+    else:
+        draw_oligos = None   # trimmed off anyway: the first option is as good as any
 
     n_reads = 0
     with open(a.output, "w") as out:
         # Stream reference-by-reference so a large DB never holds all reads in memory.
         for header, seq in si.read_fasta(a.amplicons):
-            if trim:
-                seq = flank(seq, a.fwd_primer, a.rev_primer)
-            frags = [draw_fragment(seq, a.read_len, rng) for _ in range(a.n_per_ref)]
+            if draw_oligos:
+                frags = [draw_fragment(f + seq + si.revcomp(r), a.read_len, rng)
+                         for f, r in draw_oligos(rng, a.n_per_ref)]
+            else:
+                if trim:
+                    seq = flank(seq, a.fwd_primer, a.rev_primer)
+                frags = [draw_fragment(seq, a.read_len, rng) for _ in range(a.n_per_ref)]
             recs = [(f"{header}:{i}", f, True) for i, f in enumerate(frags)
                     if f and set(f) <= set(_BASES)]
             if not recs:
@@ -190,6 +242,9 @@ def main() -> None:
     ap.add_argument("--fwd-primer", default=si.DEFAULT_FWD_PRIMER)
     ap.add_argument("--rev-primer", default=si.DEFAULT_REV_PRIMER)
     ap.add_argument("--primer-mismatches", type=int, default=3)
+    ap.add_argument("--primer-mix", type=Path, default=None,
+                    help="fwd/rev/reads table of concrete primer oligos to draw each read's "
+                         "primers from (default: uniform over the codes when untrimmed)")
     ap.add_argument("-o", "--output", type=Path, help="output FASTA (mapseq input)")
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--verbose", "-v", action="store_true")
