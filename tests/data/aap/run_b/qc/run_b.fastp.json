@@ -1,0 +1,8 @@
+{
+ "read1_before_filtering": {
+  "total_reads": 1000
+ },
+ "merged_and_filtered": {
+  "total_reads": 700
+ }
+}

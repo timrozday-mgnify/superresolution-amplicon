@@ -172,6 +172,47 @@ nextflow_pipeline {
         }
     }
 
+    test("AAP merged reads: its .mseq is reused, the other run is mapped - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                // bin/aap_samplesheet.py on tests/data/aap: run_a carries AAP's .mseq.
+                input        = "${projectDir}/tests/data/samplesheet.aap.yml"
+                outdir       = "$outputDir"
+                references   = "${projectDir}/tests/data/refs.fasta"
+                trim_primers = false
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.tasks().findAll { it.name.contains('READS_TO_FASTA') }*.name == ['SUPERRESOLUTION_AMPLICON:READS_TO_FASTA (run_b)'] },
+                { assert workflow.trace.tasks().findAll { it.name.contains('MAPSEQ_OBS') }.size() == 1 },
+                { assert path("${params.outdir}/composition/run_a/run_a.inferred_composition.csv").exists() },
+                { assert path("${params.outdir}/composition/run_b/run_b.inferred_composition.csv").exists() }
+            )
+        }
+    }
+
+    test("merged reads refuse --trim_primers true - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input      = "${projectDir}/tests/data/samplesheet.aap.yml"
+                outdir     = "$outputDir"
+                references = "${projectDir}/tests/data/refs.fasta"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.failed },
+                { assert workflow.stdout.any { it.contains('needs --trim_primers false') } }
+            )
+        }
+    }
+
     test("amplicon_cache keeps the extraction and clustering outside the work dir - stub") {
         tag "stub"
         options "-stub"

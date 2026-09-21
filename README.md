@@ -90,7 +90,7 @@ YAML list of samples (or a map with `samples:`). Per sample:
 | `references` | no | Per-sample reference fasta; overrides `--references`. |
 | `error_model` | no | Path to a pre-trained `.pt` model; **skips training** for this sample. |
 | `mseq` | no | Path to a mapseq classification of this sample's reads (a previous run's `mapseq/<id>/<id>.obs.mseq.gz`); **skips read mapping** for this sample. It must have been produced against the same reference set — the ids in it are matched to the extracted amplicons — and it carries the read-prep settings it was made with, so `--obs_max_reads`, `--trim_primers` and `--min_pair_overlap` no longer apply to that sample. Mapping is the expensive stage, so this is what makes a parameter sweep over the mis-mapping and inference knobs cheap. |
-
+| `merged` | no | `true` for reads that are already merged pairs, e.g. amplicon-analysis-pipeline's `qc/<id>.merged.fastq.gz`. They are never merged again or primer-trimmed, and the run needs `--trim_primers false` so the simulated reads keep their primers too. `bin/aap_samplesheet.py` writes such rows from an AAP output directory. |
 | `panel_references` | no | Genome panel for this sample; overrides `--panel_references`. See [Panel reinterpretation](#panel-reinterpretation). |
 | `panel_taxa` | no | Taxon panel entries for this sample; overrides `--panel_taxa`. See [Panel reinterpretation](#panel-reinterpretation). |
 

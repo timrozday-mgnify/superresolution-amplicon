@@ -18,8 +18,8 @@ workflow {
 
     // YAML samplesheet: a list of sample entries, each:
     //   id, reads (or fastq_1[/fastq_2]), platform, references (optional),
-    //   error_model (optional), mseq (optional), panel_references (optional),
-    //   panel_taxa (optional)
+    //   error_model (optional), mseq (optional), merged (optional),
+    //   panel_references (optional), panel_taxa (optional)
     def loaded = new org.yaml.snakeyaml.Yaml().load(file(params.input, checkIfExists: true).text)
     def rows = (loaded instanceof Map) ? loaded.samples : loaded
     if (!(rows instanceof List)) {
@@ -52,6 +52,17 @@ workflow {
         }
         else {
             error "Sample ${row.id} needs 'reads' (list) or 'fastq_1'[/'fastq_2']"
+        }
+        // `merged: true` marks reads that are already merged pairs, e.g. AAP's
+        // qc/<id>.merged.fastq.gz (bin/aap_samplesheet.py). They are never merged again,
+        // and never primer-trimmed: AAP's reads (and its .mseq) keep their primers, and
+        // the simulated reads must be prepared the same way, which --trim_primers sets
+        // for the whole run.
+        if (row.merged?.toString() == 'true') {
+            if (paired) error "Sample ${row.id}: 'merged: true' reads are one file, not a pair"
+            if (params.trim_primers.toString() == 'true') {
+                error "Sample ${row.id}: 'merged: true' needs --trim_primers false (merged reads keep their primers)"
+            }
         }
         def meta = [
             id:          row.id,
