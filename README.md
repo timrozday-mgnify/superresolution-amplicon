@@ -251,6 +251,8 @@ simulates reads, so nothing needs an error model and the skiver subworkflow neve
 | `--sim_error_model` | `flat` | `flat` (constant per-base probability per mutation type; **no training at all**) or `trained` (skiver context model). See [the sensitivity result](dev/error_rate_sensitivity.md) for why `flat` is the default. |
 | `--trained_error_model_scope` | `per-sample`, or `pooled` if any row is `merged: true` | With `trained`, fit one model per sample or one pooled model per platform. Explicit sample `error_model` files always win. |
 | `--trained_error_model_max_reads` | `1000000` | Pooled mode: deterministic, uniformly sampled FASTQ records per platform (`0` = all). |
+| `--sim_read_structure` | `merged` | `merged` simulates each read as one merged read. `pairs` simulates R1/R2 mates of `--sim_mate_len` cycles that run into their TruSeq adapters, and merges them with amplicon-analysis-pipeline's fastp 1.0.1 and its READS_QC_MERGE arguments (`FASTP_MERGE`). Unmerged pairs are dropped, as AAP drops them, and each source's merged share goes to `yield.tsv` in the kernel bundle. Use it to validate `merged`, or where merging loses reads (long amplicons on short reads). Needs `--trim_primers false`; under `trained` every row needs an `error_model` trained on raw mates. No cmsearch clip is applied: the pairs carry no spacer or overhang, so a merged read already spans primer to primer. |
+| `--sim_mate_len` | `310` | `pairs`: cycles per mate (the Nov2025 runs are 2×310). |
 | `--flat_sub_rate` | `0.005` | Flat model: per-base substitution probability. |
 | `--flat_ins_rate` | `0.0005` | Flat model: per-base insertion probability. |
 | `--flat_del_rate` | `0.0005` | Flat model: per-base deletion probability. |

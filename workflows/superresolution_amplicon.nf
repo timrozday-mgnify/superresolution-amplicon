@@ -17,6 +17,7 @@ include { PANEL_KERNEL; PANEL_ALIGN } from '../modules/local/panel_kernel/build/
 include { SIMULATE_READS as SIMULATE_PANEL_READS } from '../modules/local/simulate_reads/main'
 include { MAPSEQ as MAPSEQ_PANEL_HOME } from '../modules/local/mapseq/map/main'
 include { MAPSEQ as MAPSEQ_PANEL_SIM  } from '../modules/local/mapseq/map/main'
+include { FASTP_MERGE           } from '../modules/local/fastp/merge/main'
 
 workflow SUPERRESOLUTION_AMPLICON {
     take:
@@ -233,6 +234,8 @@ workflow SUPERRESOLUTION_AMPLICON {
                 max_ambiguous_bases: params.max_ambiguous_bases, max_postings: params.max_postings,
                 sim_error_model: params.sim_error_model,
                 sim_n_per_ref: params.sim_n_per_ref, sim_read_len: params.sim_read_len,
+                sim_read_structure: params.sim_read_structure, sim_mate_len: params.sim_mate_len,
+                primer_mix: params.primer_mix,
                 flat_sub_rate: params.flat_sub_rate, flat_ins_rate: params.flat_ins_rate,
                 flat_del_rate: params.flat_del_rate, mapseq_args: params.mapseq_args,
                 mapseq_min_identity: params.mapseq_min_identity, mapseq_tag: params.mapseq_tag,
@@ -287,7 +290,18 @@ workflow SUPERRESOLUTION_AMPLICON {
                 .join(ch_panel_groups.map { meta, panel, d, model -> [ meta.id, model ] })
                 .map { id, meta, sources, model -> [ meta, sources, model ] },
                 params.primer_mix ? file(params.primer_mix, checkIfExists: true) : [])
-            MAPSEQ_PANEL_SIM(SIMULATE_PANEL_READS.out.reads
+            // pairs: merge the simulated mates the way AAP merged the observed ones.
+            if (params.sim_read_structure == 'pairs') {
+                FASTP_MERGE(SIMULATE_PANEL_READS.out.pairs)
+                ch_versions = ch_versions.mix(FASTP_MERGE.out.versions)
+                ch_sim_reads = FASTP_MERGE.out.reads
+                ch_sim_yield = FASTP_MERGE.out.yield.map { meta, y -> [ meta.id, y ] }
+            }
+            else {
+                ch_sim_reads = SIMULATE_PANEL_READS.out.reads
+                ch_sim_yield = ch_sim_reads.map { meta, reads -> [ meta.id, [] ] }
+            }
+            MAPSEQ_PANEL_SIM(ch_sim_reads
                 .map { meta, reads -> [ meta.id, reads ] }
                 .join(ch_panel_db.map { meta, sources, fasta, tax, mscluster -> [ meta.id, meta, fasta, tax, mscluster ] })
                 .map { id, reads, meta, fasta, tax, mscluster -> [ meta, reads, fasta, tax, mscluster ] })
@@ -300,7 +314,8 @@ workflow SUPERRESOLUTION_AMPLICON {
                 .join(ch_db_amplicons)
                 .join(MAPSEQ_PANEL_HOME.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
                 .join(MAPSEQ_PANEL_SIM.out.mseq.map { meta, mseq -> [ meta.id, mseq ] })
-                .map { id, meta, prepared, fasta, home, sim -> [ meta, prepared, fasta, home, sim ] })
+                .join(ch_sim_yield)
+                .map { id, meta, prepared, fasta, home, sim, yld -> [ meta, prepared, fasta, home, sim, yld ] })
             ch_versions = ch_versions.mix(PANEL_KERNEL.out.versions)
             ch_panel_kernel = PANEL_KERNEL.out.kernel
         }

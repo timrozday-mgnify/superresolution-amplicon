@@ -15,7 +15,9 @@ process SIMULATE_READS {
     path primer_mix
 
     output:
-    tuple val(meta), path("${meta.id}.sim.fasta"), emit: reads
+    // One of the two, by params.sim_read_structure: reads (merged) or mate pairs (pairs).
+    tuple val(meta), path("${meta.id}.sim.fasta"),           emit: reads, optional: true
+    tuple val(meta), path("${meta.id}.sim_{1,2}.fastq.gz"),  emit: pairs, optional: true
     path "versions.yml",                           emit: versions
 
     when:
@@ -26,6 +28,8 @@ process SIMULATE_READS {
     def prefix    = task.ext.prefix ?: "${meta.id}"
     def model_arg = model_pt.name == 'NO_MODEL' ? '' : "--model-pt ${model_pt}"
     def mix_arg   = primer_mix ? "--primer-mix ${primer_mix}" : ''
+    def output    = params.sim_read_structure == 'pairs'
+        ? "${prefix}.sim --mate-len ${params.sim_mate_len}" : "${prefix}.sim.fasta"
     """
     export SKIVER_SCRIPTS=\${SKIVER_SCRIPTS:-/opt/skiver/scripts}
 
@@ -34,7 +38,7 @@ process SIMULATE_READS {
         ${model_arg} \\
         ${mix_arg} \\
         --seed ${params.seed} \\
-        -o ${prefix}.sim.fasta \\
+        -o ${output} \\
         $args
 
     cat <<-END_VERSIONS > versions.yml
@@ -46,7 +50,11 @@ process SIMULATE_READS {
     stub:
     def prefix = task.ext.prefix ?: "${meta.id}"
     """
-    printf '>ref|0|x:0\\nACGTACGTACGT\\n' > ${prefix}.sim.fasta
+    if [ "${params.sim_read_structure}" = pairs ]; then
+        for m in 1 2; do printf '@ref|0|x:0\\nACGT\\n+\\nIIII\\n' | gzip > ${prefix}.sim_\$m.fastq.gz; done
+    else
+        printf '>ref|0|x:0\\nACGTACGTACGT\\n' > ${prefix}.sim.fasta
+    fi
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":

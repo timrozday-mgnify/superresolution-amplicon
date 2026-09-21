@@ -197,6 +197,49 @@ nextflow_pipeline {
         }
     }
 
+    test("pairs merges simulated mates with fastp and keeps their yield - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input              = "${projectDir}/tests/data/samplesheet.aap.yml"
+                outdir             = "$outputDir"
+                references         = "${projectDir}/tests/data/refs.fasta"
+                trim_primers       = false
+                sim_read_structure = "pairs"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.succeeded().findAll { it.name.contains('FASTP_MERGE') }.size() == 1 },
+                { assert workflow.trace.succeeded().findAll { it.name.contains('MAPSEQ_PANEL_SIM') }.size() == 1 },
+                { assert file("${params.outdir}/mismapping").listFiles().any { new File(it, 'yield.tsv').exists() } }
+            )
+        }
+    }
+
+    test("pairs refuses --trim_primers true and an untrained mate model - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input              = "${projectDir}/tests/data/samplesheet.aap.yml"
+                outdir             = "$outputDir"
+                references         = "${projectDir}/tests/data/refs.fasta"
+                trim_primers       = false
+                sim_read_structure = "pairs"
+                sim_error_model    = "trained"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.failed },
+                { assert workflow.stdout.any { it.contains('must be a mate model') } }
+            )
+        }
+    }
+
     test("merged reads refuse --trim_primers true - stub") {
         tag "stub"
         options "-stub"

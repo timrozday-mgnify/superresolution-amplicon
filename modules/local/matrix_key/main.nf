@@ -31,6 +31,7 @@ process MATRIX_KEY {
         primer_mismatches: params.primer_mismatches, trim_primers: params.trim_primers,
         // ponytail: keyed by path, like the reference set; hash it if mixes get edited in place.
         primer_mix: params.primer_mix ?: '',
+        sim_read_structure: params.sim_read_structure, sim_mate_len: params.sim_mate_len,
         mapseq_args: params.mapseq_args, mapseq_min_identity: params.mapseq_min_identity,
         mapseq_tag: params.mapseq_tag, mapseq_db: mapseq_db, seed: params.seed, identity: identity
     ].collect { k, v -> "${k}=${v}" }.sort().join('\n')

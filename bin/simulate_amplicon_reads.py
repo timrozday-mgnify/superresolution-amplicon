@@ -39,10 +39,19 @@ table, untrimmed reads draw each degenerate position uniformly over its code's o
 ponytail: the forward spacer and 3' overhang are not simulated. AAP's cmsearch clip removes
 most of both, keeping at most 2 spacer bases and some overhang (dev/aap_merge_effects.md,
 0.4); simulate them if the kernel fit shows those few bases matter.
+
+``--mate-len`` writes read pairs instead (``<output>_1.fastq.gz``/``_2``): ``--mate-len``
+cycles of R1 over the fragment, and of R2 over its reverse complement (the model's reverse
+strand), each running on into its TruSeq adapter. Run through AAP's own fastp merge, these
+give merged reads whose errors went through the same merge as the real ones (plan 2.3).
+ponytail: without a Phred calibration, trained qualities come from the context error
+rate, so fastp's low-against-high quality correction almost never fires. It corrected
+9e-5 per base in the Nov2025 run; pass skiver's calibration if that turns out to matter.
 """
 from __future__ import annotations
 
 import argparse
+import gzip
 import logging
 import os
 import sys
@@ -63,6 +72,11 @@ _SKIVER_LIB = Path(os.environ.get(
 log = logging.getLogger("simulate_amplicon_reads")
 
 _BASES = "ACGT"
+# What a mate reads past the fragment (dev/aap_merge_effects.py). The poly-A tail only
+# keeps a mate full length when the fragment plus adapter is shorter than a read.
+_ADAPTER_R1 = "AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC"
+_ADAPTER_R2 = "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGTA"
+_FLAT_QUAL = chr(33 + 38)
 
 
 def draw_fragment(seq: str, read_len: int | None, rng) -> str:
@@ -96,8 +110,10 @@ def apply_flat(seq: str, rng, sub_rate: float, ins_rate: float, del_rate: float)
 
 
 def sampler(error_model: str, model_pt=None, sub_rate: float = 0.005,
-            ins_rate: float = 0.0005, del_rate: float = 0.0005, use_vi: bool = False):
-    """Return ``f(records, rng) -> [(name, sequence)]`` for either error model.
+            ins_rate: float = 0.0005, del_rate: float = 0.0005, use_vi: bool = False,
+            quality: bool = False):
+    """Return ``f(records, rng) -> [(name, sequence)]`` for either error model, or
+    ``[(name, sequence, quality)]`` with ``quality`` (flat reads are Q38 throughout).
 
     ``records`` are ``(name, sequence, True)`` triples, the shape skiver's ``apply_batch``
     takes. Both models are reached through one call so callers that only want to
@@ -106,14 +122,21 @@ def sampler(error_model: str, model_pt=None, sub_rate: float = 0.005,
     """
     if error_model != "trained":
         log.info("flat error model: sub=%g ins=%g del=%g", sub_rate, ins_rate, del_rate)
-        return lambda records, rng: [
-            (name, apply_flat(seq, rng, sub_rate, ins_rate, del_rate))
-            for name, seq, _ in records]
+        flat = lambda seq, rng: apply_flat(seq, rng, sub_rate, ins_rate, del_rate)  # noqa: E731
+        if quality:
+            return lambda records, rng: [
+                (name, m, _FLAT_QUAL * len(m)) for name, seq, _ in records
+                for m in [flat(seq, rng)]]
+        return lambda records, rng: [(name, flat(seq, rng)) for name, seq, _ in records]
     if str(_SKIVER_LIB) not in sys.path:
         sys.path.insert(0, str(_SKIVER_LIB))
     from lib.error_application import ErrorModel, apply_batch  # noqa: E402
     log.info("loading error model %s", model_pt)
     model = ErrorModel.load(model_pt, use_vi=use_vi)
+    if quality:
+        return lambda records, rng: [
+            (r.name, r.sequence, r.quality)
+            for r in apply_batch(model, records, rng, emit_quality=True)]
     return lambda records, rng: [
         (r.name, r.sequence) for r in apply_batch(model, records, rng, emit_quality=False)]
 
@@ -153,11 +176,23 @@ def uniform_primer_mix(fwd: str, rev: str):
     return lambda rng, n: [(one(rng, fo), one(rng, ro)) for _ in range(n)]
 
 
+def mate_templates(fragment: str, mate_len: int) -> tuple[str, str]:
+    """What R1 and R2 read before errors: ``mate_len`` cycles into the adapter, plus a few
+    bases so a deletion still leaves a full-length read."""
+    n = mate_len + 10
+    return ((fragment + _ADAPTER_R1 + "A" * n)[:n],
+            (si.revcomp(fragment) + _ADAPTER_R2 + "A" * n)[:n])
+
+
 def run(a) -> None:
     rng = np.random.default_rng(a.seed)
+    mate_len = getattr(a, "mate_len", None)
     apply_error = sampler(a.error_model, a.model_pt, a.sub_rate, a.ins_rate, a.del_rate,
-                          a.use_vi)
+                          a.use_vi, quality=bool(mate_len))
     trim = getattr(a, "trim_primers", False)
+    if mate_len and trim:
+        raise ValueError("--mate-len simulates AAP merged reads, which keep their primers: "
+                         "drop --trim-primers")
     mix = getattr(a, "primer_mix", None)
     if mix:
         pairs, p = read_primer_mix(mix, a.fwd_primer, a.rev_primer)
@@ -169,6 +204,8 @@ def run(a) -> None:
     else:
         draw_oligos = None   # trimmed off anyway: the first option is as good as any
 
+    if mate_len:
+        return run_pairs(a, rng, apply_error, draw_oligos, mate_len)
     n_reads = 0
     with open(a.output, "w") as out:
         # Stream reference-by-reference so a large DB never holds all reads in memory.
@@ -195,6 +232,28 @@ def run(a) -> None:
                 n_reads += 1
     log.info("wrote %d simulated reads -> %s", n_reads, a.output)
     print(f"simulate_amplicon_reads: {n_reads} reads -> {a.output}")
+
+
+def run_pairs(a, rng, apply_error, draw_oligos, mate_len: int) -> None:
+    """Write ``<output>_1.fastq.gz``/``_2``; both mates of a pair share a name."""
+    n_pairs = 0
+    with gzip.open(f"{a.output}_1.fastq.gz", "wt") as o1, \
+            gzip.open(f"{a.output}_2.fastq.gz", "wt") as o2:
+        for header, seq in si.read_fasta(a.amplicons):
+            if not set(seq) <= set(_BASES):
+                log.warning("reference %s produced no usable fragment (non-ACGT?)", header)
+                continue
+            r1s, r2s = [], []
+            for i, (f, r) in enumerate(draw_oligos(rng, a.n_per_ref)):
+                t1, t2 = mate_templates(f + seq + si.revcomp(r), mate_len)
+                r1s.append((f"{header}:{i}", t1, True))
+                r2s.append((f"{header}:{i}", t2, False))
+            for (name, s1, q1), (_, s2, q2) in zip(apply_error(r1s, rng), apply_error(r2s, rng)):
+                o1.write(f"@{name}\n{s1[:mate_len]}\n+\n{q1[:mate_len]}\n")
+                o2.write(f"@{name}\n{s2[:mate_len]}\n+\n{q2[:mate_len]}\n")
+                n_pairs += 1
+    log.info("wrote %d simulated pairs -> %s_{1,2}.fastq.gz", n_pairs, a.output)
+    print(f"simulate_amplicon_reads: {n_pairs} pairs -> {a.output}_{{1,2}}.fastq.gz")
 
 
 def demo() -> None:
@@ -245,7 +304,11 @@ def main() -> None:
     ap.add_argument("--primer-mix", type=Path, default=None,
                     help="fwd/rev/reads table of concrete primer oligos to draw each read's "
                          "primers from (default: uniform over the codes when untrimmed)")
-    ap.add_argument("-o", "--output", type=Path, help="output FASTA (mapseq input)")
+    ap.add_argument("--mate-len", type=int, default=None,
+                    help="write read pairs of this many cycles (<output>_1/_2.fastq.gz) "
+                         "instead of FASTA, for AAP's fastp merge")
+    ap.add_argument("-o", "--output", type=Path,
+                    help="output FASTA (mapseq input), or the pair prefix with --mate-len")
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--verbose", "-v", action="store_true")
     a = ap.parse_args()

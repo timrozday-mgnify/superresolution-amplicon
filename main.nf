@@ -26,6 +26,13 @@ workflow {
         error "Samplesheet ${params.input} must be a YAML list of samples (or a map with 'samples:')"
     }
 
+    if (!(params.sim_read_structure in ['merged', 'pairs'])) {
+        error "--sim_read_structure must be 'merged' or 'pairs'"
+    }
+    if (params.sim_read_structure == 'pairs' && params.trim_primers.toString() == 'true') {
+        error "--sim_read_structure pairs simulates AAP merged reads, which keep their primers: set --trim_primers false"
+    }
+
     ch_rows = Channel.fromList(rows)
 
     // [ meta, [ reads ] ]
@@ -63,6 +70,10 @@ workflow {
             if (params.trim_primers.toString() == 'true') {
                 error "Sample ${row.id}: 'merged: true' needs --trim_primers false (merged reads keep their primers)"
             }
+        }
+        if (params.sim_read_structure == 'pairs' && params.sim_error_model == 'trained'
+                && !(row.error_model || params.error_model)) {
+            error "Sample ${row.id}: --sim_read_structure pairs simulates mates, so a trained model must be a mate model: set error_model"
         }
         def meta = [
             id:          row.id,
