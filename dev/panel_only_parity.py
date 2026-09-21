@@ -3,6 +3,7 @@
 
     python dev/panel_only_parity.py rescore      # 20HM S01-S20 and SILVA S05, inference only
     python dev/panel_only_parity.py compare      # prints the tables in panel_only_parity.md
+    python dev/panel_only_parity.py depth P0_CHECKOUT 1 2 4 8 ...   # B. uniformis depth sweep
 
 ``rescore`` reruns ``infer_composition.py`` + ``check_composition_fit.py`` on the stored
 observations and kernels the snapshots were made from (``work/panel_obs``,
@@ -18,6 +19,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -100,5 +102,64 @@ def compare() -> None:
               f"{_fit(old / 'fit.json')} -> {_fit(new / 'fit.json')} |")
 
 
+# The pipeline's INFER_COMPOSITION flags (conf/modules.config defaults, --seed 42).
+PIPELINE_INFER = ["--seed", "42", "--mode", "vi", "--alpha", "0.5", "--steps", "3000",
+                  "--lr", "0.02", "--num-samples", "500", "--warmup", "500",
+                  "--min-infer-reads", "1000", "--presence-prior", "0.01",
+                  "--presence-temp", "1.0"]
+OLD_RUNS = {"simulate": "buniformis_simulate", "align_tau0": "buniformis_exact_hash",
+            "align_tau1": "buniformis_kmer_tau1"}
+
+
+def _task_dir(root: Path, needle: str) -> Path:
+    """The INFER_COMPOSITION work dir under ``root`` whose script mentions ``needle``."""
+    for script in root.rglob(".command.sh"):
+        text = script.read_text()
+        if "infer_composition.py" in text and "--obs-mseq" in text and needle in text:
+            return script.parent
+    raise SystemExit(f"no inference task for {needle} under {root}")
+
+
+def depth(p0_checkout: Path, multiples: list[int]) -> None:
+    """Scale the B. uniformis observation k-fold (same composition, k x the reads) and fit
+    it with the P.0 square code and the panel code, gate on, the pipeline's flags."""
+    print("| mode | x reads | reads | TV(P.0 code, panel code) | present P.0 / panel "
+          "| conc_frac P.0 / panel |")
+    print("|---|---|---|---|---|---|")
+    observed = WORK / "panel_only_parity" / "buniformis" / "observed.mseq"
+    rows = [line for line in observed.read_text().splitlines() if line and not line.startswith("#")]
+    for mode, old_run in OLD_RUNS.items():
+        old_task = _task_dir(WORK / "panel_only_parity" / old_run, "b_uniformis")
+        key = next((OUT / f"buniformis_{mode}" / "mismapping").glob("panel_*")).name
+        new_task = _task_dir(OUT / "work", key)
+        for k in multiples:
+            base = OUT / "depth" / mode / f"x{k}"
+            base.mkdir(parents=True, exist_ok=True)
+            obs = base / "observed.mseq"
+            obs.write_text("".join(f"r{i}_{line}\n" for i in range(k) for line in rows))
+            fits = {}
+            for name, code, task, amplicons, extra in (
+                    ("old", p0_checkout, old_task, "refs_0970e0d6aa57_amplicons",
+                     ["--infer-space", "genome"]),
+                    ("new", ROOT, new_task, key, [])):
+                out = base / name
+                subprocess.run([sys.executable, code / "bin" / "infer_composition.py",
+                                "--amplicon-dir", str(task / amplicons),
+                                "--mismapping-matrix", str(task / "mismapping_matrix.npz"),
+                                "--obs-mseq", str(obs), "--sample-id", "b", "-o", str(out),
+                                *PIPELINE_INFER, *extra], check=True, capture_output=True)
+                comp = pd.read_csv(out / "inferred_composition.csv")
+                with np.load(out / "posterior_draws.npz") as draws:
+                    conc = float(np.median(draws["conc_frac"]))
+                fits[name] = (_genomes(out / "inferred_composition.csv"),
+                              int((comp.presence_prob > 0.5).sum()), conc)
+            (a, pa, ca), (b, pb, cb) = fits["old"], fits["new"]
+            print(f"| {mode} | {k} | {k * len(rows)} | {_tv(a, b):.4f} | {pa} / {pb} "
+                  f"| {ca:.3f} / {cb:.3f} |", flush=True)
+
+
 if __name__ == "__main__":
-    {"rescore": rescore, "compare": compare}[sys.argv[1]]()
+    if sys.argv[1] == "depth":
+        depth(Path(sys.argv[2]), [int(k) for k in sys.argv[3:]])
+    else:
+        {"rescore": rescore, "compare": compare}[sys.argv[1]]()

@@ -69,3 +69,46 @@ The 20HM samples (79k reads, 54 observed labels) keep their gate. The collapse i
 low-depth, few-label effect of the panel's label space. It is not a code regression,
 but it does reach the default settings, since `--infer_presence` defaults to `true`.
 The panel sweeps already validated `infer_presence false`.
+
+## Depth sweep: more reads restore the gate, not the 0.02 bar
+
+`python dev/panel_only_parity.py depth <P.0 checkout> 1 2 4 ... 128` repeats the
+*B. uniformis* observation k times. The composition is unchanged and the reads are k times
+as many. Each depth is fitted with the P.0 square code (a checkout of `da8e61e`, on the
+snapshot's matrices) and with the panel code (on this run's kernels), gate on and with
+the pipeline's flags. The observation is synthetic: 50 known references, 25 reads each.
+So the truth is known exactly. "Merged" sums the pairs V4 cannot separate (the two
+*B. uniformis* strains, and *E. rectale* with *R. intestinalis*).
+
+| x reads | reads | present, P.0 / panel | TV(P.0, panel) | merged TV(P.0, panel) | merged TV(truth, P.0) | merged TV(truth, panel) |
+|---|---|---|---|---|---|---|
+| 1 | 1,250 | 8 / 0 | 0.241 | 0.221 | 0.119 | 0.212 |
+| 2 | 2,500 | 8 / 0 | 0.218 | 0.195 | 0.130 | 0.204 |
+| 4 | 5,000 | 8 / 1 | 0.173 | 0.148 | 0.139 | 0.185 |
+| 8 | 10,000 | 8 / 7 | 0.130 | 0.103 | 0.145 | 0.142 |
+| 16 | 20,000 | 8 / 7 | 0.110 | 0.072 | 0.148 | 0.125 |
+| 32 | 40,000 | 8 / 8 | 0.105 | 0.060 | 0.152 | 0.110 |
+| 64 | 80,000 | 9 / 9 | 0.106 | 0.063 | 0.156 | 0.100 |
+| 128 | 160,000 | 9 / 10 | 0.110 | 0.070 | 0.162 | 0.097 |
+
+This is `simulate`. Both align modes track it within 0.01 at every depth, and at 128x
+they give merged TV(P.0, panel) 0.071 and TV(truth, panel) 0.098.
+
+- **The gate recovers by 8x** (10,000 reads). From then on the panel code calls as many
+  genomes present as P.0 does.
+- **The P.0-to-panel gap plateaus at 0.06–0.07 merged (0.11 unmerged)** from 16x to 128x.
+  It is not sampling noise, and more reads will not bring it to 0.02. Repeating reads
+  adds no independent evidence: `conc_frac x reads` stays near 200 at every depth, in both
+  codes.
+- **The gap is P.0's error, not the panel's.** From 8x up the panel fit is at least as
+  close to the truth as P.0, and at 128x it is 0.10 against 0.16. Two genomes carry the
+  gap. P.0 halves *D. formicigenerans* (0.068 against 0.12 true, 0.13 observed), which the
+  panel gets right (0.12). The *B. uniformis* strain split, which V4 cannot resolve, falls
+  on opposite strains in the two codes.
+- **Both codes share a 0.06 floor to the truth.** *C. bolteae* (6% of the truth) is read
+  only through references outside the extracted amplicons: the 75 hits that both count
+  as foreign.
+
+So the P.7 bar (genome TV <= 0.02 against P.0) is not met on *B. uniformis* at any
+depth. Where the two codes differ, the panel is the more accurate one. Below ~10,000
+reads on this set the default gate still collapses.
