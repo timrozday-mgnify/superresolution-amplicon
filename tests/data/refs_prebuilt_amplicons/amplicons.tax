@@ -1,0 +1,7 @@
+#cutoff: 0.00:0.08 0.80:0.35 0.95:0.05
+#name: refdb
+#levels: Kingdom Genome Copy
+genomeA|0|genomeA_16S_0	Bacteria;genomeA;genomeA|0|genomeA_16S_0
+genomeA|1|genomeA_16S_1	Bacteria;genomeA;genomeA|1|genomeA_16S_1
+genomeB|0|genomeB_16S_0	Bacteria;genomeB;genomeB|0|genomeB_16S_0
+genomeB|1|genomeB_16S_1	Bacteria;genomeB;genomeB|1|genomeB_16S_1

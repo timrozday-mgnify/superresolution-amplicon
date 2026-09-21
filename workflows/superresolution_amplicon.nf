@@ -7,7 +7,6 @@
 include { TRAIN_ERROR_MODEL    } from '../subworkflows/local/train_error_model/main'
 include { EXTRACT_AMPLICONS    } from '../modules/local/extract_amplicons/main'
 include { MAPSEQ_CLUSTER       } from '../modules/local/mapseq/cluster/main'
-include { MAPSEQ_CLUSTER as MAPSEQ_CLUSTER_MATRIX } from '../modules/local/mapseq/cluster/main'
 include { MAPSEQ as MAPSEQ_SIM } from '../modules/local/mapseq/map/main'
 include { MAPSEQ as MAPSEQ_OBS } from '../modules/local/mapseq/map/main'
 include { MAPSEQ as MAPSEQ_HOME } from '../modules/local/mapseq/map/main'
@@ -158,62 +157,102 @@ workflow SUPERRESOLUTION_AMPLICON {
         }
     }
 
-    // In-silico PCR -> the mapseq reference set (+ translation table T), then its mapseq
-    // clustering: once per distinct reference FASTA, however many samples name it. At GTDB
-    // scale each is hours. The set's meta holds only its id, so adding or removing a
-    // sample leaves both tasks cached.
-    // The id is also the --amplicon_cache key (conf/modules.config), shared across runs,
-    // so it names everything that shapes the amplicons: the FASTA, the primers and the
-    // extractor's code.
+    // The reference set is a MAPseq database: the extracted amplicons, their .tax, MAPseq's
+    // <fasta>.mscluster, and the translation table T + refseq index. A prebuilt one is the
+    // directory EXTRACT_AMPLICONS writes with the .mscluster added. `references` names one
+    // directly, or is a FASTA with one beside it as `<stem>_amplicons/` (the pipeline's own
+    // name for that directory). Either way nothing is extracted or clustered for that set.
+    // Without one, the set is extracted (in-silico PCR, cheap), but it is clustered only
+    // under --build_mapseq_db: at SILVA scale that is 12 min, at GTDB scale hours, and a
+    // database the observed reads were not mapped against labels them differently.
+    def db_files = ['amplicons.fasta', 'amplicons.tax', 'amplicons.fasta.mscluster',
+                    'translation_table.tsv', 'refseq_index.csv']
+    def build_db = params.build_mapseq_db.toString() == 'true'
+    // The set's id is also the --amplicon_cache key (conf/modules.config), shared across
+    // runs, so it names everything that shapes the amplicons: the FASTA, the primers and
+    // the extractor's code. The set's meta holds only its id, so adding or removing a
+    // sample leaves the extraction and clustering cached.
     // ponytail: the FASTA by location, size and mtime, not content. The same bytes at two
     // paths are extracted twice. Key by a content digest if that happens, which costs a
     // hash of the whole FASTA per run.
     def extractor = file("${projectDir}/bin/subspecies_infer.py").text.md5()
+    // [ set id, sample meta, FASTA or prebuilt dir, prebuilt ]
     ch_refs_by_set = ch_refs.map { meta, refs ->
+        def db = refs.isDirectory() ? refs : refs.parent.resolve(
+            refs.name.replaceFirst(/\.(fa|fasta|fna)(\.gz)?$/, '') + '_amplicons')
+        if (db.isDirectory()) {
+            def missing = db_files.findAll { !db.resolve(it).exists() }
+            if (missing) {
+                error "Sample ${meta.id}: prebuilt MAPseq database ${db} lacks ${missing.join(', ')}"
+            }
+            return [ "db_" + db.toUriString().md5().take(12), meta, db, true ]
+        }
         def key = [refs.toUriString(), refs.size(), refs.lastModified(), params.fwd_primer,
                    params.rev_primer, params.primer_mismatches, extractor].join('|')
-        [ "refs_" + key.md5().take(12), meta, refs ]
+        [ "refs_" + key.md5().take(12), meta, refs, false ]
     }
-    EXTRACT_AMPLICONS(ch_refs_by_set
+    ch_set_src = ch_refs_by_set
+        .map { set, meta, src, prebuilt -> [ set, src, prebuilt ] }
         .unique { it[0] }
-        .map { set, meta, refs -> [ [ id: set ], refs ] })
+        .branch { set, src, prebuilt ->
+            prebuilt: prebuilt
+            extract:  true
+        }
+    EXTRACT_AMPLICONS(ch_set_src.extract.map { set, refs, prebuilt -> [ [ id: set ], refs ] })
     ch_versions = ch_versions.mix(EXTRACT_AMPLICONS.out.versions)
-    // [ set meta, amplicons.fasta, amplicons.tax ]: the mapseq reference set.
-    ch_set_refs = EXTRACT_AMPLICONS.out.dir.map { meta, d ->
-        [ meta, d.resolve('amplicons.fasta'), d.resolve('amplicons.tax') ] }
+    ch_extracted = EXTRACT_AMPLICONS.out.dir.map { meta, d -> [ meta.id, d ] }
 
-    // Cluster only a set something maps against with mapseq: a sample's own reads (no
-    // `mseq:`) or a panel's sources. An align-mode matrix never reads the .mscluster, so a
-    // sweep over supplied classifications skips it; ch_db then holds only the samples that
-    // use it.
-    // Home probes map the square matrix's amplicons against their own set.
+    // Only a set something maps against with MAPseq needs a .mscluster: a sample's own
+    // reads (no `mseq:`), a panel's sources, the home probes, or a simulated square
+    // matrix. An align-mode matrix never reads it, so a sweep over supplied
+    // classifications needs no database at all.
     def home_probes = params.mismapping_method == 'align' && !params.mismapping_matrix &&
         (params.align_home_probes as int) > 0
-    ch_cluster_sets = ch_refs_by_set
-        .map { set, meta, refs -> [ meta.id, set, meta ] }
+    def sim_matrix = params.mismapping_method == 'simulate' && !params.mismapping_matrix
+    ch_mapped_sets = ch_refs_by_set
+        .map { set, meta, src, prebuilt -> [ meta.id, set, meta, src, prebuilt ] }
         .join(ch_reads.map { meta, reads -> [ meta.id, !meta.mseq ] })
-        .filter { id, set, meta, maps_reads ->
-            maps_reads || meta.panel || meta.panel_taxa || home_probes }
-        .map { id, set, meta, maps_reads -> [ set ] }
+        .filter { id, set, meta, src, prebuilt, maps_reads ->
+            maps_reads || meta.panel || meta.panel_taxa || home_probes || sim_matrix }
+        .map { id, set, meta, src, prebuilt, maps_reads ->
+            if (!prebuilt && !build_db) {
+                error "Sample ${id} maps with MAPseq, but ${src} has no prebuilt MAPseq " +
+                      "database beside it. Expected ${src.parent}/<stem>_amplicons/ holding " +
+                      "${db_files.join(', ')}. Point `references` at such a directory, or " +
+                      "pass --build_mapseq_db to extract and cluster one in this run."
+            }
+            [ set, prebuilt ] }
         .unique()
-    MAPSEQ_CLUSTER(ch_set_refs
-        .map { meta, fasta, tax -> [ meta.id, meta, fasta, tax ] }
-        .join(ch_cluster_sets)
-        .map { set, meta, fasta, tax -> [ meta, fasta, tax ] })
+    // A clustered set is a complete database directory, the same shape as a prebuilt one,
+    // and replaces the extracted one downstream: so the amplicons/<id>_amplicons/ that
+    // MATRIX_KEY publishes can be handed to a later run as `references`.
+    MAPSEQ_CLUSTER(ch_extracted
+        .join(ch_mapped_sets.filter { set, prebuilt -> !prebuilt }.map { set, prebuilt -> [ set ] })
+        .map { set, d -> [ [ id: set ], d ] })
     ch_versions = ch_versions.mix(MAPSEQ_CLUSTER.out.versions)
+    ch_clustered = MAPSEQ_CLUSTER.out.dir.map { meta, d -> [ meta.id, d ] }
+    ch_prebuilt = ch_set_src.prebuilt.map { set, d, prebuilt -> [ set, d ] }
+    // [ set id, amplicon dir ]
+    ch_set_dirs = ch_extracted
+        .join(ch_clustered, remainder: true)
+        .map { set, extracted, clustered -> [ set, clustered ?: extracted ] }
+        .mix(ch_prebuilt)
+    // [ set id, fasta, tax, mscluster ]
+    ch_set_db = ch_clustered.mix(ch_prebuilt).map { set, d ->
+        [ set, d.resolve('amplicons.fasta'), d.resolve('amplicons.tax'),
+          d.resolve('amplicons.fasta.mscluster') ] }
 
     // Fan the shared results back out to samples by set id. combine, not join: join is
     // 1:1 and would keep one sample per set.
-    ch_sample_sets = ch_refs_by_set.map { set, meta, refs -> [ set, meta ] }
+    ch_sample_sets = ch_refs_by_set.map { set, meta, src, prebuilt -> [ set, meta ] }
     // [ sample meta, amplicon_dir ]
     ch_amplicons = ch_sample_sets
-        .combine(EXTRACT_AMPLICONS.out.dir.map { meta, d -> [ meta.id, d ] }, by: 0)
+        .combine(ch_set_dirs, by: 0)
         .map { set, meta, d -> [ meta, d ] }
-    // [ sample id, fasta, tax, mscluster ] — the mapseq DB slots, shared by both mappings.
+    // [ sample id, fasta, tax, mscluster ]: the MAPseq database every mapping uses —
+    // observed reads, simulated reads, panel sources and home probes alike.
     ch_db = ch_sample_sets
-        .combine(ch_set_refs
-            .map { meta, fasta, tax -> [ meta.id, fasta, tax ] }
-            .join(MAPSEQ_CLUSTER.out.mscluster.map { meta, mscluster -> [ meta.id, mscluster ] }), by: 0)
+        .combine(ch_set_db, by: 0)
         .map { set, meta, fasta, tax, mscluster -> [ meta.id, fasta, tax, mscluster ] }
 
     // Fingerprint extracted amplicons and group all samples that experience the same
@@ -329,18 +368,18 @@ workflow SUPERRESOLUTION_AMPLICON {
         }
     }
     else {
-        // The representative's amplicon directory is sufficient for the common matrix.
+        // The representative's amplicon directory is sufficient for the common matrix, and
+        // its database is the one its reads map against: every member's amplicons are
+        // byte-identical (the matrix key hashes them), so any member's .mscluster serves.
         ch_group_refs = ch_matrix_groups.map { meta, d, model ->
             [ meta, d, d.resolve('amplicons.fasta'), d.resolve('amplicons.tax'), model ]
         }
-        MAPSEQ_CLUSTER_MATRIX(ch_group_refs.map { meta, d, fasta, tax, model -> [ meta, fasta, tax ] })
         SIMULATE_READS(ch_group_refs.map { meta, d, fasta, tax, model -> [ meta, fasta, model ] })
-        ch_versions = ch_versions.mix(MAPSEQ_CLUSTER_MATRIX.out.versions).mix(SIMULATE_READS.out.versions)
+        ch_versions = ch_versions.mix(SIMULATE_READS.out.versions)
         MAPSEQ_SIM(SIMULATE_READS.out.reads
-            .map { meta, reads -> [ meta.id, meta, reads ] }
-            .join(ch_group_refs.map { meta, d, fasta, tax, model -> [ meta.id, d, fasta, tax ] })
-            .join(MAPSEQ_CLUSTER_MATRIX.out.mscluster.map { meta, cluster -> [ meta.id, cluster ] })
-            .map { id, meta, reads, d, fasta, tax, cluster -> [ meta, reads, fasta, tax, cluster ] })
+            .map { meta, reads -> [ meta.members[0].id, meta, reads ] }
+            .combine(ch_db, by: 0)
+            .map { id, meta, reads, fasta, tax, mscluster -> [ meta, reads, fasta, tax, mscluster ] })
         ch_versions = ch_versions.mix(MAPSEQ_SIM.out.versions)
         BUILD_MISMAPPING(ch_group_refs
             .map { meta, d, fasta, tax, model -> [ meta.id, meta, d ] }

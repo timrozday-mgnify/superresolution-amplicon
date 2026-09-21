@@ -102,7 +102,7 @@ YAML list of samples (or a map with `samples:`). Per sample:
 | `fastq_1` / `fastq_2` | yes\* | Alternative to `reads` (paired-end). Supplying `fastq_2` marks the sample paired: R1/R2 are **merged into one query per fragment** before mapping, so each query spans the amplicon like the references do. |
 | `paired` | no | `true` to merge a two-file `reads` list as R1/R2. Not inferred: two files could equally be two single-end runs. |
 | `platform` | no | `hq-illumina` \| `lq-illumina` \| `ont` \| `pacbio` (default `hq-illumina`). Sets the skiver error-model context + report notebook. |
-| `references` | no | Per-sample reference fasta; overrides `--references`. |
+| `references` | no | Per-sample reference fasta, or a [prebuilt MAPseq database](#prebuilt-mapseq-database) directory; overrides `--references`. |
 | `error_model` | no | Path to a pre-trained `.pt` model; **skips training** for this sample. |
 | `mseq` | no | Path to a mapseq classification of this sample's reads (a previous run's `mapseq/<id>/<id>.obs.mseq.gz`); **skips read mapping** for this sample. It must have been produced against the same reference set — the ids in it are matched to the extracted amplicons — and it carries the read-prep settings it was made with, so `--obs_max_reads`, `--trim_primers` and `--min_pair_overlap` no longer apply to that sample. Mapping is the expensive stage, so this is what makes a parameter sweep over the mis-mapping and inference knobs cheap. |
 
@@ -160,8 +160,8 @@ python bin/build_mapseq_database.py \
     --input genomes.yml \
     --output-prefix db/references
 
-# Use db/references.fasta with the pipeline.
-nextflow run main.nf --input samples.yml --references db/references.fasta
+# Use db/references.fasta with the pipeline. A small set can be clustered in-run.
+nextflow run main.nf --input samples.yml --references db/references.fasta --build_mapseq_db
 ```
 
 Each source sequence receives a header such as
@@ -191,6 +191,39 @@ nextflow run main.nf --input samples.yml \
 A SILVA reference is a sequence, not a genome, so genome-space inference against it has no
 biological reading. Use it through `v4_group` or a panel (`panel_references`).
 
+The run above needs the prebuilt MAPseq database described next, beside the FASTA as
+`db/silva_138_2_ssu_nr99_amplicons/`.
+
+### Prebuilt MAPseq database
+
+Every MAPseq mapping in a run (observed reads, simulated reads, panel sources, home
+probes) goes against one database per reference set: the extracted amplicons, their
+`.tax`, and MAPseq's `.mscluster`. **The pipeline does not build one unless asked.**
+Clustering SILVA NR99 V4 takes 12 min and GTDB hours, and a database other than the one
+the observed reads were mapped against labels them differently.
+
+A prebuilt database is a directory holding `amplicons.fasta`, `amplicons.tax`,
+`amplicons.fasta.mscluster`, `translation_table.tsv` and `refseq_index.csv`. It is used
+when `references` names it, or when `references` is a FASTA with the directory beside it
+as `<stem>_amplicons/` (`db/silva.fasta` → `db/silva_amplicons/`). Nothing is then
+extracted or clustered, and the FASTA itself is not read. Build one once:
+
+```bash
+python bin/subspecies_infer.py amplicons --db-fasta db/silva_138_2_ssu_nr99.fasta \
+    -o db/silva_138_2_ssu_nr99_amplicons --threads 8
+cd db/silva_138_2_ssu_nr99_amplicons
+awk '/^>/ { n++ } n <= 1' amplicons.fasta > probe.fasta     # mapseq clusters whatever the query
+mapseq probe.fasta amplicons.fasta amplicons.tax -nthreads 8 > /dev/null && rm probe.fasta
+```
+
+Use the same primers as the run (`--fwd_primer`, `--rev_primer`, `--primer_mismatches`):
+the directory does not record them. A supplied `mseq:` must have been mapped against this
+database. A run with no prebuilt database that maps with MAPseq fails, naming the
+directory it looked for, unless `--build_mapseq_db` is set. A `--build_mapseq_db` run publishes
+each database it builds whole, as `amplicons/<id>_amplicons/`: pass that directory as a
+later run's `references`. An `align`-mode run whose
+samples all supply `mseq:` needs no database and only extracts the amplicons.
+
 ## Parameters
 
 Run mode / IO:
@@ -198,7 +231,8 @@ Run mode / IO:
 | param | default | description |
 |-------|---------|-------------|
 | `--input` | – | YAML samplesheet (required). |
-| `--references` | – | Default reference fasta (per-sample override in samplesheet). |
+| `--references` | – | Default reference fasta or prebuilt MAPseq database directory (per-sample override in samplesheet). |
+| `--build_mapseq_db` | `false` | Extract and cluster a reference set's MAPseq database in-run when no [prebuilt one](#prebuilt-mapseq-database) is found. Off: such a run fails instead. |
 | `--outdir` | `./results` | Output directory. |
 | `--platform` | `hq-illumina` | Default platform (see samplesheet). |
 | `--error_model` | – | Global pre-trained model (per-sample override in samplesheet). |
@@ -217,7 +251,7 @@ Reference amplicons (in-silico PCR):
 |-------|---------|-------------|
 | `--fwd_primer` / `--rev_primer` | V4 515F / 806R | Amplicon primers. |
 | `--primer_mismatches` | `3` | Allowed primer mismatches. |
-| `--amplicon_cache` | – | Directory that keeps each reference set's extracted amplicons and mapseq clustering (`storeDir`), keyed by the reference FASTA (path, size, mtime), primers and extractor code. Runs pointed at the same directory reuse them instead of rebuilding — at SILVA/GTDB scale the clustering alone is tens of minutes. The cache is unlocked: warm it with one run before starting several on the same set at once. |
+| `--amplicon_cache` | – | Directory that keeps each reference set's extracted amplicons and, under `--build_mapseq_db`, its mapseq clustering (`storeDir`), keyed by the reference FASTA (path, size, mtime), primers and extractor code. Runs pointed at the same directory reuse them instead of rebuilding — at SILVA/GTDB scale the clustering alone is tens of minutes. The cache is unlocked: warm it with one run before starting several on the same set at once. |
 | `--trim_primers` | `true` | Trim primers off observed reads before mapping, and simulate the matrix and panel reads from primer-flanked amplicons trimmed the same way. Set `false` if reads are already primer-trimmed. |
 
 Mis-mapping — how `M` is built:
@@ -253,7 +287,8 @@ simulates reads, so nothing needs an error model and the skiver subworkflow neve
 | `--sim_n_per_ref` | `500` | Simulated reads per reference (sampling depth for `M`). |
 | `--mismapping_matrix` | – | A previously generated `mismapping_matrix.npz` for the same amplicon reference set. Skips read simulation and simulated-read mapseq. Either form is accepted: the labelled compressed CSR, or the grouped form; legacy CSV matrices remain readable. |
 
-In-silico PCR and the mapseq clustering run once per distinct `references` file,
+Without a prebuilt database, in-silico PCR and (under `--build_mapseq_db`) the mapseq
+clustering run once per distinct `references` file,
 however many samples name it: 50 samples against one GTDB SSU FASTA extract and
 cluster it once. `amplicons/<id>_amplicons/` is still published per sample. The
 pipeline then fingerprints extracted amplicons and builds each compatible matrix once

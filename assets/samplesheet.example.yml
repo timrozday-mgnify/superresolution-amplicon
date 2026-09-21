@@ -5,7 +5,8 @@
 #   reads       fastq(s): a single path or a list. (Or use fastq_1[/fastq_2].)
 #   platform    optional. skiver error-model context / report notebook.
 #               one of: hq-illumina | lq-illumina | ont | pacbio  (default: hq-illumina)
-#   references  optional. Per-sample reference fasta; overrides --references.
+#   references  optional. Per-sample reference fasta, or a prebuilt MAPseq database
+#               directory (README: Prebuilt MAPseq database); overrides --references.
 #   error_model optional. Path to a pre-trained .pt model; skips training for this sample.
 #   mseq        optional. A mapseq classification of these reads against THIS reference
 #               set (a previous run's mapseq/<id>/<id>.obs.mseq.gz); skips read mapping.

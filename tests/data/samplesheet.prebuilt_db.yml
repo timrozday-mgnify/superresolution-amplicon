@@ -1,0 +1,11 @@
+# Two ways to name one prebuilt MAPseq database: a FASTA with `<stem>_amplicons/` beside
+# it, and the directory itself. Both are one reference set, so nothing is extracted or
+# clustered and the samples share one matrix.
+- id: by_fasta
+  reads: tests/data/sample.fastq.gz
+  platform: hq-illumina
+  references: tests/data/refs_prebuilt.fasta
+- id: by_dir
+  reads: tests/data/sample.fastq.gz
+  platform: hq-illumina
+  references: tests/data/refs_prebuilt_amplicons

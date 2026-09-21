@@ -16,14 +16,20 @@ nextflow_pipeline {
         then {
             assertAll(
                 { assert workflow.success },
-                // 1 sample: extraction, reference fingerprinting, observed mapping,
-                // a canonical matrix build/publish path, inference, and fit check = 12.
+                // 1 sample: extraction + clustering, reference fingerprinting, observed
+                // mapping, a canonical matrix build/publish path, inference, and fit
+                // check = 11. The simulated reads map against the same database as the
+                // observed ones, so there is one clustering, not two.
                 // No SKIVER_*: the error model is only used by the read simulator.
-                { assert workflow.trace.succeeded().size() == 12 },
+                { assert workflow.trace.succeeded().size() == 11 },
                 { assert workflow.trace.tasks().every { !it.name.contains('SKIVER') } },
                 { assert path("${params.outdir}/composition/demo/demo.inferred_composition.csv").exists() },
                 { assert path("${params.outdir}/composition/demo/demo.fit_diagnostics.json").exists() },
-                { assert path("${params.outdir}/amplicons/demo_amplicons").exists() },
+                // A built database is published whole, so a later run can take it as
+                // `references` without rebuilding it.
+                { assert ['amplicons.fasta', 'amplicons.tax', 'amplicons.fasta.mscluster',
+                          'translation_table.tsv', 'refseq_index.csv'].every {
+                    path("${params.outdir}/amplicons/demo_amplicons/${it}").exists() } },
                 { assert path("${params.outdir}/mapseq/demo/demo.obs.mseq.gz").exists() }
             )
         }
@@ -42,7 +48,7 @@ nextflow_pipeline {
         then {
             assertAll(
                 { assert workflow.success },
-                { assert workflow.trace.succeeded().size() == 12 },
+                { assert workflow.trace.succeeded().size() == 11 },
                 { assert path("${params.outdir}/composition/demo/demo.inferred_v4_groups.csv").exists() },
                 { assert path("${params.outdir}/composition/demo/demo.inferred_composition.csv").exists() },
                 { assert path("${params.outdir}/composition/demo/demo.fit_diagnostics.json").exists() }
@@ -126,12 +132,11 @@ nextflow_pipeline {
         then {
             assertAll(
                 { assert workflow.success },
-                // The default single-sample run is 12 tasks; supplying the classification
-                // drops READS_TO_FASTA and MAPSEQ_OBS, and with nothing left to map against
-                // the database, its MAPSEQ_CLUSTER.
+                // The default single-sample run is 11 tasks; supplying the classification
+                // drops READS_TO_FASTA and MAPSEQ_OBS. The simulated matrix still maps
+                // against the database, so its MAPSEQ_CLUSTER stays.
                 { assert workflow.trace.succeeded().size() == 9 },
                 { assert workflow.trace.tasks().every { !it.name.contains('MAPSEQ_OBS') } },
-                { assert workflow.trace.tasks().every { !it.name.contains(':MAPSEQ_CLUSTER (') } },
                 { assert workflow.trace.tasks().every { !it.name.contains('READS_TO_FASTA') } },
                 { assert path("${params.outdir}/composition/demo/demo.inferred_composition.csv").exists() },
                 { assert !path("${params.outdir}/mapseq/demo").exists() }
@@ -158,7 +163,52 @@ nextflow_pipeline {
                 { assert set.size() == 1 },
                 { assert path("${cache}/${set[0]}/amplicons/${set[0]}_amplicons/amplicons.fasta").exists() },
                 { assert file("${cache}/${set[0]}").listFiles().any { d ->
-                    d.name.startsWith('mapseq_') && new File(d, 'amplicons.fasta.mscluster').exists() } }
+                    d.name.startsWith('mapseq_') &&
+                    new File(d, "${set[0]}_amplicons/amplicons.fasta.mscluster").exists() } }
+            )
+        }
+    }
+
+    test("a run that maps with MAPseq refuses to build its database by default - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input           = "${projectDir}/assets/samplesheet.example.yml"
+                outdir          = "$outputDir"
+                build_mapseq_db = false
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.failed },
+                { assert workflow.trace.tasks().every { !it.name.contains(':MAPSEQ_CLUSTER (') } },
+                { assert workflow.stdout.any { it.contains('has no prebuilt MAPseq database') }
+                         || workflow.errorReport.contains('has no prebuilt MAPseq database') }
+            )
+        }
+    }
+
+    test("a prebuilt MAPseq database is used as is, found beside the FASTA or named - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input           = "${projectDir}/tests/data/samplesheet.prebuilt_db.yml"
+                outdir          = "$outputDir"
+                build_mapseq_db = false
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.tasks().every { !it.name.contains('EXTRACT_AMPLICONS') } },
+                { assert workflow.trace.tasks().every { !it.name.contains(':MAPSEQ_CLUSTER (') } },
+                // Both rows name the same database: one set, one matrix, two samples.
+                { assert workflow.trace.succeeded().findAll { it.name.contains('SIMULATE_READS') }.size() == 1 },
+                { assert workflow.trace.succeeded().findAll { it.name.contains(':MAPSEQ_OBS (') }.size() == 2 },
+                { assert path("${params.outdir}/composition/by_fasta/by_fasta.inferred_composition.csv").exists() },
+                { assert path("${params.outdir}/composition/by_dir/by_dir.inferred_composition.csv").exists() }
             )
         }
     }
@@ -176,8 +226,8 @@ nextflow_pipeline {
         then {
             assertAll(
                 { assert workflow.success },
-                // + SKIVER_DUMP + SKIVER_TRAIN + SKIVER_REPORT = 15
-                { assert workflow.trace.succeeded().size() == 15 }
+                // + SKIVER_DUMP + SKIVER_TRAIN + SKIVER_REPORT = 14
+                { assert workflow.trace.succeeded().size() == 14 }
             )
         }
     }
@@ -194,7 +244,7 @@ nextflow_pipeline {
         then {
             assertAll(
                 { assert workflow.success },
-                { assert workflow.trace.succeeded().size() == 12 },
+                { assert workflow.trace.succeeded().size() == 11 },
                 { assert workflow.trace.tasks().any { it.name.contains('READS_TO_FASTA') } },
                 { assert path("${params.outdir}/mapseq/paired_demo/paired_demo.obs.mseq.gz").exists() }
             )
@@ -217,8 +267,8 @@ nextflow_pipeline {
         then {
             assertAll(
                 { assert workflow.success },
-                // Indexed minimap2 + PAF parsing replace SIMULATE_READS +
-                // MAPSEQ_CLUSTER_MATRIX + MAPSEQ_SIM + BUILD_MISMAPPING: 12 - 4 + 3 = 11.
+                // Indexed minimap2 + PAF parsing replace SIMULATE_READS + MAPSEQ_SIM +
+                // BUILD_MISMAPPING: 11 - 3 + 3 = 11.
                 { assert workflow.trace.succeeded().size() == 11 },
                 { assert workflow.trace.tasks().every { !it.name.contains('SIMULATE') } },
                 { assert workflow.trace.tasks().every { !it.name.contains('SKIVER') } },
