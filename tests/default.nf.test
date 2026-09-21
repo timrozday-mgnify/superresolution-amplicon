@@ -139,6 +139,30 @@ nextflow_pipeline {
         }
     }
 
+    test("amplicon_cache keeps the extraction and clustering outside the work dir - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input          = "${projectDir}/assets/samplesheet.example.yml"
+                outdir         = "$outputDir"
+                amplicon_cache = "$outputDir/cache"
+            }
+        }
+        then {
+            // A second run pointed at the same cache skips both tasks ("Stored process").
+            def cache = params.amplicon_cache
+            def set = file(cache).listFiles()*.name.findAll { it.startsWith('refs_') }
+            assertAll(
+                { assert workflow.success },
+                { assert set.size() == 1 },
+                { assert path("${cache}/${set[0]}/amplicons/${set[0]}_amplicons/amplicons.fasta").exists() },
+                { assert file("${cache}/${set[0]}").listFiles().any { d ->
+                    d.name.startsWith('mapseq_') && new File(d, 'amplicons.fasta.mscluster').exists() } }
+            )
+        }
+    }
+
     test("trained error model adds the skiver subworkflow - stub") {
         tag "stub"
         options "-stub"
