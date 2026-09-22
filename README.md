@@ -199,6 +199,58 @@ SILVA-SSU/138.1/SILVA-SSU-tax.txt            --taxonomy (AAP's sk__/s__ form rea
 - A hit on an entry with no amplicon under the primers is off-target and dropped (0.29% of
   reads against AAP's SILVA, `dev/aap_merge_effects.md` 0.6).
 
+### Inputs from amplicon-analysis-pipeline
+
+SR can profile an amplicon-analysis-pipeline (AAP) run's output instead of the raw reads.
+It takes AAP's fastp-merged reads and reuses AAP's MAPseq classification, so nothing is
+mapped twice.
+
+```bash
+bin/aap_samplesheet.py aap_results --panel panel.fasta -o samplesheet.yml
+nextflow run . --input samplesheet.yml --references SILVA-SSU/138.1/SILVA-SSU.fasta \
+    --taxonomy SILVA-SSU/138.1/SILVA-SSU-tax.txt --trim_primers false \
+    --primer_mix assets/primer_mix_emp_v4.tsv
+```
+
+- **Samplesheet.** `bin/aap_samplesheet.py` writes one row per QC-passed run:
+  `qc/<id>.merged.fastq.gz` as `reads` with `merged: true`, fastp's `merge_rate`, and
+  `taxonomy-summary/<--db-label>/<id>.mseq` as `mseq`. It refuses a run that AAP did not
+  call a single 16S V4 amplicon, or whose primers cannot sit on `--fwd_primer`/
+  `--rev_primer`'s binding sites. Every row gets the same `--panel`/`--panel-taxa`.
+- **Database.** Use the SILVA-SSU directory AAP classified against, as shipped (see
+  [The MAPseq database](#the-mapseq-database)). The reused `.mseq` is valid only against
+  that same FASTA and `.mscluster`.
+- **Read preparation.** Merged reads keep their primers, so the run needs
+  `--trim_primers false`, and the kernel simulates untrimmed reads to match. `--primer_mix`
+  draws those primers from AAP's measured EMP 515F/806R oligo mix rather than uniformly
+  over the degenerate bases.
+- **Error model.** Merged reads have their own error profile, not a raw mate's
+  ([dev/aap_merge_effects.md](dev/aap_merge_effects.md) 0.1–0.2). Choose one:
+  - flat rates measured on merged reads: `--flat_sub_rate 3.4e-4 --flat_ins_rate 4e-6
+    --flat_del_rate 4e-6` (20 Nov2025 runs; per-run numbers);
+  - `--sim_error_model trained`, which trains one pooled model on the merged reads;
+  - `--sim_read_structure pairs`, which simulates raw mates and merges them with AAP's
+    fastp. It needs a model trained on raw mates as each row's `error_model`.
+- **Align.** Give substitutions and indels separate decays (`--align_distance_decay auto
+  --align_indel_decay auto`), since indels are about 100× rarer in merged reads. Align is
+  refused on a row whose `merge_rate` is below 0.8.
+
+On a synthetic 16-genome V4 community (2×310, 200k pairs, reinterpreted through a 22-genome
+panel), the synthetic-metagenomic-benchmark-pipeline scored species total variation against
+truth:
+
+| input | kernel | species TV |
+|---|---|---|
+| AAP's own MAPseq labels | – | 0.742 |
+| AAP merged reads | simulate, merged | 0.0083 |
+| AAP merged reads | simulate, pairs (oracle model) | 0.0074 |
+| AAP merged reads | align, tau 1 | 0.0188 |
+| raw pairs, SR's own merge | simulate | 0.0099 |
+
+Most of AAP's gap is resolution: MAPseq assigns under 5% of its reads to a species.
+`merged` is within 0.001 of `pairs`, so it stays the default. Every genome in that
+community is its own species, so it does not test a strain split.
+
 ## Parameters
 
 Run mode / IO:
