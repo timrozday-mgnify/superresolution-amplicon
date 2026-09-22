@@ -254,6 +254,45 @@ def test_panel_align_candidate_probes_and_auto_decay(monkeypatch) -> None:
     ), ka) == 0.013
 
 
+def test_panel_probes_search_the_ambiguous_pass_from_the_probe_side() -> None:
+    """With probes, the IUPAC pass finds every probe's neighbour within tau, whichever end
+    carries the ambiguity, and proposes no pair that lacks a probe. Checked against brute
+    force on a set where ambiguous sequences outnumber the probes."""
+    import kernel_align as ka
+
+    rng = np.random.default_rng(3)
+    bases = np.array(list("ACGT"))
+
+    def mutate(seq: str, subs: int = 0, n_codes: int = 0, indel: bool = False) -> str:
+        s = list(seq)
+        for i in rng.choice(len(s), size=subs + n_codes, replace=False)[:subs]:
+            s[i] = rng.choice(bases[bases != s[i]])
+        for i in rng.choice(len(s), size=n_codes, replace=False):
+            s[i] = "N"
+        if indel:
+            del s[int(rng.integers(len(s)))]
+        return "".join(s)
+
+    roots = ["".join(rng.choice(bases, size=240)) for _ in range(6)]
+    sequences = list(dict.fromkeys(
+        [mutate(r, subs=k % 2, n_codes=k % 3, indel=k % 5 == 4)
+         for r in roots for k in range(8)]))
+    ambiguous = [i for i, s in enumerate(sequences) if "N" in s]
+    probes = np.array([i for i, s in enumerate(sequences) if "N" not in s][:3], dtype=np.int64)
+    assert len(ambiguous) > len(probes)
+
+    tau, budget = 1, 4
+    pairs = {tuple(p) for p in ka.pigeonhole_candidates(
+        sequences, tau=tau, max_ambiguous_bases=budget, max_postings=1 << 30, probes=probes)}
+    assert all(i in probes or j in probes for i, j in pairs)
+    for p in probes:
+        for j in range(len(sequences)):
+            ambiguity = sum(c == "N" for c in sequences[p] + sequences[j])
+            if (j != p and ambiguity <= budget
+                    and ka.bounded_iupac_distance(sequences[p], sequences[j], tau) <= tau):
+                assert (min(p, j), max(p, j)) in pairs, (p, j)
+
+
 def test_indel_decay_weights_indels_apart_and_leaves_them_out_of_the_strata(
         tmp_path: Path) -> None:
     """A label one substitution away takes c_sub, one indel away takes c_indel. The strata
