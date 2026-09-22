@@ -166,7 +166,7 @@ workflow SUPERRESOLUTION_AMPLICON {
     ch_set_src = ch_refs_by_set
         .map { set, meta, refs -> [ set, refs ] }
         .unique { it[0] }
-        .join(EXTRACT_AMPLICONS.out.dir.map { meta, d -> [ meta.id, d ] })
+        .join(EXTRACT_AMPLICONS.out.dir.map { meta, fasta, tax, tt, idx -> [ meta.id, fasta.parent ] })
         .map { set, refs, d ->
             if (refs.name.endsWith('.gz')) {
                 error "MAPseq maps against the reference FASTA itself and cannot read a " +

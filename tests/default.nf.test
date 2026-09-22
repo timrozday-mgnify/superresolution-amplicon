@@ -282,6 +282,35 @@ nextflow_pipeline {
         }
     }
 
+    // A run that loses the race to a cold cache finds the winner's extraction already
+    // moved in. Seeded here as a cached set without its versions.yml, so this run misses,
+    // rebuilds and unstages onto it: storeDir's `mv -f` failed on the directory before.
+    test("amplicon_cache survives a concurrent run's extraction - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input          = "${projectDir}/assets/samplesheet.example.yml"
+                outdir         = "$outputDir"
+                amplicon_cache = "$outputDir/cache"
+            }
+            // The example's set id. If the cache key changes, the set assertion below fails
+            // rather than this test passing without a collision.
+            def stale = new File("$outputDir/cache/refs_c7b39ffaf873/amplicons/refs_c7b39ffaf873_amplicons")
+            stale.mkdirs()
+            new File(stale, 'amplicons.fasta').text = '>stale\nA\n'
+        }
+        then {
+            def cache = params.amplicon_cache
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.succeeded().findAll { it.name.contains(':EXTRACT_AMPLICONS (') }.size() == 1 },
+                { assert file(cache).listFiles()*.name.findAll { it.startsWith('refs_') } == ['refs_c7b39ffaf873'] },
+                { assert !path("${cache}/refs_c7b39ffaf873/amplicons/refs_c7b39ffaf873_amplicons/amplicons.fasta").text.contains('stale') }
+            )
+        }
+    }
+
     test("a .mscluster beside the reference FASTA is used, not rebuilt - stub") {
         tag "stub"
         options "-stub"

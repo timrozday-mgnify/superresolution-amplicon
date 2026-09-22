@@ -12,9 +12,12 @@ process EXTRACT_AMPLICONS {
     tuple val(meta), path(references)
 
     output:
-    // The directory only: storeDir (--amplicon_cache) moves each output in turn, and a
-    // file declared inside an already-moved directory fails that move.
-    tuple val(meta), path("${meta.id}_amplicons"), emit: dir
+    // The files, not their directory: storeDir (--amplicon_cache) moves each output with
+    // `mv -f`, which replaces a file atomically but fails on a directory another run has
+    // already moved there. So concurrent cold runs on one set each overwrite the same
+    // (identical) files instead of all but one failing. The workflow takes their parent.
+    tuple val(meta), path("${meta.id}_amplicons/amplicons.fasta"), path("${meta.id}_amplicons/references.tax"),
+        path("${meta.id}_amplicons/translation_table.tsv"), path("${meta.id}_amplicons/refseq_index.csv"), emit: dir
     path "versions.yml",                           emit: versions
 
     when:
