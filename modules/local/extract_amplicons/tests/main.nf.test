@@ -1,0 +1,36 @@
+nextflow_process {
+
+    name "EXTRACT_AMPLICONS"
+    script "../main.nf"
+    process "EXTRACT_AMPLICONS"
+
+    // A run that loses the race to a cold --amplicon_cache finds the winner's extraction
+    // already moved in. Seeded here as a cached set without its versions.yml, so this run
+    // misses, rebuilds and unstages onto it: storeDir's `mv -f` failed on the directory
+    // before EXTRACT_AMPLICONS declared its files instead.
+    test("amplicon_cache survives a concurrent run's extraction - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                amplicon_cache = "$outputDir/cache"
+            }
+            process {
+                """
+                input[0] = [ [ id: 'set1' ], file("${projectDir}/tests/data/refs.fasta", checkIfExists: true) ]
+                """
+            }
+            def stale = new File("$outputDir/cache/set1/amplicons/set1_amplicons")
+            stale.mkdirs()
+            new File(stale, 'amplicons.fasta').text = '>stale\nA\n'
+        }
+        then {
+            def fasta = "${params.amplicon_cache}/set1/amplicons/set1_amplicons/amplicons.fasta"
+            assertAll(
+                { assert process.success },
+                { assert process.out.dir[0][1].toString() == fasta },
+                { assert !path(fasta).text.contains('stale') }
+            )
+        }
+    }
+}
