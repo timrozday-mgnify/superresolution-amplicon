@@ -185,9 +185,10 @@ def pigeonhole_candidates(
     SSU V4 amplicons) and expensive: budgeting for it globally would need ``P`` blocks so
     short that a conserved window matches thousands of amplicons. The first pass uses
     ``P = tau + 1`` long blocks over the whole set and settles every ambiguity-free pair;
-    the second uses ``P = tau + max_ambiguous_bases + 1`` short blocks but probes only
-    from the ambiguous sequences, which is enough because a pair this filter could
-    otherwise miss has at least one ambiguous member.
+    the second uses ``P = tau + max_ambiguous_bases + 1`` short blocks. A pair the first
+    pass can miss has at least one ambiguous member, and the short blocks find it from
+    either end, so the second pass searches from the smaller side: the ambiguous
+    sequences, or the requested ``probes`` when there are fewer of them.
 
     Args:
         sequences: Distinct amplicons, one per duplicate group.
@@ -196,8 +197,8 @@ def pigeonhole_candidates(
             references carrying two ambiguity codes each need a budget of four.
         max_postings: Drop a block shared by more than this many sequences.
         probes: Sequence indexes to search against all sequences. By default every
-            sequence is searched. Ambiguous sequences are also searched when needed to
-            retain the filter's recall guarantee for a clean probe and ambiguous target.
+            sequence is searched. When given, only pairs with at least one probe member
+            are returned.
 
     Returns:
         ``(m, 2)`` array of ``i < j`` index pairs to verify.
@@ -215,11 +216,19 @@ def pigeonhole_candidates(
     )
     log.info("%d of %d distinct amplicons carry IUPAC codes", len(ambiguous), total)
     if len(ambiguous) and max_ambiguous_bases:
-        # A clean probe can be near an ambiguous target. Searching the ambiguous targets
-        # as well as the requested probes preserves the pigeonhole guarantee in that
-        # direction without indexing a second copy of the database.
-        packed = np.union1d(packed, _block_pass(
-            sequences, ambiguous, tau, tau + max_ambiguous_bases + 1, max_postings))
+        # A clean probe can be near an ambiguous target. The pair damages at most
+        # tau + max_ambiguous_bases of the target's short blocks whichever end searches,
+        # so search from the smaller side. For a panel (tens of probes against a database
+        # with tens of thousands of ambiguous amplicons) the ambiguous side proposed ~72M
+        # database-to-database pairs on SILVA, every one verified and then discarded.
+        second = (probe_indexes if probes is not None and len(probe_indexes) < len(ambiguous)
+                  else ambiguous)
+        extra = _block_pass(sequences, second, tau, tau + max_ambiguous_bases + 1,
+                            max_postings)
+        if probes is not None and second is ambiguous:
+            left, right = divmod(extra, total)
+            extra = extra[np.isin(left, probe_indexes) | np.isin(right, probe_indexes)]
+        packed = np.union1d(packed, extra)
     return np.stack(divmod(packed, total), axis=1)
 
 
