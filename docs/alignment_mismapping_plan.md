@@ -201,6 +201,14 @@ This is a narrow exception in practice: paired samples have their mates merged i
 whole-fragment queries before mapping (see the paired bullet below), so queries normally
 span the amplicon.
 
+amplicon-analysis-pipeline's fastp-merged reads (`merged: true`) meet the same assumption.
+Two caveats. Merging can drop pairs unevenly across sources (long amplicons first), which
+edit distance cannot express, so `align` refuses a row with `merge_rate` below 0.8 and
+those rows go to `simulate --sim_read_structure pairs`. And merged reads carry about 100×
+fewer indels than substitutions, so `--align_indel_decay` weights indels separately. On
+the benchmark's synthetic AAP sample, `align` scored species TV 0.019 against `simulate`'s
+0.008. That is usable, but not the default for these reads.
+
 ### 8. High-error long reads are outside the tested regime
 
 The tie cluster is error-model-free, which is the point at Illumina rates and wrong at ONT
