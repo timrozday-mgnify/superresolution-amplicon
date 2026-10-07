@@ -35,6 +35,12 @@ workflow {
 
     ch_rows = Channel.fromList(rows)
 
+    // Whether this run has to train an error model from reads. Only the `simulate`
+    // kernel's `trained` model reads a FASTQ at all; a supplied kernel, `align` and the
+    // flat model each take the reads channel for its meta and drop the files.
+    def trains_a_model = !params.panel_kernel && params.mismapping_method != 'align' &&
+                         params.sim_error_model != 'flat'
+
     // [ meta, [ reads ] ]
     ch_reads = ch_rows.map { row ->
         if (!row.id) error "Each sample needs an 'id'"
@@ -57,8 +63,22 @@ workflow {
                 paired = true
             }
         }
+        else if (row.mseq) {
+            // Reads are optional on an `mseq:` row: the classification already stands in
+            // for them, and nothing downstream opens the files. This is the OTU
+            // reinterpretation route -- an amplicon-analysis-pipeline run's own MAPseq
+            // labels re-read over a panel, with no FASTQ fetched at all. Keep `merged:
+            // true` on such a row anyway: it still declares how the reads behind that
+            // classification were prepared, which --trim_primers has to match.
+            if (trains_a_model && !(row.error_model || params.error_model)) {
+                error "Sample ${row.id}: 'mseq' without 'reads' has nothing to train an " +
+                      "error model on. Give the row an 'error_model' (or --error_model), " +
+                      "or pick a kernel that needs none: --sim_error_model flat, " +
+                      "--mismapping_method align, or --panel_kernel."
+            }
+        }
         else {
-            error "Sample ${row.id} needs 'reads' (list) or 'fastq_1'[/'fastq_2']"
+            error "Sample ${row.id} needs 'reads' (list) or 'fastq_1'[/'fastq_2'], or 'mseq' on its own"
         }
         // `merged: true` marks reads that are already merged pairs, e.g. AAP's
         // qc/<id>.merged.fastq.gz (bin/aap_samplesheet.py). They are never merged again,

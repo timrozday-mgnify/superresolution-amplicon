@@ -95,7 +95,8 @@ YAML list of samples (or a map with `samples:`). Per sample:
 | `panel_references` | no | Genome panel for this sample; overrides `--panel_references`. See [Panel reinterpretation](#panel-reinterpretation). |
 | `panel_taxa` | no | Taxon panel entries for this sample; overrides `--panel_taxa`. See [Panel reinterpretation](#panel-reinterpretation). |
 
-\* provide either `reads` or `fastq_1`.
+\* provide either `reads` or `fastq_1` — or neither, on a row that carries `mseq`
+and needs no trained error model (see [OTU results only, no reads](#otu-results-only-no-reads)).
 
 ```yaml
 - id: sampleA
@@ -234,6 +235,54 @@ nextflow run . --input samplesheet.yml --references SILVA-SSU/138.1/SILVA-SSU.fa
 - **Align.** Give substitutions and indels separate decays (`--align_distance_decay auto
   --align_indel_decay auto`), since indels are about 100× rarer in merged reads. Align is
   refused on a row whose `merge_rate` is below 0.8.
+
+#### OTU results only, no reads
+
+A row that carries `mseq` may omit `reads` and `fastq_1` entirely. AAP's classification
+already stands in for the reads, and nothing downstream opens the files: `READS_TO_FASTA`
+and `MAPSEQ_OBS` are skipped either way, and a supplied kernel, `align` and the flat model
+each take the reads channel only for its meta. So an AAP run's OTU results can be
+reinterpreted over a panel without the FASTQ existing anywhere — the fast route when the
+reads are remote, private, or simply not worth moving.
+
+```bash
+nextflow run . --input samplesheet.yml \
+    --references SILVA-SSU/138.1/SILVA-SSU.fasta \
+    --taxonomy SILVA-SSU/138.1/SILVA-SSU-tax.txt \
+    --panel_references panel.fasta \
+    --trim_primers false --primer_mix assets/primer_mix_emp_v4.tsv \
+    --error_model pooled_merged.pt
+```
+
+```yaml
+- id: run_a
+  references: SILVA-SSU/138.1/SILVA-SSU.fasta
+  mseq: aap_results/run_a/taxonomy-summary/SILVA-SSU/run_a.mseq
+  merged: true
+  panel_references: panel.fasta
+```
+
+The one thing reads are still needed for is **training** an error model, so a reads-less
+row is refused under `--sim_error_model trained` unless it has an `error_model` (or
+`--error_model`) of its own. Three ways out, in descending order of accuracy:
+
+1. **A pre-trained model.** Train once from one run's reads — `--sim_error_model trained
+   --trained_error_model_scope pooled` writes a pooled per-platform model — then pass that
+   `.pt` to every later reads-less run. The merged-read error profile is a property of the
+   sequencing and of AAP's fastp, not of the sample, so one model covers a whole batch.
+2. **`--mismapping_method align`**, which never trains anything. Refused on a row whose
+   `merge_rate` is below 0.8, and `merge_rate` is not in an OTU-only samplesheet — so only
+   use it where the merge rate is known to be high.
+3. **`--sim_error_model flat`** with rates measured on merged reads (`--flat_sub_rate
+   3.4e-4 --flat_ins_rate 4e-6 --flat_del_rate 4e-6`). Cheapest, and the weakest: under
+   panel reinterpretation the flat model misses context-specific relabels and scored no
+   better than the home labels alone on GTDB r232
+   ([dev/panel_reinterpretation.md](dev/panel_reinterpretation.md)).
+
+`merged: true` is still worth setting on a reads-less AAP row: there are no reads to
+merge, but it declares how the reads behind that classification were prepared, and
+`--trim_primers false` has to match it so the simulated panel reads are prepared the same
+way.
 
 On a synthetic 16-genome V4 community (2×310, 200k pairs, reinterpreted through a 22-genome
 panel), the synthetic-metagenomic-benchmark-pipeline scored species total variation against
