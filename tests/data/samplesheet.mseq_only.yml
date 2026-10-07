@@ -1,0 +1,6 @@
+# The OTU reinterpretation route: AAP's own MAPseq classification and nothing else. No
+# FASTQ is fetched, so the run must not need a trained error model (flat here).
+- id: demo
+  platform: hq-illumina
+  references: tests/data/refs.fasta
+  mseq: tests/data/supplied.obs.mseq.gz
