@@ -1,0 +1,6 @@
+# Byte-identical to tests/data/refs.fasta at another path with another mtime. Keying on
+# content means a kernel built against one is valid against the other.
+- id: demo
+  reads: tests/data/sample.fastq.gz
+  platform: hq-illumina
+  references: tests/data/refs_moved.fasta
