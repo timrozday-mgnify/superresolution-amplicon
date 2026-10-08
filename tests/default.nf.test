@@ -63,7 +63,8 @@ nextflow_pipeline {
         when {
             params {
                 // The bundle a stub run of the example sheet publishes: its provenance names
-                // the stub amplicons' sha256 and the unclustered refs.fasta as the MAPseq db.
+                // the stub amplicons' sha256, and the MAPseq db by the content of refs.fasta
+                // and of the .mscluster the stub writes for it.
                 def refs = new File("${projectDir}/tests/data/refs.fasta")
                 def sha = { byte[] b -> java.security.MessageDigest.getInstance('SHA-256').digest(b).encodeHex().toString() }
                 def amplicons = ">ref|0|${sha(refs.bytes).take(12)}\nACGTACGTACGT\n"
@@ -72,7 +73,7 @@ nextflow_pipeline {
                 ['mismapping_matrix.npz', 'panel_translation.tsv', 'sources.tsv'].each { new File(kdir, it).text = '' }
                 new File(kdir, 'provenance.json').text = groovy.json.JsonOutput.toJson([
                     matrix_key: 'panel_supplied', reference_sha256: sha(amplicons.bytes),
-                    mapseq_db: [refs.absolutePath, refs.length(), refs.lastModified(), 'clustered'].join('|'),
+                    mapseq_db: [sha(refs.bytes), sha('0 0\n'.bytes)].join('|'),
                     panel: 'database', panel_taxa: null])
                 input        = "${projectDir}/assets/samplesheet.example.yml"
                 outdir       = "$outputDir"
@@ -88,6 +89,40 @@ nextflow_pipeline {
                 { assert workflow.trace.tasks().every { !it.name.contains('PANEL') } },
                 { assert path("${params.outdir}/composition/demo/demo.inferred_composition.csv").exists() },
                 { assert !path("${params.outdir}/mismapping").exists() }
+            )
+        }
+    }
+
+    test("a kernel is reused for the same database at another path - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                // Same bundle as above, built against tests/data/refs.fasta -- but the run
+                // names tests/data/refs_moved.fasta, a byte-identical copy at another path
+                // with another mtime. Keying on content is what makes this reusable: under
+                // path+mtime keying the bundle is refused, and the --amplicon_cache entry
+                // misses too, re-extracting and re-clustering the database.
+                def refs = new File("${projectDir}/tests/data/refs.fasta")
+                def sha = { byte[] b -> java.security.MessageDigest.getInstance('SHA-256').digest(b).encodeHex().toString() }
+                def amplicons = ">ref|0|${sha(refs.bytes).take(12)}\nACGTACGTACGT\n"
+                def kdir = new File("$outputDir/panel_moved")
+                kdir.mkdirs()
+                ['mismapping_matrix.npz', 'panel_translation.tsv', 'sources.tsv'].each { new File(kdir, it).text = '' }
+                new File(kdir, 'provenance.json').text = groovy.json.JsonOutput.toJson([
+                    matrix_key: 'panel_moved', reference_sha256: sha(amplicons.bytes),
+                    mapseq_db: [sha(refs.bytes), sha('0 0\n'.bytes)].join('|'),
+                    panel: 'database', panel_taxa: null])
+                input        = "${projectDir}/tests/data/samplesheet.moved_refs.yml"
+                outdir       = "$outputDir"
+                panel_kernel = kdir.absolutePath
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.tasks().every { !it.name.contains('PANEL') } },
+                { assert path("${params.outdir}/composition/demo/demo.inferred_composition.csv").exists() }
             )
         }
     }
