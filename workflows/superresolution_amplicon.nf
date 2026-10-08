@@ -19,6 +19,22 @@ include { MAPSEQ as MAPSEQ_PANEL_HOME } from '../modules/local/mapseq/map/main'
 include { MAPSEQ as MAPSEQ_PANEL_SIM  } from '../modules/local/mapseq/map/main'
 include { FASTP_MERGE           } from '../modules/local/fastp/merge/main'
 
+// SHA-256 of a file's content, streamed a megabyte at a time so a multi-gigabyte
+// reference database is never held in memory.
+//
+// Input files are identified by content, never by path, size or mtime. That is what makes
+// a --panel_kernel bundle and an --amplicon_cache portable: a kernel built on a cluster is
+// reusable on a laptop, where the same database sits at a different path, and copying a
+// file (which rarely preserves mtime to the millisecond) does not invalidate it. The same
+// bytes at two paths also share one cache entry instead of being extracted twice.
+def fileDigest(path) {
+    def md = java.security.MessageDigest.getInstance('SHA-256')
+    java.nio.file.Files.newInputStream(path).withStream { input ->
+        input.eachByte(1 << 20) { buffer, count -> md.update(buffer, 0, count) }
+    }
+    md.digest().encodeHex().toString()
+}
+
 workflow SUPERRESOLUTION_AMPLICON {
     take:
     ch_reads      // [ meta, [ reads ] ]                (meta.id, meta.platform)
@@ -141,15 +157,23 @@ workflow SUPERRESOLUTION_AMPLICON {
     // The id is also the --amplicon_cache key (conf/modules.config), shared across runs,
     // so it names everything that shapes the amplicons: the FASTA, the primers and the
     // extractor's code.
-    // ponytail: the FASTA by location, size and mtime, not content. The same bytes at two
-    // paths are extracted twice. Key by a content digest if that happens, which costs a
-    // hash of the whole FASTA per run.
+    //
+    // The FASTA goes into the key by content (fileDigest, above). Hashed once per distinct
+    // FASTA rather than once per sample, so a 50-row samplesheet over one SILVA database
+    // hashes it once.
     def extractor = file("${projectDir}/bin/subspecies_infer.py").text.md5()
-    ch_refs_by_set = ch_refs.map { meta, refs ->
-        def key = [refs.toUriString(), refs.size(), refs.lastModified(), params.fwd_primer,
-                   params.rev_primer, params.primer_mismatches, extractor].join('|')
-        [ "refs_" + key.md5().take(12), meta, refs ]
-    }
+    ch_ref_content = ch_refs
+        .map { meta, refs -> [ refs.toUriString(), refs ] }
+        .unique { it[0] }
+        .map { uri, refs -> [ uri, fileDigest(refs) ] }
+    ch_refs_by_set = ch_refs
+        .map { meta, refs -> [ refs.toUriString(), meta, refs ] }
+        .combine(ch_ref_content, by: 0)
+        .map { uri, meta, refs, digest ->
+            def key = [digest, params.fwd_primer, params.rev_primer,
+                       params.primer_mismatches, extractor].join('|')
+            [ "refs_" + key.md5().take(12), meta, refs ]
+        }
     EXTRACT_AMPLICONS(ch_refs_by_set
         .unique { it[0] }
         .map { set, meta, refs -> [ [ id: set ], refs ] })
@@ -185,20 +209,21 @@ workflow SUPERRESOLUTION_AMPLICON {
         }
     MAPSEQ_CLUSTER(ch_set_src.cluster.map { set, refs, tax, mscluster, d -> [ [ id: set ], refs, tax ] })
     ch_versions = ch_versions.mix(MAPSEQ_CLUSTER.out.versions)
-    // [ set, amplicon dir, fasta, tax, mscluster, database identity ]. The identity names
-    // the FASTA and where its clustering came from, not the clustering's work path, so the
-    // panel key is stable across runs.
+    // [ set, amplicon dir, fasta, tax, mscluster, database identity ]. The identity is the
+    // FASTA's and the clustering's content, so it is the same string whether the
+    // .mscluster shipped beside the FASTA or this run built it -- which is what lets a
+    // bundle built where the clustering happened be reused where it was only copied to.
+    // It also actually checks the clustering, which naming the branch did not.
     ch_sets = ch_set_src.prebuilt
         .map { set, refs, tax, mscluster, d ->
             [ set, d, refs, tax, mscluster,
-              [refs.toUriString(), refs.size(), refs.lastModified(), mscluster.size(),
-               mscluster.lastModified()].join('|') ] }
+              [fileDigest(refs), fileDigest(mscluster)].join('|') ] }
         .mix(ch_set_src.cluster
             .map { set, refs, tax, mscluster, d -> [ set, refs, tax, d ] }
             .join(MAPSEQ_CLUSTER.out.mscluster.map { meta, mscluster -> [ meta.id, mscluster ] })
             .map { set, refs, tax, d, mscluster ->
                 [ set, d, refs, tax, mscluster,
-                  [refs.toUriString(), refs.size(), refs.lastModified(), 'clustered'].join('|') ] })
+                  [fileDigest(refs), fileDigest(mscluster)].join('|') ] })
 
     // Fan the shared results back out to samples by set id. combine, not join: join is
     // 1:1 and would keep one sample per set.
@@ -229,10 +254,13 @@ workflow SUPERRESOLUTION_AMPLICON {
             def id = "panel_${key.take(16)}"
             def members = entries.collect { it[0].id }
             // Strings, not paths: this is written to the bundle's provenance.json, and
-            // --panel_kernel compares it field by field.
+            // --panel_kernel compares it field by field. The panel files go in by content
+            // digest, for the same reason the database does -- a bundle has to survive
+            // being copied to a machine where the panel lives somewhere else.
             def provenance = [
                 matrix_key: id, reference_sha256: rep[4], mapseq_db: rep[5],
-                panel: panel.toString(), panel_taxa: panel_taxa?.toString(), model_identity: rep[3],
+                panel: panel.toString() == 'database' ? 'database' : fileDigest(panel),
+                panel_taxa: panel_taxa ? fileDigest(panel_taxa) : null, model_identity: rep[3],
                 mismapping_method: params.mismapping_method, align_tau: params.align_tau,
                 align_distance_decay: params.align_distance_decay,
                 align_indel_decay: params.align_indel_decay,

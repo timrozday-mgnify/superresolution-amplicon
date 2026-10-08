@@ -192,7 +192,9 @@ SILVA-SSU/138.1/SILVA-SSU-tax.txt            --taxonomy (AAP's sk__/s__ form rea
 
 - A `<fasta>.mscluster` beside the FASTA is used, never rebuilt. Without one, the run
   clusters the FASTA once, cached under `--amplicon_cache`: seconds for a genome
-  collection, hours for 2M sequences.
+  collection, hours for 2M sequences. Either way the database's identity is the FASTA's
+  content digest and the clustering's, so the two routes agree and a kernel built under
+  one is valid under the other.
 - The FASTA must be uncompressed: MAPseq cannot read a gzipped database.
 - MAPseq is given a generated `references.tax`. The tax file changes only MAPseq's
   taxonomy columns, never the hit, which is all the pipeline reads. Lineages come from
@@ -368,7 +370,7 @@ a property of AAP. `--sim_error_model trained` on `merged: true` rows trains on 
 reads themselves, pooled per platform. Position covariates (skiver's `Position(N)`) are not
 among the candidates: the pinned skiver cannot simulate from them.
 | `--sim_n_per_ref` | `5000` | Simulated reads per distinct panel V4 source (sampling depth for the kernel). |
-| `--panel_kernel` | – | A `mismapping/panel_<key>/` directory published by an earlier run. Skips building the kernel: no panel preparation, error-model training, simulation or panel mapping. Refused unless its `provenance.json` names the same extracted amplicons (`reference_sha256`), MAPseq database (`mapseq_db`), `panel` and `panel_taxa` as every sample's. |
+| `--panel_kernel` | – | A `mismapping/panel_<key>/` directory published by an earlier run, possibly on another machine. Skips building the kernel: no panel preparation, error-model training, simulation or panel mapping. Refused unless its `provenance.json` names the same extracted amplicons (`reference_sha256`), MAPseq database (`mapseq_db`), `panel` and `panel_taxa` as every sample's — all compared by content digest, so paths and mtimes may differ. |
 
 In-silico PCR and the mapseq clustering run once per distinct `references` file,
 however many samples name it: 50 samples against one GTDB SSU FASTA extract and
@@ -383,9 +385,39 @@ nextflow run main.nf --input samples.yml --references refs.fasta \
 ```
 
 The run refuses the bundle unless it was built against the same extracted amplicons,
-MAPseq database (the FASTA's path, size and mtime, and its `.mscluster`) and panel. Its
-simulation or alignment settings are not checked, because they are the bundle's own:
-the kernel is used as it was built.
+MAPseq database and panel. Its simulation or alignment settings are not checked, because
+they are the bundle's own: the kernel is used as it was built.
+
+Those three are compared **by content**, not by path: the database FASTA's digest and its
+`.mscluster`'s, the panel's digest, and the extracted amplicons' `reference_sha256`. So a
+bundle is portable — **build the kernel on a cluster and reuse it on a laptop**, where the
+same database sits somewhere else entirely:
+
+```bash
+# on the cluster: cluster the database once, build the kernel
+nextflow run main.nf --input one_sample.yml --references /hps/.../SILVA-SSU.fasta \
+    --panel_references panel.fasta --amplicon_cache /hps/.../cache --outdir prep
+
+# copy prep/mismapping/panel_<key>/ and the database anywhere, then
+nextflow run main.nf --input all_samples.yml --references ~/db/SILVA-SSU.fasta \
+    --panel_kernel panel_<key> --outdir results
+```
+
+**Send the `.mscluster` with the FASTA.** The database's identity covers the clustering's
+bytes, and a run that built the clustering itself and a run that found it beside the FASTA
+agree on that identity — the bytes are hashed, not where they came from. A receiving run
+with no `.mscluster` therefore has to rebuild a byte-identical one. That held on this
+repo's fixtures, but mapseq clusters multi-threaded and nothing promises it at SILVA scale,
+so shipping the file is the reliable route. The failure mode is safe either way: a digest
+that differs is a refusal naming `mapseq_db`, never a kernel quietly used against the
+wrong labels.
+
+Copy the `--amplicon_cache` too and the in-silico PCR and the clustering are both skipped;
+its key is content-based for the same reason, so the same bytes at two paths share one
+entry.
+
+The cost is one streaming SHA-256 per distinct input file per run — seconds on a SILVA
+FASTA, against hours for the clustering it lets you skip.
 
 Read mapping (mapseq):
 
