@@ -444,11 +444,14 @@ nextflow_pipeline {
             // A second run pointed at the same cache skips both tasks ("Stored process").
             def cache = params.amplicon_cache
             def set = file(cache).listFiles()*.name.findAll { it.startsWith('refs_') }
+            // The clustering is keyed by the FASTA's content alone, apart from the primers.
+            def db = file(cache).listFiles()*.name.findAll { it.startsWith('db_') }
             assertAll(
                 { assert workflow.success },
                 { assert set.size() == 1 },
+                { assert db.size() == 1 },
                 { assert path("${cache}/${set[0]}/amplicons/${set[0]}_amplicons/amplicons.fasta").exists() },
-                { assert file("${cache}/${set[0]}").listFiles().any { d ->
+                { assert file("${cache}/${db[0]}").listFiles().any { d ->
                     d.name.startsWith('mapseq_') && new File(d, 'refs.fasta.mscluster').exists() } }
             )
         }

@@ -271,6 +271,24 @@ precompute-once route — build the kernel from the panel, the database and the 
 then apply it to new data later with `--panel_kernel`. With
 `--mismapping_method align` the build needs no reads anywhere in the run.
 
+**Per genome.** A kernel row depends only on its source amplicon and the database, so a
+panel's kernel can be assembled from one-genome bundles. Split the panel with
+`bin/split_panel.py panel.fasta -o genomes/`, give the kernel-only samplesheet one row per
+genome (`panel_references: genomes/<genome>.fasta`), then stack any subset of the
+resulting bundles:
+
+```bash
+build_panel_kernel.py combine --panel panel.fasta --parts results/mismapping/panel_*/ \
+    [--panel-weights weights.tsv] -o panel_bundle/
+```
+
+The result equals the kernel the whole panel builds (`tests/test_panel_combine.py`), and
+its provenance names `panel.fasta`, so `--panel_kernel` accepts it. Under
+`--panel_kernel_only`, a genome the primers cannot amplify gets no bundle, not a failed
+run. `combine` accepts a missing genome only if the parts' primers cannot amplify it.
+Panel weights belong at `combine`, not in the parts. The MAPseq clustering is keyed by
+the FASTA's content alone, so a sweep over primer pairs on one database clusters it once.
+
 Otherwise the one thing reads are still needed for is **training** an error model, so a
 reads-less row is refused under `--sim_error_model trained` unless it has an `error_model`
 (or `--error_model`) of its own. Three ways out, in descending order of accuracy:

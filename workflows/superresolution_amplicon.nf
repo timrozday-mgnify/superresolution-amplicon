@@ -250,7 +250,16 @@ workflow SUPERRESOLUTION_AMPLICON {
             prebuilt: mscluster
             cluster:  true
         }
-    MAPSEQ_CLUSTER(ch_set_src.cluster.map { set, refs, tax, mscluster, d -> [ [ id: set ], refs, tax ] })
+    // Clustered once per FASTA content, not per set: the clustering reads no primer, and
+    // references.tax lists every entry whichever amplified, so a primer sweep over one
+    // database shares one clustering. db_<digest> is its --amplicon_cache key.
+    ch_cluster_src = ch_set_src.cluster
+        .map { set, refs, tax, mscluster, d -> [ refs.toUriString(), set, refs, tax, d ] }
+        .combine(ch_ref_content, by: 0)
+        .map { uri, set, refs, tax, d, digest -> [ "db_" + digest.take(12), set, refs, tax, d ] }
+    MAPSEQ_CLUSTER(ch_cluster_src
+        .unique { it[0] }
+        .map { db, set, refs, tax, d -> [ [ id: db ], refs, tax ] })
     ch_versions = ch_versions.mix(MAPSEQ_CLUSTER.out.versions)
     // [ set, amplicon dir, fasta, tax, mscluster, database identity ]. The identity is the
     // FASTA's and the clustering's content, so it is the same string whether the
@@ -261,10 +270,9 @@ workflow SUPERRESOLUTION_AMPLICON {
         .map { set, refs, tax, mscluster, d ->
             [ set, d, refs, tax, mscluster,
               [fileDigest(refs), fileDigest(mscluster)].join('|') ] }
-        .mix(ch_set_src.cluster
-            .map { set, refs, tax, mscluster, d -> [ set, refs, tax, d ] }
-            .join(MAPSEQ_CLUSTER.out.mscluster.map { meta, mscluster -> [ meta.id, mscluster ] })
-            .map { set, refs, tax, d, mscluster ->
+        .mix(ch_cluster_src
+            .combine(MAPSEQ_CLUSTER.out.mscluster.map { meta, mscluster -> [ meta.id, mscluster ] }, by: 0)
+            .map { db, set, refs, tax, d, mscluster ->
                 [ set, d, refs, tax, mscluster,
                   [fileDigest(refs), fileDigest(mscluster)].join('|') ] })
 
@@ -313,7 +321,8 @@ workflow SUPERRESOLUTION_AMPLICON {
                 sim_error_model: params.sim_error_model,
                 sim_n_per_ref: params.sim_n_per_ref, sim_read_len: params.sim_read_len,
                 sim_read_structure: params.sim_read_structure, sim_mate_len: params.sim_mate_len,
-                primer_mix: params.primer_mix,
+                primer_mix: params.primer_mix, fwd_primer: params.fwd_primer,
+                rev_primer: params.rev_primer, primer_mismatches: params.primer_mismatches,
                 flat_sub_rate: params.flat_sub_rate, flat_ins_rate: params.flat_ins_rate,
                 flat_del_rate: params.flat_del_rate, mapseq_args: params.mapseq_args,
                 mapseq_min_identity: params.mapseq_min_identity, mapseq_tag: params.mapseq_tag,
@@ -354,8 +363,16 @@ workflow SUPERRESOLUTION_AMPLICON {
             params.taxonomy ? file(params.taxonomy, checkIfExists: true) : [],
             panel_weights ?: [])
         ch_versions = ch_versions.mix(PANEL_PREPARE.out.versions)
+        // Empty only under --panel_kernel_only (prepare's --allow-empty): a one-genome
+        // panel these primers cannot amplify. It gets no kernel, and the joins below drop
+        // its preparation with it.
+        ch_panel_sources = PANEL_PREPARE.out.sources.filter { meta, sources ->
+            if (sources.size() > 0) return true
+            log.warn "${meta.members.join(', ')}: no panel genome amplifies; no kernel built"
+            false
+        }
         // [ meta, sources, fasta, tax, mscluster ] against the representative's database.
-        ch_panel_db = PANEL_PREPARE.out.sources
+        ch_panel_db = ch_panel_sources
             .map { meta, sources -> [ meta.db_id, meta, sources ] }
             .combine(ch_db, by: 0)
             .map { db_id, meta, sources, fasta, tax, mscluster -> [ meta, sources, fasta, tax, mscluster ] }
@@ -364,7 +381,7 @@ workflow SUPERRESOLUTION_AMPLICON {
         ch_db_amplicons = ch_panel_groups.map { meta, panel, d, model -> [ meta.id, d.resolve('amplicons.fasta') ] }
         ch_versions = ch_versions.mix(MAPSEQ_PANEL_HOME.out.versions)
         if (params.mismapping_method == 'simulate') {
-            SIMULATE_PANEL_READS(PANEL_PREPARE.out.sources
+            SIMULATE_PANEL_READS(ch_panel_sources
                 .map { meta, sources -> [ meta.id, meta, sources ] }
                 .join(ch_panel_groups.map { meta, panel, d, model -> [ meta.id, model ] })
                 .map { id, meta, sources, model -> [ meta, sources, model ] },

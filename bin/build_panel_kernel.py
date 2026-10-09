@@ -10,6 +10,7 @@
         --home-mseq home.mseq --sim-mseq sim.mseq -o OUT/panel_kernel.npz
     build_panel_kernel.py align --prepared OUT --db-amplicons amplicons.fasta \
         --home-mseq home.mseq --tau 1 --distance-decay 0.007 -o OUT/align_kernel.npz
+    build_panel_kernel.py combine --panel panel.fasta --parts mismapping/panel_*/ -o BUNDLE
 
 ``prepare`` cuts each panel genome's V4 copies, or reuses every V4 group from an extracted
 database, and writes ``sources.fasta`` (one record per distinct amplicon, ``v4g_<sha16>``),
@@ -22,6 +23,9 @@ MAPseq runs outside this script, as the same command used for the observed reads
 the fraction of ``s``'s classified simulated reads MAPseq labels ``l``, and ``home[s]`` the
 label of the error-free source sequence. ``panel_sources.tsv`` next to the kernel lists each
 source's home, its row's top labels and its block (sources whose rows put >= 99% on one label).
+
+``combine`` stacks one-genome bundles (``split_panel.py``, one samplesheet row per genome)
+into a panel's bundle, so each genome is prepared once and any panel of them assembled after.
 """
 from __future__ import annotations
 
@@ -54,10 +58,12 @@ def v4g(seq: str) -> str:
 
 
 def panel_copies(panel: Path, fwd: str, rev: str, max_mismatch: int,
-                 alias: dict[str, str]) -> tuple[dict[str, list[str]], list[str]]:
+                 alias: dict[str, str], allow_empty: bool = False,
+                 ) -> tuple[dict[str, list[str]], list[str]]:
     """(genome -> its amplifiable V4 copies, genomes dropped for having none).
 
-    Copies keep primers cut off and duplicates kept.
+    Copies keep primers cut off and duplicates kept. ``allow_empty`` returns no copies
+    rather than failing when every genome is dropped.
 
     A directory holds ``<genome>.amplicons.fasta`` files; a single FASTA names the genome
     before the first ``|`` of each header. ``alias`` maps a file stem/genome to a genome id.
@@ -86,7 +92,7 @@ def panel_copies(panel: Path, fwd: str, rev: str, max_mismatch: int,
                     len(dropped), len(copies), ", ".join(dropped))
         for g in dropped:
             del copies[g]
-    if not copies:
+    if not copies and not allow_empty:
         raise SystemExit(f"no panel genome in {panel} has an amplifiable V4 copy; "
                          "check the primers, --max-mismatch and the panel references")
     return copies, dropped
@@ -292,7 +298,7 @@ def prepare(a) -> None:
         db_amplicons = a.db_amplicons
         copies, dropped = ({}, []) if not a.panel_amplicons else panel_copies(
             a.panel_amplicons, a.fwd_primer, a.rev_primer, a.max_mismatch,
-            dict(x.split("=", 1) for x in a.alias))
+            dict(x.split("=", 1) for x in a.alias), getattr(a, "allow_empty", False))
         rows = [{"genome_id": g, "source": v4g(seq), "weight": n / len(seqs)}
                 for g, seqs in sorted(copies.items()) for seq, n in Counter(seqs).items()]
         if getattr(a, "panel_weights", None):
@@ -322,9 +328,11 @@ def prepare(a) -> None:
                      for g in groups]
             sequence.update((g, group_seq[g]) for g in groups)
             log.info("taxon entry %s: %d V4 group(s)", entry, len(groups))
-    if not rows:
+    if not rows and not getattr(a, "allow_empty", False):
         raise SystemExit("no panel entry has a source")
-    translation = pd.DataFrame(rows)
+    # Empty under --allow-empty: a one-genome panel these primers cannot amplify. The
+    # workflow drops it at the empty sources.fasta, so it gets no kernel.
+    translation = pd.DataFrame(rows, columns=["genome_id", "source", "weight"])
     sources = (translation.groupby("source").genome_id.agg(";".join).rename("genomes")
                .reset_index())
     sources["in_db"] = True if whole_database else sources.source.isin(set(label_ids))
@@ -615,6 +623,133 @@ def source_table(sources: pd.DataFrame, kernel: sparse.csr_array, home: np.ndarr
     return out
 
 
+# Provenance a combined bundle sets itself; every other field must agree across its parts.
+_PER_PART = {"matrix_key", "panel", "samples"}
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def combine(a) -> None:
+    """Stack one-genome bundles into the bundle for the panel ``--panel``.
+
+    A kernel row is a function of its source's sequence and the database alone, so a
+    panel's kernel is its genomes' rows stacked, a source two genomes share kept once --
+    the kernel the whole panel would have built, without building it. Each genome of
+    ``--panel`` is found among ``--parts`` by the sha256 of its lines as ``split_panel.py``
+    writes them, which is what a part's provenance ``panel`` records, so a part built from
+    another copy of a genome is never picked up. A genome with no part must be one the
+    parts' primers cannot amplify; any other is a part never built, and fails.
+    """
+    import json
+
+    import split_panel
+
+    prov = {d: json.loads((d / "provenance.json").read_text()) for d in a.parts}
+    first = prov[a.parts[0]]
+    for d, p in prov.items():
+        if p.get("panel_taxa") or p.get("panel_weights") or p.get("panel") == "database":
+            raise SystemExit(f"{d}: not a one-genome part (built with panel_taxa, "
+                             "panel_weights or the whole database); give --panel-weights here")
+        if (d / "yield.tsv").exists():
+            raise SystemExit(f"{d}: --sim_read_structure pairs parts cannot be combined")
+        diff = sorted(k for k in (set(p) | set(first)) - _PER_PART
+                      if p.get(k) != first.get(k))
+        if diff:
+            raise SystemExit(f"{d} was built differently from {a.parts[0]}: {', '.join(diff)}")
+    part_of = {p["panel"]: d for d, p in prov.items()}
+
+    chunks = split_panel.genome_chunks(a.panel)
+    chosen = {g: part_of.get(_sha256(c)) for g, c in chunks.items()}
+    missing = sorted(g for g, d in chosen.items() if d is None)
+    if missing:
+        if not first.get("fwd_primer"):
+            raise SystemExit(f"no part for genome(s) {', '.join(missing)}, and the parts name "
+                             "no primers to check that they cannot amplify")
+        _, unamplifiable = panel_copies(a.panel, first["fwd_primer"], first["rev_primer"],
+                                        int(first["primer_mismatches"]), {}, allow_empty=True)
+        unbuilt = sorted(set(missing) - set(unamplifiable))
+        if unbuilt:
+            raise SystemExit(f"no part among --parts for genome(s) {', '.join(unbuilt)}")
+        log.warning("%d genome(s) not amplified by these primers, left out (their reads "
+                    "become `background`): %s", len(missing), ", ".join(missing))
+    chosen = {g: d for g, d in chosen.items() if d is not None}
+    if not chosen:
+        raise SystemExit(f"these primers amplify no genome of {a.panel}")
+
+    kernels = {d: sm.read_kernel(d / "mismapping_matrix.npz") for d in set(chosen.values())}
+    k0 = next(iter(kernels.values()))
+    if any(k.label_ids != k0.label_ids for k in kernels.values()):
+        raise SystemExit("parts were built against different database labels")
+    translation = pd.concat([pd.read_csv(d / "panel_translation.tsv", sep="\t")
+                             for d in chosen.values()], ignore_index=True)
+    if a.panel_weights:
+        translation = pd.DataFrame(override_weights(translation.to_dict("records"),
+                                                    a.panel_weights))
+    # Sorted by source, as prepare writes sources.tsv, and the kernel's rows follow it.
+    sources = (translation.groupby("source").genome_id.agg(";".join).rename("genomes")
+               .reset_index())
+
+    # Each source's row, from the first part holding it: (part, row index).
+    where: dict[str, tuple[Path, int]] = {}
+    for d in chosen.values():
+        for i, s in enumerate(kernels[d].source_ids):
+            where.setdefault(s, (d, i))
+    picks = [where[s] for s in sources.source]
+    kernel = sparse.csr_array(sparse.vstack([kernels[d].kernel[[i]] for d, i in picks]))
+    home = np.array([kernels[d].home[i] for d, i in picks], dtype=np.int64)
+    strata = None
+    if k0.strata is not None:
+        strata = (sparse.vstack([kernels[d].strata[0][[i]] for d, i in picks]), k0.strata[1])
+    row_of = {pick: r for r, pick in enumerate(picks)}
+    neighbours = None
+    if k0.neighbours is not None:
+        n = [(row_of[(d, s)], label, dist) for d, k in kernels.items()
+             for s, label, dist in zip(*k.neighbours) if (d, s) in row_of]
+        neighbours = tuple(np.asarray(c, dtype=np.int64) for c in zip(*n)) if n else (
+            np.zeros(0, np.int64),) * 3
+    per_source = {f: (None if getattr(k0, f) is None else
+                      np.array([getattr(kernels[d], f)[i] for d, i in picks]))
+                  for f in ("n_simulated", "n_unmapped")}
+
+    in_db, identity = {}, {}
+    for d in chosen.values():
+        in_db.update(pd.read_csv(d / "sources.tsv", sep="\t").set_index("source").in_db)
+        identity.update(pd.read_csv(d / "panel_sources.tsv", sep="\t")
+                        .set_index("source").identity_to_home)
+    sources["in_db"] = sources.source.map(in_db)
+
+    genomes = sorted(chosen)
+    weights_digest = _sha256(a.panel_weights.read_bytes()) if a.panel_weights else None
+    panel_digest = _sha256(a.panel.read_bytes())
+    key = _sha256(json.dumps([sorted(prov[d]["matrix_key"] for d in set(chosen.values())),
+                              panel_digest, weights_digest]).encode())
+    provenance = {**{k: v for k, v in first.items() if k not in _PER_PART},
+                  "matrix_key": f"panel_{key[:16]}", "panel": panel_digest,
+                  "panel_taxa": None, "panel_weights": weights_digest, "samples": genomes,
+                  "parts": {g: prov[d]["matrix_key"] for g, d in sorted(chosen.items())}}
+
+    a.out.mkdir(parents=True, exist_ok=True)
+    (a.out / "provenance.json").write_text(json.dumps(provenance) + "\n")
+    translation.to_csv(a.out / "panel_translation.tsv", sep="\t", index=False)
+    sources.to_csv(a.out / "sources.tsv", sep="\t", index=False)
+    if missing:
+        (a.out / "panel_unamplifiable.txt").write_text("".join(f"{g}\n" for g in missing))
+    sm.write_kernel(a.out / "mismapping_matrix.npz", kernel, sources.source.tolist(),
+                    k0.label_ids, home, ref_headers=k0.ref_headers,
+                    label_of_ref=k0.label_of_ref, db_amplicons_sha256=k0.db_amplicons_sha256,
+                    provenance={**k0.provenance, "combined": provenance["parts"]},
+                    strata=strata, neighbours=neighbours, kernel_version=k0.kernel_version,
+                    **per_source)
+    zeros = np.zeros(len(sources), dtype=np.int64)
+    source_table(sources, kernel, home, sources.source.map(identity).to_numpy(), k0.label_ids,
+                 *(zeros if v is None else v for v in per_source.values())).to_csv(
+        a.out / "panel_sources.tsv", sep="\t", index=False, float_format="%.4f")
+    log.info("%d genome part(s) -> %d sources x %d labels in %s", len(chosen), *kernel.shape,
+             a.out)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -640,6 +775,8 @@ def main() -> None:
     p.add_argument("--panel-weights", type=Path,
                    help="TSV genome_id<TAB>source<TAB>weight replacing listed genomes' "
                         "copy-count weights")
+    p.add_argument("--allow-empty", action="store_true",
+                   help="write an empty preparation, not fail, when nothing amplifies")
     p.add_argument("-o", "--out", type=Path, required=True)
     b = sub.add_parser("build")
     b.add_argument("--prepared", type=Path, required=True)
@@ -676,9 +813,17 @@ def main() -> None:
     al.add_argument("--max-postings", type=int, default=4096,
                     help="skip pigeonhole blocks shared by more than this many sequences")
     al.add_argument("-o", "--out", type=Path, required=True)
+    c = sub.add_parser("combine", help="stack one-genome bundles into a panel's bundle")
+    c.add_argument("--panel", type=Path, required=True,
+                   help="the panel FASTA the bundle is for (genome|index|orig headers)")
+    c.add_argument("--parts", type=Path, nargs="+", required=True,
+                   help="one-genome mismapping/panel_<key>/ bundles, one primer pair's")
+    c.add_argument("--panel-weights", type=Path,
+                   help="TSV genome_id<TAB>source<TAB>weight, as prepare's")
+    c.add_argument("-o", "--out", type=Path, required=True)
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    {"prepare": prepare, "build": build, "align": align}[a.cmd](a)
+    {"prepare": prepare, "build": build, "align": align, "combine": combine}[a.cmd](a)
 
 
 if __name__ == "__main__":
