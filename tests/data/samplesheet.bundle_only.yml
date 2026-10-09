@@ -1,0 +1,5 @@
+# OTU reinterpretation over a supplied kernel with no database named: the bundle alone
+# labels the mseq, so the reference FASTA is never needed.
+- id: demo
+  platform: hq-illumina
+  mseq: tests/data/supplied.obs.mseq.gz

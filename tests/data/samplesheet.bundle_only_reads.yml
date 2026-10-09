@@ -1,0 +1,4 @@
+# Reads and no database: a supplied kernel cannot map them without one.
+- id: demo
+  reads: tests/data/sample.fastq.gz
+  platform: hq-illumina
