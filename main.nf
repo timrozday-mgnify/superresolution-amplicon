@@ -120,10 +120,15 @@ workflow {
         [ meta, reads ]
     }
 
+    // A supplied kernel with no database named anywhere: its bundle already maps every
+    // database header to a V4 label, so each row's mseq is reinterpreted without the
+    // database. Naming one keeps the full check of the bundle against it.
+    def bundle_only = params.panel_kernel && !rows.any { it.references ?: params.references }
+
     // [ meta, references_fasta ] — per-sample 'references' overrides the global param.
     ch_refs = ch_rows.map { row ->
         def ref = row.references ?: params.references
-        if (!ref) error "Sample ${row.id}: no references (set samplesheet 'references' or --references)"
+        if (!ref && !bundle_only) error "Sample ${row.id}: no references (set samplesheet 'references' or --references)"
         def meta = [ id: row.id, platform: (row.platform ?: params.platform) ]
         // A supplied genome/taxon panel can reinterpret this sample's database labels. A
         // normal sample instead uses every extracted database V4 group as its panel.
@@ -140,7 +145,7 @@ workflow {
         else {
             meta.panel = 'database'
         }
-        [ meta, resolveFile(ref.toString()) ]
+        [ meta, ref ? resolveFile(ref.toString()) : [] ]
     }
 
     // [ id, model_pt ] for samples supplying a pre-trained error model.
@@ -153,5 +158,5 @@ workflow {
     def trained_scope = params.trained_error_model_scope
         ?: (rows.any { it.merged?.toString() == 'true' } ? 'pooled' : 'per-sample')
 
-    SUPERRESOLUTION_AMPLICON(ch_reads, ch_refs, ch_pretrained, trained_scope)
+    SUPERRESOLUTION_AMPLICON(ch_reads, ch_refs, ch_pretrained, trained_scope, bundle_only)
 }

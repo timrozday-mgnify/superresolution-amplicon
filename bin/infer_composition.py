@@ -35,6 +35,7 @@ _HERE = Path(__file__).resolve().parent
 import sys
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
+import presence_evidence as pe  # noqa: E402  (needs sys.path)
 import subspecies_infer as si  # noqa: E402  (needs sys.path)
 import sparse_matrix as sm  # noqa: E402  (needs sys.path)
 
@@ -423,6 +424,14 @@ def run(a) -> None:
     fit_status = "low_depth" if low_depth else "ok"
     out = a.output_dir
     out.mkdir(parents=True, exist_ok=True)
+    c.source_reads.assign(sample=a.sample_id).to_csv(out / "panel_source_reads.csv", index=False)
+    if c.neighbours is not None:
+        # Presence evidence from the reads on each member's own amplicons; needs the
+        # neighbourhood an align kernel stores, to expect sequencing-error spill-over.
+        evidence, calibration = pe.evaluate(a.sample_id, c.counts, c.table, c.source_home,
+                                            (c.source_ids, *c.neighbours))
+        evidence.assign(**{k: v for k, v in calibration.items() if k != "sample"}).to_csv(
+            out / "presence_evidence.csv", index=False)
     # Report per entry. Interval ends come from summed draws, not summed member intervals;
     # members are independent under the mean-field presence guide, so an entry is present
     # unless every member is absent.
@@ -560,7 +569,15 @@ def _panel_context(kernel_path: Path, amplicon_dir: Path, obs_mseq, min_identity
         strata = (fitted_distances, k.strata[1])
     fitted_home = np.append(sub_home, u)
     y = np.concatenate([counts[explained], np.zeros(n_sink), [counts[unexplained].sum()]])
+    # Reads on each panel source's home label next to its copy weight: the observed copy
+    # ratios, which a wrong reference copy structure shows up in before any fit does.
+    source_home = dict(zip(k.source_ids, k.home.tolist()))
+    source_reads = table.assign(
+        home_label=[k.label_ids[source_home[s]] for s in table.source],
+        reads=[int(counts[source_home[s]]) for s in table.source])
     return SimpleNamespace(
+        source_reads=source_reads, counts=counts, table=table, source_home=source_home,
+        source_ids=k.source_ids, neighbours=k.neighbours,
         fitted=fitted, home=fitted_home, y=y, genome_of_row=genome_of_row, weight=weight,
         strata=strata, method=k.provenance.get("method", "simulate"),
         genomes=panel_genomes + ["background"], entries=entries, entry_of=entry_of,

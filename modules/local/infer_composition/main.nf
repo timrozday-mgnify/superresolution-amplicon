@@ -17,6 +17,8 @@ process INFER_COMPOSITION {
     tuple val(meta), path("${meta.id}.ambiguity_sets.csv"),  optional: true, emit: ambiguity_sets
     tuple val(meta), path("${meta.id}.lca_composition.csv"), optional: true, emit: lca_composition
     tuple val(meta), path("${meta.id}.inferred_panel_members.csv"), optional: true, emit: panel_members
+    tuple val(meta), path("${meta.id}.panel_source_reads.csv"), emit: source_reads
+    tuple val(meta), path("${meta.id}.presence_evidence.csv"), optional: true, emit: presence_evidence
     path "versions.yml",                                             emit: versions
 
     when:
@@ -42,6 +44,8 @@ process INFER_COMPOSITION {
     cp out/inferred_composition.csv  ${prefix}.inferred_composition.csv
     cp out/inference_diagnostics.csv ${prefix}.inference_diagnostics.csv
     cp out/posterior_draws.npz       ${prefix}.posterior_draws.npz
+    cp out/panel_source_reads.csv    ${prefix}.panel_source_reads.csv
+    [ -f out/presence_evidence.csv ] && cp out/presence_evidence.csv ${prefix}.presence_evidence.csv || true
     [ -f out/loss_trace.csv ] && cp out/loss_trace.csv ${prefix}.loss_trace.csv || true
     [ -f out/ambiguity_pairs.csv ] && cp out/ambiguity_pairs.csv ${prefix}.ambiguity_pairs.csv || true
     [ -f out/ambiguity_sets.csv ] && cp out/ambiguity_sets.csv ${prefix}.ambiguity_sets.csv || true
@@ -60,6 +64,7 @@ process INFER_COMPOSITION {
     echo 'sample,genome_id,observed_rel_abundance,inferred_mean,inferred_lo,inferred_hi,presence_prob' > ${prefix}.inferred_composition.csv
     echo 'sample,mode,likelihood,n_reads,mismapping_group_id,mismapping_matrix_path' > ${prefix}.inference_diagnostics.csv
     touch ${prefix}.posterior_draws.npz
+    echo 'genome_id,source,weight,home_label,reads,sample' > ${prefix}.panel_source_reads.csv
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":

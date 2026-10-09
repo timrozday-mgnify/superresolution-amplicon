@@ -163,6 +163,10 @@ def test_panel_inference_recovers_genomes_and_background(tmp_path: Path) -> None
     assert d.n_labels_observed == 4 and d.n_labels_unexplained == 1
     assert np.isclose(d.observed_unexplained_fraction, 0.1)
     assert np.isclose(d.unexplained_fraction, got.background)
+    # Each source's home-label reads, beside its copy weight: the observed copy ratios.
+    reads = pd.read_csv(out / "panel_source_reads.csv")
+    assert reads.set_index("genome_id").reads.to_dict() == {"gA": 3500, "gB": 3600, "gC": 3500}
+    assert set(reads.home_label) == {"l0", "l2"} and set(reads["sample"]) == {"S"}
 
 
 def test_panel_align_kernel_redecays_exactly_and_fits_a_latent_decay(tmp_path: Path) -> None:
@@ -195,6 +199,8 @@ def test_panel_align_kernel_redecays_exactly_and_fits_a_latent_decay(tmp_path: P
     K, dist = k.kernel.toarray(), k.strata[0].toarray()
     assert np.allclose(K[0, lab], [1 / 1.1, 0.1 / 1.1, 0]) and np.allclose(K[1, lab], [0, 0, 1])
     assert dist[0, lab[1]] == 1 and k.strata[1] == 0.1 and k.home.tolist() == [lab[0], lab[2]]
+    # The stored neighbourhood: a is one edit from B, d one edit from C (its home).
+    assert set(zip(*map(np.ndarray.tolist, k.neighbours))) == {(0, lab[1], 1), (1, lab[2], 1)}
 
     r, s, c = torch.tensor([0.6, 0.4]), torch.tensor(0.8), torch.tensor(0.3)
     redecayed = np.where(K > 0, K * (0.3 / 0.1) ** dist, 0.0)
@@ -225,6 +231,9 @@ def test_panel_align_kernel_redecays_exactly_and_fits_a_latent_decay(tmp_path: P
     assert abs(comp.gX - 0.6) < 0.03 and abs(comp.gY - 0.4) < 0.03, comp
     diag = pd.read_csv(out / "inference_diagnostics.csv").iloc[0]
     assert diag.infer_distance_decay and diag.kernel_method == "align" and diag.distance_decay > 0
+    # The kernel stores a neighbourhood, so inference also writes presence evidence.
+    evidence = pd.read_csv(out / "presence_evidence.csv").set_index("genome_id")
+    assert set(evidence.index) == {"gX", "gY"} and (evidence.status == "present").all()
     fit_json = tmp_path / "fit.json"
     fit.run(SimpleNamespace(
         composition=out / "inferred_composition.csv", posterior_draws=out / "posterior_draws.npz",
@@ -233,6 +242,41 @@ def test_panel_align_kernel_redecays_exactly_and_fits_a_latent_decay(tmp_path: P
         output=fit_json))
     import json
     assert json.loads(fit_json.read_text())["fit_status"] == "ok", fit_json.read_text()
+
+
+def test_an_exact_home_tie_keeps_the_source_s_own_group(tmp_path: Path) -> None:
+    """MAPseq's home for an exact source can be a tie it broke towards another group (a
+    reference with Ns scores 1 against everything it covers). An exact hit off the
+    source's own group goes back to it; a relabel below identity 1 stands."""
+    import build_panel_kernel as bpk
+
+    a, b = bpk.v4g(A), bpk.v4g(B)
+    db = _amplicons(tmp_path / "amplicons.fasta")
+    headers, label_ids, label_of_ref, _ = bpk.db_groups(db)
+    label_of_hit = dict(zip(headers, label_of_ref.tolist()))
+    own = {label: i for i, label in enumerate(label_ids)}
+    tie = tmp_path / "tie.mseq"
+    tie.write_text(f"{a}\tg4|0|C\t250\t1.0\n{b}\tg1|0|A\t250\t0.996\n")
+    home, identity = bpk._home_labels(tie, {a: 0, b: 1}, label_of_hit, own)
+    assert home.tolist() == [own[a], own[a]] and identity.tolist() == [1.0, 0.996]
+
+
+def test_panel_weights_override_replaces_a_genome_s_copy_weights(tmp_path: Path) -> None:
+    """A measured copy structure replaces a listed genome's weights (0 drops a source,
+    the rest renormalise); unlisted genomes keep theirs; a foreign source is refused."""
+    import build_panel_kernel as bpk
+
+    rows = [{"genome_id": "vp", "source": s, "weight": w}
+            for s, w in (("b9af", 0.25), ("90a5", 0.5), ("6b90", 0.25))]
+    rows.append({"genome_id": "other", "source": "aaaa", "weight": 1.0})
+    weights = tmp_path / "w.tsv"
+    weights.write_text("# measured\ngenome_id\tsource\tweight\nvp\tb9af\t3\nvp\t6b90\t1\n"
+                       "vp\t90a5\t0\n")
+    got = {(r["genome_id"], r["source"]): r["weight"] for r in bpk.override_weights(rows, weights)}
+    assert got == {("other", "aaaa"): 1.0, ("vp", "b9af"): 0.75, ("vp", "6b90"): 0.25}
+    weights.write_text("genome_id\tsource\tweight\nvp\taaaa\t1\n")
+    with pytest.raises(SystemExit, match="not an extracted amplicon"):
+        bpk.override_weights(rows, weights)
 
 
 def test_panel_align_candidate_probes_and_auto_decay(monkeypatch) -> None:

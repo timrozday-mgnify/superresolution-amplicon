@@ -16,8 +16,10 @@ process MATRIX_KEY {
     script:
     def settings = [
         // Must equal sparse_matrix.KERNEL_VERSION (tests/test_measured_mismapping.py checks).
-        kernel_version: 2,
+        kernel_version: 3,
         panel: meta.panel ?: 'database', panel_taxa: meta.panel_taxa ?: '',
+        // ponytail: keyed by path, like the panel; provenance carries its content digest.
+        panel_weights: params.panel_weights ?: '',
         panel_taxon_max_sources: params.panel_taxon_max_sources,
         mismapping_method: params.mismapping_method,
         align_tau: params.align_tau,

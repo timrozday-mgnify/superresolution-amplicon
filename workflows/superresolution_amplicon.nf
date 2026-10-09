@@ -41,9 +41,14 @@ workflow SUPERRESOLUTION_AMPLICON {
     ch_refs       // [ meta, references_fasta ]
     ch_pretrained // retained for the public workflow signature
     trained_scope // 'per-sample' | 'pooled': params.trained_error_model_scope, resolved in main.nf
+    bundle_only   // --panel_kernel with no database named: the bundle alone labels each mseq
 
     main:
     ch_versions = Channel.empty()
+    // A measured copy structure overriding panel weights changes the panel translation, so
+    // its content is part of the bundle's identity, like the panel FASTA's.
+    def panel_weights = params.panel_weights ? file(params.panel_weights, checkIfExists: true) : null
+    def weights_digest = panel_weights ? fileDigest(panel_weights) : null
 
     // Error model: only the read simulator uses it, so the whole skiver training
     // subworkflow is skipped under the flat model. [ id, model_pt ] either way.
@@ -149,6 +154,44 @@ workflow SUPERRESOLUTION_AMPLICON {
                 .mix(ch_supplied_model)
         }
     }
+
+    if (bundle_only) {
+        // The kernel carries the database's header -> V4 label map and the bundle the
+        // panel translation, which is everything inference reads, so the database is
+        // never extracted, clustered or opened. Only the panel is checked here, by
+        // content; the database is checked hit by hit in INFER_COMPOSITION, whose
+        // n_foreign_hits counts the hits the kernel's database does not hold.
+        def kdir = file(params.panel_kernel, checkIfExists: true)
+        ['mismapping_matrix.npz', 'panel_translation.tsv', 'sources.tsv', 'provenance.json'].each {
+            if (!kdir.resolve(it).exists()) {
+                error "--panel_kernel ${kdir} is not a mismapping/panel_<key>/ bundle: no ${it}"
+            }
+        }
+        def supplied = new groovy.json.JsonSlurper().parseText(kdir.resolve('provenance.json').text)
+        ch_sample_meta = ch_refs.map { meta, refs ->
+            def mine = [panel: meta.panel.toString() == 'database' ? 'database' : fileDigest(meta.panel),
+                        panel_taxa: meta.panel_taxa ? fileDigest(meta.panel_taxa) : null,
+                        panel_weights: weights_digest]
+            def diff = mine.findAll { k, v -> supplied[k]?.toString() != v?.toString() }
+            if (diff) {
+                error "--panel_kernel ${kdir} was built for a different " +
+                      diff.collect { k, v -> "${k} (${supplied[k]}, not ${v})" }.join(', ') +
+                      " than sample ${meta.id}"
+            }
+            [ meta.id, meta ]
+        }
+        ch_mismapping = ch_reads.map { meta, reads ->
+            if (!meta.mseq) {
+                error "Sample ${meta.id}: with no --references, --panel_kernel can only " +
+                      "reinterpret a supplied 'mseq'; mapping reads needs the database"
+            }
+            [ meta.id, kdir, kdir.resolve('mismapping_matrix.npz'), supplied.matrix_key ]
+        }
+        ch_amplicons = Channel.empty()
+        ch_panel_kernel = Channel.empty()
+        ch_db = Channel.empty()
+    }
+    else {
 
     // In-silico PCR -> the V4 amplicons (+ translation table T), then the FASTA's mapseq
     // clustering: once per distinct reference FASTA, however many samples name it. At GTDB
@@ -260,7 +303,8 @@ workflow SUPERRESOLUTION_AMPLICON {
             def provenance = [
                 matrix_key: id, reference_sha256: rep[4], mapseq_db: rep[5],
                 panel: panel.toString() == 'database' ? 'database' : fileDigest(panel),
-                panel_taxa: panel_taxa ? fileDigest(panel_taxa) : null, model_identity: rep[3],
+                panel_taxa: panel_taxa ? fileDigest(panel_taxa) : null,
+                panel_weights: weights_digest, model_identity: rep[3],
                 mismapping_method: params.mismapping_method, align_tau: params.align_tau,
                 align_distance_decay: params.align_distance_decay,
                 align_indel_decay: params.align_indel_decay,
@@ -292,7 +336,7 @@ workflow SUPERRESOLUTION_AMPLICON {
         }
         def supplied = new groovy.json.JsonSlurper().parseText(kdir.resolve('provenance.json').text)
         ch_panel_kernel = ch_panel_groups.map { meta, panel, d, model ->
-            def diff = ['reference_sha256', 'mapseq_db', 'panel', 'panel_taxa'].findAll { k ->
+            def diff = ['reference_sha256', 'mapseq_db', 'panel', 'panel_taxa', 'panel_weights'].findAll { k ->
                 supplied[k]?.toString() != meta.provenance[k]?.toString() }
             if (diff) {
                 error "--panel_kernel ${kdir} was built for a different " +
@@ -307,7 +351,8 @@ workflow SUPERRESOLUTION_AMPLICON {
             ch_panel_groups.map { meta, panel, d, model ->
                 [ meta, panel == 'database' ? [] : panel ?: [], meta.panel_taxa ?: [],
                   d.resolve('amplicons.fasta'), d ] },
-            params.taxonomy ? file(params.taxonomy, checkIfExists: true) : [])
+            params.taxonomy ? file(params.taxonomy, checkIfExists: true) : [],
+            panel_weights ?: [])
         ch_versions = ch_versions.mix(PANEL_PREPARE.out.versions)
         // [ meta, sources, fasta, tax, mscluster ] against the representative's database.
         ch_panel_db = PANEL_PREPARE.out.sources
@@ -369,6 +414,8 @@ workflow SUPERRESOLUTION_AMPLICON {
         .flatMap { meta, kdir -> meta.members.collect { member ->
             [ member, kdir, kdir.resolve('mismapping_matrix.npz'), meta.matrix_key ]
         } }
+    ch_sample_meta = ch_amplicons.map { meta, d -> [ meta.id, meta ] }
+    }
 
     // Real reads -> fasta -> mapseq -> the observed per-reference counts.
     // A sample carrying `mseq:` in the samplesheet supplies that classification instead
@@ -409,8 +456,7 @@ workflow SUPERRESOLUTION_AMPLICON {
         .mix(ch_obs.supplied.map { meta, reads -> [ meta.id, meta.mseq ] })
 
     // INFER_COMPOSITION: amplicon dir + canonical matrix + observed mseq, joined by id.
-    ch_infer_in = ch_amplicons
-        .map { meta, d -> [ meta.id, meta ] }
+    ch_infer_in = ch_sample_meta
         .join(ch_mismapping)
         .join(ch_obs_mseq)
         .map { id, meta, d, matrix, matrix_key, obs -> [ meta, d, matrix, obs, matrix_key ] }

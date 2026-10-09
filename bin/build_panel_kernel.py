@@ -170,15 +170,59 @@ def taxon_members(taxa: list[tuple[str, str]], headers: list[str], label_ids: li
     return members
 
 
-def _home_labels(home_mseq: Path, src: dict[str, int], label_of_hit: dict[str, int]):
-    """Each source's MAPseq label (-1 when unhit) and identity, from the sources' own mapping."""
+def _home_labels(home_mseq: Path, src: dict[str, int], label_of_hit: dict[str, int],
+                 own: dict[str, int]):
+    """Each source's MAPseq label (-1 when unhit) and identity, from the sources' own mapping.
+
+    An exact hit (identity 1) on a label other than the source's own V4 group is a tie
+    MAPseq broke, not a relabel: both references match every base it scored. It breaks
+    them badly when one carries Ns -- a draft genome's assembly gap inside V4 extracts a
+    malformed singleton group that scores 1 against everything it covers, and won
+    S. salivarius's home away from the 4,867 references real reads land on. So an exact
+    tie keeps the source's own group whenever the database has it. A relabel below
+    identity 1 (2acb -> 81c3 at 0.996) is what MAPseq does to real reads too, and stands.
+    """
     home = np.full(len(src), -1, dtype=np.int64)
     identity = np.full(len(src), np.nan)
     for query, hit, hit_identity in _mseq_rows(home_mseq):
         if query in src and hit in label_of_hit:
             home[src[query]] = label_of_hit[hit]
             identity[src[query]] = float(hit_identity)
+    for source, i in src.items():
+        if identity[i] == 1.0 and source in own and home[i] != own[source]:
+            log.info("%s: exact MAPseq tie on %d; keeping its own group", source, home[i])
+            home[i] = own[source]
     return home, identity
+
+
+def override_weights(rows: list[dict], path: Path) -> list[dict]:
+    """Replace listed genomes' copy-count weights with a measured copy structure.
+
+    ``path`` is a TSV ``genome_id<TAB>source<TAB>weight``. A genome it lists keeps only
+    the sources it names, weighted as given and renormalised to 1; a weight of 0 drops
+    that source from the genome. Every named source must be one of the genome's own
+    extracted amplicons, so a typo or a stale v4g id fails rather than inventing one.
+    It exists for a member whose reference genome's copies disagree with the cultured
+    strain's, as reads show it -- V. parvula DSM 2008 on CP001820 has 1:2:1, every
+    Nov2025 sample 3:1:0.
+    """
+    override = pd.read_csv(path, sep="\t", comment="#")
+    if not {"genome_id", "source", "weight"} <= set(override.columns):
+        raise SystemExit(f"{path}: needs columns genome_id, source, weight")
+    own = defaultdict(set)
+    for row in rows:
+        own[row["genome_id"]].add(row["source"])
+    bad = [f"{g}:{s}" for g, s in zip(override.genome_id, override.source) if s not in own[g]]
+    if bad:
+        raise SystemExit(f"{path}: not an extracted amplicon of that genome: {', '.join(bad)}")
+    if (override.weight < 0).any() or (override.groupby("genome_id").weight.sum() <= 0).any():
+        raise SystemExit(f"{path}: weights must be non-negative, with a positive total per genome")
+    listed = set(override.genome_id)
+    total = override.groupby("genome_id").weight.sum()
+    log.info("panel weights overridden for: %s", ", ".join(sorted(listed)))
+    return [r for r in rows if r["genome_id"] not in listed] + [
+        {"genome_id": g, "source": s, "weight": w / total[g]}
+        for g, s, w in zip(override.genome_id, override.source, override.weight) if w > 0]
 
 
 def _read_taxa(path: Path) -> list[tuple[str, str]]:
@@ -251,6 +295,8 @@ def prepare(a) -> None:
             dict(x.split("=", 1) for x in a.alias))
         rows = [{"genome_id": g, "source": v4g(seq), "weight": n / len(seqs)}
                 for g, seqs in sorted(copies.items()) for seq, n in Counter(seqs).items()]
+        if getattr(a, "panel_weights", None):
+            rows = override_weights(rows, a.panel_weights)
         sequence = {v4g(s): s for seqs in copies.values() for s in seqs}
         taxa = _read_taxa(a.panel_taxa) if a.panel_taxa else []
 
@@ -316,7 +362,8 @@ def build(a) -> None:
     headers, label_ids, label_of_ref, _ = db_groups(a.db_amplicons)
     label_of_hit = dict(zip(headers, label_of_ref.tolist()))
 
-    home, home_identity = _home_labels(a.home_mseq, src, label_of_hit)
+    home, home_identity = _home_labels(a.home_mseq, src, label_of_hit,
+                                       {label: i for i, label in enumerate(label_ids)})
     if (home < 0).any():
         raise SystemExit("no home label (no database hit) for source(s): "
                          + ", ".join(np.asarray(source_ids)[home < 0]))
@@ -408,7 +455,7 @@ def align(a) -> None:
     own = {label: i for i, label in enumerate(label_ids)}
     if a.home_mseq:
         home, home_identity = _home_labels(a.home_mseq, src,
-                                           dict(zip(headers, label_of_ref.tolist())))
+                                           dict(zip(headers, label_of_ref.tolist())), own)
     else:
         home = np.array([own.get(s, -1) for s in source_ids], dtype=np.int64)
         home_identity = np.where(home >= 0, 1.0, np.nan)
@@ -500,6 +547,8 @@ def align(a) -> None:
                                      shape=shape)
         distances.data -= 1.0
         strata = (distances, a.distance_decay)
+    neighbours = _neighbours(ka, unique_sequences, source_rows, len(label_ids),
+                             max_ambiguous_bases, max_postings)
     provenance = {"method": "align", "prepared": str(a.prepared), "tau": a.tau,
                   "distance_decay": a.distance_decay, "indel_decay": a.indel_decay,
                   "ambiguity_weight": a.ambiguity_weight,
@@ -508,12 +557,40 @@ def align(a) -> None:
     sm.write_kernel(a.out, kernel, source_ids, label_ids, home, ref_headers=headers,
                     label_of_ref=label_of_ref,
                     db_amplicons_sha256=hashlib.sha256(a.db_amplicons.read_bytes()).hexdigest(),
-                    provenance=provenance, strata=strata)
+                    provenance=provenance, strata=strata, neighbours=neighbours)
     zeros = np.zeros(len(source_ids), dtype=np.int64)
     source_table(sources, kernel, home, home_identity, label_ids, zeros, zeros).to_csv(
         a.out.with_name("panel_sources.tsv"), sep="\t", index=False, float_format="%.4f")
     log.info("align kernel tau=%d c=%g: %d sources x %d labels, %d nonzeros", a.tau,
              a.distance_decay, *kernel.shape, kernel.nnz)
+
+
+# Edit radius of the neighbourhood stored beside an align kernel. Sequencing-error
+# spill-over onto a label falls ~10x per edit (Nov2025: 0.02-2.5% of the parent's reads at
+# one edit), so two edits covers every neighbour that can hold a parent's errors.
+NEIGHBOUR_TAU = 2
+
+
+def _neighbours(ka, sequences: list[str], source_rows: dict[int, list[int]], n_labels: int,
+                max_ambiguous_bases: int, max_postings: int):
+    """``(source row, label, distance)`` for every database label 1..NEIGHBOUR_TAU edits
+    from a panel source: where its sequencing errors land. Independent of the kernel's
+    own --tau, which decides what the fit models, not what the evidence must expect."""
+    rows, labels, dists = [], [], []
+    pairs = ka.pigeonhole_candidates(sequences, NEIGHBOUR_TAU, max_ambiguous_bases,
+                                     max_postings, probes=np.fromiter(source_rows, np.int64))
+    for left, right in pairs:
+        for probe, label in ((left, right), (right, left)):
+            if probe not in source_rows or label >= n_labels:
+                continue
+            d = ka.bounded_iupac_distance(sequences[probe], sequences[label], NEIGHBOUR_TAU)
+            if 1 <= d <= NEIGHBOUR_TAU:
+                for row in source_rows[probe]:
+                    rows.append(row)
+                    labels.append(int(label))
+                    dists.append(d)
+    log.info("%d source-to-label neighbour pair(s) within %d edits", len(rows), NEIGHBOUR_TAU)
+    return np.asarray(rows), np.asarray(labels), np.asarray(dists)
 
 
 def source_table(sources: pd.DataFrame, kernel: sparse.csr_array, home: np.ndarray,
@@ -560,6 +637,9 @@ def main() -> None:
     p.add_argument("--max-mismatch", type=int, default=2)
     p.add_argument("--alias", action="append", default=[],
                    help="file_stem=genome_id (repeatable)")
+    p.add_argument("--panel-weights", type=Path,
+                   help="TSV genome_id<TAB>source<TAB>weight replacing listed genomes' "
+                        "copy-count weights")
     p.add_argument("-o", "--out", type=Path, required=True)
     b = sub.add_parser("build")
     b.add_argument("--prepared", type=Path, required=True)

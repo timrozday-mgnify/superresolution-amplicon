@@ -26,7 +26,7 @@ from scipy import sparse
 
 # Bump whenever the alignment kernel's definition changes; MATRIX_KEY hashes it too
 # (modules/local/matrix_key/main.nf), so a stale kernel is never silently reused.
-KERNEL_VERSION = 2
+KERNEL_VERSION = 3
 
 
 def _stored_version(archive) -> int:
@@ -79,12 +79,15 @@ def write_kernel(path: Path, kernel: sparse.csr_array, source_ids: list[str],
                  label_of_ref: np.ndarray | None = None, db_amplicons_sha256: str = "",
                  n_simulated: np.ndarray | None = None, n_unmapped: np.ndarray | None = None,
                  provenance: dict | None = None, strata=None,
+                 neighbours: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
                  kernel_version: int = KERNEL_VERSION) -> None:
     """Write a sources x labels kernel with each source's home label.
 
     ``n_simulated``/``n_unmapped`` are per source and optional; ``provenance`` is any
     JSON-serialisable record of the build (error model, rates, reads per source, seed).
-    ``strata`` is an alignment kernel's ``(distances, decay)``.
+    ``strata`` is an alignment kernel's ``(distances, decay)``. ``neighbours`` is
+    ``(source, label, distance)``: every database label a few edits from each source,
+    which the presence evidence needs to expect sequencing-error spill-over.
     """
     kernel = kernel.tocsr()
     per_source = {"n_simulated": n_simulated, "n_unmapped": n_unmapped}
@@ -105,6 +108,9 @@ def write_kernel(path: Path, kernel: sparse.csr_array, source_ids: list[str],
         kernel_version=np.int64(kernel_version),
         **_strata_arrays(kernel, strata),
         **{k: np.asarray(v, dtype=np.int64) for k, v in per_source.items() if v is not None},
+        **({} if neighbours is None else {
+            f"neighbour_{name}": np.asarray(v, dtype=np.int64)
+            for name, v in zip(("source", "label", "distance"), neighbours)}),
     )
 
 
@@ -132,6 +138,9 @@ def read_kernel(path: Path) -> SimpleNamespace:
                 kernel_version=_stored_version(archive),
                 **{f: archive[f] if f in archive else None
                    for f in ("n_simulated", "n_unmapped")},
+                neighbours=(tuple(archive[f"neighbour_{n}"].astype(np.int64)
+                                  for n in ("source", "label", "distance"))
+                            if "neighbour_source" in archive else None),
             )
     except (KeyError, OSError, ValueError) as exc:
         raise ValueError(f"invalid rectangular mis-mapping kernel {path}") from exc

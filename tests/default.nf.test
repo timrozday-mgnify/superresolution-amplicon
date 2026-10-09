@@ -202,6 +202,46 @@ nextflow_pipeline {
         }
     }
 
+    test("a supplied kernel with no database reinterprets an mseq from the bundle alone - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                // panel_kernel_other names a database nothing here matches: with no
+                // --references it is never compared, because nothing reads the database.
+                input        = "${projectDir}/tests/data/samplesheet.bundle_only.yml"
+                outdir       = "$outputDir"
+                panel_kernel = "${projectDir}/tests/data/panel_kernel_other"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.tasks().collect { it.name.split(' ')[0].tokenize(':')[-1] }.unique().sort() ==
+                         ['CHECK_COMPOSITION_FIT', 'INFER_COMPOSITION'] },
+                { assert path("${params.outdir}/composition/demo/demo.inferred_composition.csv").exists() }
+            )
+        }
+    }
+
+    test("a supplied kernel with no database refuses a row it would have to map - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input        = "${projectDir}/tests/data/samplesheet.bundle_only_reads.yml"
+                outdir       = "$outputDir"
+                panel_kernel = "${projectDir}/tests/data/panel_kernel_other"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.failed },
+                { assert workflow.stdout.any { it.contains("can only reinterpret a supplied 'mseq'") } }
+            )
+        }
+    }
+
     test("taxa-only and mixed panels each get their own panel kernel - stub") {
         tag "stub"
         options "-stub"
