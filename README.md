@@ -264,9 +264,16 @@ nextflow run . --input samplesheet.yml \
   panel_references: panel.fasta
 ```
 
-The one thing reads are still needed for is **training** an error model, so a reads-less
-row is refused under `--sim_error_model trained` unless it has an `error_model` (or
-`--error_model`) of its own. Three ways out, in descending order of accuracy:
+If the kernel is all you want, **`--panel_kernel_only`** drops the requirement
+altogether: the row needs neither `reads` nor `mseq`, nothing is mapped or inferred, and
+the published `mismapping/panel_<key>/` bundle is the whole product. That is the
+precompute-once route — build the kernel from the panel, the database and the primers,
+then apply it to new data later with `--panel_kernel`. With
+`--mismapping_method align` the build needs no reads anywhere in the run.
+
+Otherwise the one thing reads are still needed for is **training** an error model, so a
+reads-less row is refused under `--sim_error_model trained` unless it has an `error_model`
+(or `--error_model`) of its own. Three ways out, in descending order of accuracy:
 
 1. **A pre-trained model.** Train once from one run's reads — `--sim_error_model trained
    --trained_error_model_scope pooled` writes a pooled per-platform model — then pass that
@@ -370,6 +377,7 @@ a property of AAP. `--sim_error_model trained` on `merged: true` rows trains on 
 reads themselves, pooled per platform. Position covariates (skiver's `Position(N)`) are not
 among the candidates: the pinned skiver cannot simulate from them.
 | `--sim_n_per_ref` | `5000` | Simulated reads per distinct panel V4 source (sampling depth for the kernel). |
+| `--panel_kernel_only` | `false` | Build the panel kernel and stop. The kernel is a property of the panel amplicons, the MAPseq database, the primers and the mismapping method — no sample's data enters it — so it can be precomputed once and applied to new data later with `--panel_kernel`. In this mode a samplesheet row needs neither `reads` nor `mseq`: it names only the reference set and panel to build against, and no observed mapping, inference or fit check runs. Refused together with `--panel_kernel`. Pair with `--mismapping_method align` for a build that needs no reads anywhere. |
 | `--panel_kernel` | – | A `mismapping/panel_<key>/` directory published by an earlier run, possibly on another machine. Skips building the kernel: no panel preparation, error-model training, simulation or panel mapping. Refused unless its `provenance.json` names the same extracted amplicons (`reference_sha256`), MAPseq database (`mapseq_db`), `panel` and `panel_taxa` as every sample's — all compared by content digest, so paths and mtimes may differ. |
 
 In-silico PCR and the mapseq clustering run once per distinct `references` file,

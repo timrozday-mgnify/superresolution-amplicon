@@ -26,6 +26,9 @@ workflow {
         error "Samplesheet ${params.input} must be a YAML list of samples (or a map with 'samples:')"
     }
 
+    if (params.panel_kernel_only && params.panel_kernel) {
+        error "--panel_kernel_only builds a kernel; --panel_kernel reuses one. Pick one."
+    }
     if (!(params.sim_read_structure in ['merged', 'pairs'])) {
         error "--sim_read_structure must be 'merged' or 'pairs'"
     }
@@ -38,7 +41,8 @@ workflow {
     // Whether this run has to train an error model from reads. Only the `simulate`
     // kernel's `trained` model reads a FASTQ at all; a supplied kernel, `align` and the
     // flat model each take the reads channel for its meta and drop the files.
-    def trains_a_model = !params.panel_kernel && params.mismapping_method != 'align' &&
+    def trains_a_model = !params.panel_kernel && !params.panel_kernel_only &&
+                         params.mismapping_method != 'align' &&
                          params.sim_error_model != 'flat'
 
     // [ meta, [ reads ] ]
@@ -77,7 +81,7 @@ workflow {
                       "--mismapping_method align, or --panel_kernel."
             }
         }
-        else {
+        else if (!params.panel_kernel_only) {
             error "Sample ${row.id} needs 'reads' (list) or 'fastq_1'[/'fastq_2'], or 'mseq' on its own"
         }
         // `merged: true` marks reads that are already merged pairs, e.g. AAP's

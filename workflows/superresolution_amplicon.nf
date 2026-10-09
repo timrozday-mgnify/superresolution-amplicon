@@ -379,6 +379,15 @@ workflow SUPERRESOLUTION_AMPLICON {
     // amplicons) and bakes in the read-preparation settings it was made with
     // (--obs_max_reads, --trim_primers, --min_pair_overlap): those params no longer
     // apply to that sample.
+    // --panel_kernel_only stops here: the kernel above is the whole product, and
+    // nothing below it is a property of the panel. Rows carry no observations in
+    // that mode, so there is nothing to map or infer from.
+    if (params.panel_kernel_only) {
+        ch_composition = Channel.empty()
+        ch_fit_diagnostics = Channel.empty()
+    }
+    else {
+
     ch_reads
         .branch { meta, reads ->
             supplied: meta.mseq
@@ -421,6 +430,10 @@ workflow SUPERRESOLUTION_AMPLICON {
     CHECK_COMPOSITION_FIT(ch_fit_in)
     ch_versions = ch_versions.mix(CHECK_COMPOSITION_FIT.out.versions)
 
+    ch_composition = INFER_COMPOSITION.out.composition
+    ch_fit_diagnostics = CHECK_COMPOSITION_FIT.out.diagnostics
+    }
+
     // Collate the per-process versions into one file.
     ch_versions
         .collectFile(name: 'software_versions.yml', storeDir: "${params.outdir}/pipeline_info")
@@ -428,7 +441,7 @@ workflow SUPERRESOLUTION_AMPLICON {
     emit:
     amplicons   = ch_amplicons
     mismapping  = ch_panel_kernel
-    composition = INFER_COMPOSITION.out.composition
-    fit_diagnostics = CHECK_COMPOSITION_FIT.out.diagnostics
+    composition = ch_composition
+    fit_diagnostics = ch_fit_diagnostics
     versions    = ch_versions
 }

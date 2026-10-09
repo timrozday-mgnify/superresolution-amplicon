@@ -1,0 +1,7 @@
+# --panel_kernel_only: the kernel is a property of the panel, the database, the
+# primers and the mismapping method, so a row names only what to build against.
+# No `reads`, no `mseq`: nothing is mapped or inferred.
+- id: panel_build
+  platform: hq-illumina
+  references: tests/data/refs.fasta
+  panel_references: tests/data/refs.fasta

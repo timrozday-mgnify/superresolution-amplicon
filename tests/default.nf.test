@@ -32,6 +32,63 @@ nextflow_pipeline {
         }
     }
 
+    test("panel_kernel_only builds a kernel from a row with no reads and no mseq - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input             = "${projectDir}/tests/data/samplesheet.kernel_only.yml"
+                panel_kernel_only = true
+                mismapping_method = "align"
+                outdir            = "$outputDir"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                // The kernel is a property of the panel, the database, the primers and
+                // the method, so the row carries no observations and nothing downstream
+                // of the kernel runs: no observed mapping, no inference, no fit check.
+                { assert workflow.trace.tasks().every { !it.name.contains('MAPSEQ_OBS') } },
+                { assert workflow.trace.tasks().every { !it.name.contains('READS_TO_FASTA') } },
+                { assert workflow.trace.tasks().every { !it.name.contains('INFER_COMPOSITION') } },
+                { assert workflow.trace.tasks().every { !it.name.contains('CHECK_COMPOSITION_FIT') } },
+                // align reads M off reference distances: no simulation either.
+                { assert workflow.trace.tasks().every { !it.name.contains('SIMULATE') } },
+                { assert workflow.trace.tasks().every { !it.name.contains('SKIVER') } },
+                // Under align the kernel comes from PANEL_ALIGN, not a simulate+map pass.
+                { assert workflow.trace.tasks().any { it.name.contains('PANEL_ALIGN') } },
+                // Six tasks: extract, cluster, matrix key, panel prepare, home map, align.
+                { assert workflow.trace.succeeded().size() == 6 },
+                // The bundle is the whole product, and is what --panel_kernel consumes.
+                { assert file("${params.outdir}/mismapping").listFiles()
+                         .find { it.name.startsWith('panel_') } },
+                // Nothing per-sample is published, because nothing per-sample ran.
+                { assert !path("${params.outdir}/composition").exists() }
+            )
+        }
+    }
+
+    test("panel_kernel_only and panel_kernel together are refused") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input             = "${projectDir}/tests/data/samplesheet.kernel_only.yml"
+                panel_kernel_only = true
+                panel_kernel      = "${projectDir}/tests/data/panel_kernel_other"
+                outdir            = "$outputDir"
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.failed },
+                { assert workflow.stdout.any { it.contains('Pick one') } ||
+                         workflow.errorReport.contains('Pick one') }
+            )
+        }
+    }
+
     test("panel_references builds a genome-panel kernel - stub") {
         tag "stub"
         options "-stub"
