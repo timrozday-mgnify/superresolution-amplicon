@@ -10,6 +10,7 @@ process PANEL_PREPARE {
     input:
     tuple val(meta), path(panel), path(panel_taxa), path(db_amplicons), path(amplicon_dir)
     path taxonomy   // the database's MAPseq .tax; [] unless the panel has taxa
+    path panel_weights   // measured copy weights overriding listed genomes'; [] for none
 
     output:
     tuple val(meta), path("${meta.id}_prepared"),               emit: prepared
@@ -24,9 +25,10 @@ process PANEL_PREPARE {
     def panel_arg = panel ? "--panel-amplicons ${panel}" : ''
     def taxa_arg = panel_taxa ? "--panel-taxa ${panel_taxa} --db-taxonomy ${taxonomy}" : ''
     def whole_database_arg = meta.panel == 'database' ? "--whole-database ${amplicon_dir}" : ''
+    def weights_arg = panel_weights ? "--panel-weights ${panel_weights}" : ''
     """
     build_panel_kernel.py prepare \\
-        ${panel_arg} ${taxa_arg} ${whole_database_arg} \\
+        ${panel_arg} ${taxa_arg} ${whole_database_arg} ${weights_arg} \\
         --db-amplicons ${db_amplicons} \\
         -o ${meta.id}_prepared \\
         $args

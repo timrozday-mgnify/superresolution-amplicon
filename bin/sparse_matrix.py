@@ -26,7 +26,7 @@ from scipy import sparse
 
 # Bump whenever the alignment kernel's definition changes; MATRIX_KEY hashes it too
 # (modules/local/matrix_key/main.nf), so a stale kernel is never silently reused.
-KERNEL_VERSION = 2
+KERNEL_VERSION = 3
 
 
 def _stored_version(archive) -> int:
