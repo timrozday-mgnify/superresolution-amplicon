@@ -547,6 +547,8 @@ def align(a) -> None:
                                      shape=shape)
         distances.data -= 1.0
         strata = (distances, a.distance_decay)
+    neighbours = _neighbours(ka, unique_sequences, source_rows, len(label_ids),
+                             max_ambiguous_bases, max_postings)
     provenance = {"method": "align", "prepared": str(a.prepared), "tau": a.tau,
                   "distance_decay": a.distance_decay, "indel_decay": a.indel_decay,
                   "ambiguity_weight": a.ambiguity_weight,
@@ -555,12 +557,40 @@ def align(a) -> None:
     sm.write_kernel(a.out, kernel, source_ids, label_ids, home, ref_headers=headers,
                     label_of_ref=label_of_ref,
                     db_amplicons_sha256=hashlib.sha256(a.db_amplicons.read_bytes()).hexdigest(),
-                    provenance=provenance, strata=strata)
+                    provenance=provenance, strata=strata, neighbours=neighbours)
     zeros = np.zeros(len(source_ids), dtype=np.int64)
     source_table(sources, kernel, home, home_identity, label_ids, zeros, zeros).to_csv(
         a.out.with_name("panel_sources.tsv"), sep="\t", index=False, float_format="%.4f")
     log.info("align kernel tau=%d c=%g: %d sources x %d labels, %d nonzeros", a.tau,
              a.distance_decay, *kernel.shape, kernel.nnz)
+
+
+# Edit radius of the neighbourhood stored beside an align kernel. Sequencing-error
+# spill-over onto a label falls ~10x per edit (Nov2025: 0.02-2.5% of the parent's reads at
+# one edit), so two edits covers every neighbour that can hold a parent's errors.
+NEIGHBOUR_TAU = 2
+
+
+def _neighbours(ka, sequences: list[str], source_rows: dict[int, list[int]], n_labels: int,
+                max_ambiguous_bases: int, max_postings: int):
+    """``(source row, label, distance)`` for every database label 1..NEIGHBOUR_TAU edits
+    from a panel source: where its sequencing errors land. Independent of the kernel's
+    own --tau, which decides what the fit models, not what the evidence must expect."""
+    rows, labels, dists = [], [], []
+    pairs = ka.pigeonhole_candidates(sequences, NEIGHBOUR_TAU, max_ambiguous_bases,
+                                     max_postings, probes=np.fromiter(source_rows, np.int64))
+    for left, right in pairs:
+        for probe, label in ((left, right), (right, left)):
+            if probe not in source_rows or label >= n_labels:
+                continue
+            d = ka.bounded_iupac_distance(sequences[probe], sequences[label], NEIGHBOUR_TAU)
+            if 1 <= d <= NEIGHBOUR_TAU:
+                for row in source_rows[probe]:
+                    rows.append(row)
+                    labels.append(int(label))
+                    dists.append(d)
+    log.info("%d source-to-label neighbour pair(s) within %d edits", len(rows), NEIGHBOUR_TAU)
+    return np.asarray(rows), np.asarray(labels), np.asarray(dists)
 
 
 def source_table(sources: pd.DataFrame, kernel: sparse.csr_array, home: np.ndarray,

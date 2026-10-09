@@ -199,6 +199,8 @@ def test_panel_align_kernel_redecays_exactly_and_fits_a_latent_decay(tmp_path: P
     K, dist = k.kernel.toarray(), k.strata[0].toarray()
     assert np.allclose(K[0, lab], [1 / 1.1, 0.1 / 1.1, 0]) and np.allclose(K[1, lab], [0, 0, 1])
     assert dist[0, lab[1]] == 1 and k.strata[1] == 0.1 and k.home.tolist() == [lab[0], lab[2]]
+    # The stored neighbourhood: a is one edit from B, d one edit from C (its home).
+    assert set(zip(*map(np.ndarray.tolist, k.neighbours))) == {(0, lab[1], 1), (1, lab[2], 1)}
 
     r, s, c = torch.tensor([0.6, 0.4]), torch.tensor(0.8), torch.tensor(0.3)
     redecayed = np.where(K > 0, K * (0.3 / 0.1) ** dist, 0.0)
@@ -229,6 +231,9 @@ def test_panel_align_kernel_redecays_exactly_and_fits_a_latent_decay(tmp_path: P
     assert abs(comp.gX - 0.6) < 0.03 and abs(comp.gY - 0.4) < 0.03, comp
     diag = pd.read_csv(out / "inference_diagnostics.csv").iloc[0]
     assert diag.infer_distance_decay and diag.kernel_method == "align" and diag.distance_decay > 0
+    # The kernel stores a neighbourhood, so inference also writes presence evidence.
+    evidence = pd.read_csv(out / "presence_evidence.csv").set_index("genome_id")
+    assert set(evidence.index) == {"gX", "gY"} and (evidence.status == "present").all()
     fit_json = tmp_path / "fit.json"
     fit.run(SimpleNamespace(
         composition=out / "inferred_composition.csv", posterior_draws=out / "posterior_draws.npz",
