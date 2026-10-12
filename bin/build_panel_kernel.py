@@ -375,6 +375,43 @@ def _mseq_rows(path: Path):
             yield f[0], f[1], f[3]
 
 
+def _drop_unlabelled(a, sources: pd.DataFrame, home: np.ndarray, identity: np.ndarray):
+    """Drop the sources with no home label, and write the bundle's tables to match.
+
+    Such a source's sequence is no amplicon of the database, and MAPseq's hit for it is
+    unhit or an entry the primers do not amplify. Real reads from it land there too, and
+    inference counts them as foreign hits, so it is no source of any label. It is dropped
+    from its genome, whose other copies are renormalised, and listed in
+    ``panel_unlabelled.tsv`` beside the kernel. A genome left with no copy drops out of
+    the panel, as an unamplifiable one does; with every source gone the kernel is empty,
+    which only ``--allow-empty`` accepts.
+    """
+    keep = home >= 0
+    if keep.all():
+        return sources, home, identity
+    out = a.out.parent
+    lost = sources.loc[~keep, ["source", "genomes"]]
+    lost.to_csv(out / "panel_unlabelled.tsv", sep="\t", index=False)
+    log.warning("%d source(s) have no home label -- no amplicon of the database, and MAPseq's "
+                "hit has none either -- so are dropped from their genome(s): %s", len(lost),
+                ", ".join(f"{s} ({g})" for s, g in zip(lost.source, lost.genomes)))
+    translation = pd.read_csv(a.prepared / "panel_translation.tsv", sep="\t")
+    translation = translation[~translation.source.isin(set(lost.source))].copy()
+    translation["weight"] /= translation.groupby("genome_id").weight.transform("sum")
+    sources = sources[keep].reset_index(drop=True)
+    sources["genomes"] = sources.source.map(translation.groupby("source").genome_id.agg(";".join))
+    if sources.empty and not getattr(a, "allow_empty", False):
+        raise SystemExit("no source has a home label; see panel_unlabelled.tsv")
+    # Never over prepare's own tables, which a later run reads again.
+    if out.resolve() == Path(a.prepared).resolve():
+        log.warning("kernel written into the prepared directory: its panel_translation.tsv "
+                    "and sources.tsv still list the dropped sources")
+    else:
+        translation.to_csv(out / "panel_translation.tsv", sep="\t", index=False)
+        sources.to_csv(out / "sources.tsv", sep="\t", index=False)
+    return sources, home[keep], identity[keep]
+
+
 def build(a) -> None:
     sources = pd.read_csv(a.prepared / "sources.tsv", sep="\t")
     source_ids = sources.source.tolist()
@@ -384,9 +421,9 @@ def build(a) -> None:
 
     home, home_identity = _home_labels(a.home_mseq, src, label_of_hit,
                                        {label: i for i, label in enumerate(label_ids)})
-    if (home < 0).any():
-        raise SystemExit("no home label (no database hit) for source(s): "
-                         + ", ".join(np.asarray(source_ids)[home < 0]))
+    sources, home, home_identity = _drop_unlabelled(a, sources, home, home_identity)
+    source_ids = sources.source.tolist()
+    src = {s: i for i, s in enumerate(source_ids)}
 
     n_simulated = np.zeros(len(src), dtype=np.int64)
     n_unmapped = np.zeros(len(src), dtype=np.int64)
@@ -479,10 +516,9 @@ def align(a) -> None:
     else:
         home = np.array([own.get(s, -1) for s in source_ids], dtype=np.int64)
         home_identity = np.where(home >= 0, 1.0, np.nan)
-    if (home < 0).any():
-        raise SystemExit("no home label for source(s): their sequence is no amplicon of the "
-                         "database, and MAPseq's hit is unhit or an entry these primers do "
-                         "not amplify: " + ", ".join(np.asarray(source_ids)[home < 0]))
+    sources, home, home_identity = _drop_unlabelled(a, sources, home, home_identity)
+    source_ids = sources.source.tolist()
+    src = {s: i for i, s in enumerate(source_ids)}
     if a.tau < 0:
         raise SystemExit("--tau must be non-negative")
     # A separate indel decay weights a label s substitutions and i indels away by
@@ -692,7 +728,8 @@ def combine(a) -> None:
         raise SystemExit(f"these primers amplify no genome of {a.panel}")
 
     kernels = {d: sm.read_kernel(d / "mismapping_matrix.npz") for d in set(chosen.values())}
-    k0 = next(iter(kernels.values()))
+    # A part can be empty: a genome whose every copy had no home label (_drop_unlabelled).
+    k0 = max(kernels.values(), key=lambda k: k.kernel.shape[0])
     if any(k.label_ids != k0.label_ids for k in kernels.values()):
         raise SystemExit("parts were built against different database labels")
     translation = pd.concat([pd.read_csv(d / "panel_translation.tsv", sep="\t")
@@ -710,6 +747,8 @@ def combine(a) -> None:
         for i, s in enumerate(kernels[d].source_ids):
             where.setdefault(s, (d, i))
     picks = [where[s] for s in sources.source]
+    if not picks:
+        raise SystemExit(f"no genome of {a.panel} has a source with a home label")
     kernel = sparse.csr_array(sparse.vstack([kernels[d].kernel[[i]] for d, i in picks]))
     home = np.array([kernels[d].home[i] for d, i in picks], dtype=np.int64)
     strata = None
@@ -749,6 +788,10 @@ def combine(a) -> None:
     sources.to_csv(a.out / "sources.tsv", sep="\t", index=False)
     if missing:
         (a.out / "panel_unamplifiable.txt").write_text("".join(f"{g}\n" for g in missing))
+    unlabelled = [pd.read_csv(d / "panel_unlabelled.tsv", sep="\t") for d in chosen.values()
+                  if (d / "panel_unlabelled.tsv").exists()]
+    if unlabelled:
+        pd.concat(unlabelled).to_csv(a.out / "panel_unlabelled.tsv", sep="\t", index=False)
     sm.write_kernel(a.out / "mismapping_matrix.npz", kernel, sources.source.tolist(),
                     k0.label_ids, home, ref_headers=k0.ref_headers,
                     label_of_ref=k0.label_of_ref, db_amplicons_sha256=k0.db_amplicons_sha256,
@@ -799,6 +842,8 @@ def main() -> None:
     b.add_argument("--min-identity", type=float, default=None)
     b.add_argument("--provenance", action="append", default=[],
                    help="key=value recorded in the kernel (error model, rates, seed; repeatable)")
+    b.add_argument("--allow-empty", action="store_true",
+                   help="write an empty kernel, not fail, when no source has a home label")
     b.add_argument("-o", "--out", type=Path, required=True)
     al = sub.add_parser("align", help="kernel from source-to-database edit distance, no simulation")
     al.add_argument("--prepared", type=Path, required=True)
@@ -825,6 +870,8 @@ def main() -> None:
                     help="IUPAC positions tolerated across a pigeonhole candidate pair")
     al.add_argument("--max-postings", type=int, default=4096,
                     help="skip pigeonhole blocks shared by more than this many sequences")
+    al.add_argument("--allow-empty", action="store_true",
+                    help="write an empty kernel, not fail, when no source has a home label")
     al.add_argument("-o", "--out", type=Path, required=True)
     c = sub.add_parser("combine", help="stack one-genome bundles into a panel's bundle")
     c.add_argument("--panel", type=Path, required=True,
