@@ -732,8 +732,12 @@ def combine(a) -> None:
     k0 = max(kernels.values(), key=lambda k: k.kernel.shape[0])
     if any(k.label_ids != k0.label_ids for k in kernels.values()):
         raise SystemExit("parts were built against different database labels")
-    translation = pd.concat([pd.read_csv(d / "panel_translation.tsv", sep="\t")
-                             for d in chosen.values()], ignore_index=True)
+    # An empty part (no copy with a home label) adds no row.
+    tables = [pd.read_csv(d / "panel_translation.tsv", sep="\t") for d in chosen.values()]
+    tables = [t for t in tables if not t.empty]
+    if not tables:
+        raise SystemExit(f"no genome of {a.panel} has a source with a home label")
+    translation = pd.concat(tables, ignore_index=True)
     if a.panel_weights:
         translation = pd.DataFrame(override_weights(translation.to_dict("records"),
                                                     a.panel_weights))
