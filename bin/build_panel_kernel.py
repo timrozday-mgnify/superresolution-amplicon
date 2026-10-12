@@ -187,6 +187,12 @@ def _home_labels(home_mseq: Path, src: dict[str, int], label_of_hit: dict[str, i
     S. salivarius's home away from the 4,867 references real reads land on. So an exact
     tie keeps the source's own group whenever the database has it. A relabel below
     identity 1 (2acb -> 81c3 at 0.996) is what MAPseq does to real reads too, and stands.
+
+    MAPseq maps against the whole database, so its hit can also be an entry these primers
+    do not amplify, which therefore has no label. 1492R sits at the 3' end of the 16S, where
+    many SILVA entries are truncated, so for 1100F-1492R that is common. A source whose
+    hit has no label, or that is unhit, likewise keeps its own group when the database has
+    it: some complete entry amplifies to exactly its sequence.
     """
     home = np.full(len(src), -1, dtype=np.int64)
     identity = np.full(len(src), np.nan)
@@ -195,7 +201,13 @@ def _home_labels(home_mseq: Path, src: dict[str, int], label_of_hit: dict[str, i
             home[src[query]] = label_of_hit[hit]
             identity[src[query]] = float(hit_identity)
     for source, i in src.items():
-        if identity[i] == 1.0 and source in own and home[i] != own[source]:
+        if source not in own or home[i] == own[source]:
+            continue
+        if home[i] < 0:
+            log.info("%s: MAPseq's hit has no amplicon under these primers; keeping its "
+                     "own group", source)
+            home[i], identity[i] = own[source], 1.0
+        elif identity[i] == 1.0:
             log.info("%s: exact MAPseq tie on %d; keeping its own group", source, home[i])
             home[i] = own[source]
     return home, identity
@@ -468,8 +480,9 @@ def align(a) -> None:
         home = np.array([own.get(s, -1) for s in source_ids], dtype=np.int64)
         home_identity = np.where(home >= 0, 1.0, np.nan)
     if (home < 0).any():
-        raise SystemExit("no home label for source(s) (not in the database, or unhit in "
-                         "--home-mseq): " + ", ".join(np.asarray(source_ids)[home < 0]))
+        raise SystemExit("no home label for source(s): their sequence is no amplicon of the "
+                         "database, and MAPseq's hit is unhit or an entry these primers do "
+                         "not amplify: " + ", ".join(np.asarray(source_ids)[home < 0]))
     if a.tau < 0:
         raise SystemExit("--tau must be non-negative")
     # A separate indel decay weights a label s substitutions and i indels away by
