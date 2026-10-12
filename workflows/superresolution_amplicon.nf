@@ -213,13 +213,15 @@ workflow SUPERRESOLUTION_AMPLICON {
         .map { meta, refs -> [ refs.toUriString(), meta, refs ] }
         .combine(ch_ref_content, by: 0)
         .map { uri, meta, refs, digest ->
-            def key = [digest, params.fwd_primer, params.rev_primer,
+            def key = [digest, meta.fwd_primer ?: params.fwd_primer,
+                       meta.rev_primer ?: params.rev_primer,
                        params.primer_mismatches, extractor].join('|')
             [ "refs_" + key.md5().take(12), meta, refs ]
         }
     EXTRACT_AMPLICONS(ch_refs_by_set
         .unique { it[0] }
-        .map { set, meta, refs -> [ [ id: set ], refs ] })
+        .map { set, meta, refs ->
+            [ [ id: set ] + meta.subMap(['fwd_primer', 'rev_primer']), refs ] })
     ch_versions = ch_versions.mix(EXTRACT_AMPLICONS.out.versions)
 
     // The MAPseq database is the reference FASTA itself, not its amplicons: every mapping
@@ -321,8 +323,10 @@ workflow SUPERRESOLUTION_AMPLICON {
                 sim_error_model: params.sim_error_model,
                 sim_n_per_ref: params.sim_n_per_ref, sim_read_len: params.sim_read_len,
                 sim_read_structure: params.sim_read_structure, sim_mate_len: params.sim_mate_len,
-                primer_mix: params.primer_mix, fwd_primer: params.fwd_primer,
-                rev_primer: params.rev_primer, primer_mismatches: params.primer_mismatches,
+                primer_mix: params.primer_mix,
+                fwd_primer: rep[0].fwd_primer ?: params.fwd_primer,
+                rev_primer: rep[0].rev_primer ?: params.rev_primer,
+                primer_mismatches: params.primer_mismatches,
                 flat_sub_rate: params.flat_sub_rate, flat_ins_rate: params.flat_ins_rate,
                 flat_del_rate: params.flat_del_rate, mapseq_args: params.mapseq_args,
                 mapseq_min_identity: params.mapseq_min_identity, mapseq_tag: params.mapseq_tag,
@@ -330,7 +334,8 @@ workflow SUPERRESOLUTION_AMPLICON {
             ]
             [[id: id, matrix_key: id, panel: panel, panel_taxa: panel_taxa,
               model_identity: rep[3], members: members, db_id: rep[0].id,
-              provenance: provenance], panel, rep[1], rep[2]]
+              provenance: provenance] + rep[0].subMap(['fwd_primer', 'rev_primer']),
+             panel, rep[1], rep[2]]
         }
 
     if (params.panel_kernel) {

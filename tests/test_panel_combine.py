@@ -50,7 +50,7 @@ def _bundle(tmp: Path, name: str, panel: Path, db: Path, *,
     for f in ("panel_translation.tsv", "sources.tsv"):
         (out / f).write_bytes((prepared / f).read_bytes())
     _bpk("align", "--prepared", prepared, "--db-amplicons", db, "--tau", 1,
-         "--distance-decay", 0.01, "-o", out / "mismapping_matrix.npz")
+         "--distance-decay", 0.01, "--allow-empty", "-o", out / "mismapping_matrix.npz")
     (out / "provenance.json").write_text(json.dumps({
         "matrix_key": f"panel_{name}", "panel": hashlib.sha256(panel.read_bytes()).hexdigest(),
         "panel_taxa": None, "panel_weights": None, "reference_sha256": "db",
@@ -72,12 +72,13 @@ def panel(tmp_path):
     return fasta, db
 
 
-def _part_bundles(tmp_path, fasta, db):
+def _part_bundles(tmp_path, fasta, db, unamplifiable=("gc",)):
     genomes = tmp_path / "genomes"
     subprocess.run([sys.executable, str(ROOT / "bin" / "split_panel.py"), fasta, "-o", genomes],
                    check=True)
     bundles = {g.stem: _bundle(tmp_path, g.stem, g, db) for g in sorted(genomes.glob("*.fasta"))}
-    assert bundles.pop("gc") is None          # no primer site: nothing to build
+    for g in unamplifiable:
+        assert bundles.pop(g) is None         # no primer site: nothing to build
     return list(bundles.values())
 
 
@@ -140,3 +141,30 @@ def test_an_amplifiable_genome_without_a_part_fails(tmp_path, panel):
     parts = [p for p in _part_bundles(tmp_path, fasta, db) if p.name == "ga"]
     with pytest.raises(subprocess.CalledProcessError):
         _bpk("combine", "--panel", fasta, "--parts", *parts, "-o", tmp_path / "combined")
+
+
+def test_sources_with_no_label_are_dropped_and_recorded(tmp_path):
+    """A copy that is no amplicon of the database has no home label (no --home-mseq here,
+    so its home is its own group or nothing): dropped, its genome renormalised, recorded.
+    A genome with no labelled copy left is an empty part, and combine still matches."""
+    rng = random.Random(2)
+    v1, v_gone, v_lone = _seq(rng), _seq(rng), _seq(rng)
+    amp = lambda v: "TTT" + FWD + v + REV.translate(COMP)[::-1] + "GGG"  # noqa: E731
+    fasta = tmp_path / "panel.fasta"
+    fasta.write_text(f">gd|0|x\n{amp(v1)}\n>gd|1|x\n{amp(v_gone)}\n>ge|0|x\n{amp(v_lone)}\n")
+    db = tmp_path / "db_amplicons.fasta"
+    db.write_text(f">r1\n{v1}\n>r2\n{_seq(rng)}\n")
+    whole = _bundle(tmp_path, "whole", fasta, db)
+    translation = pd.read_csv(whole / "panel_translation.tsv", sep="\t")
+    assert translation.genome_id.tolist() == ["gd"] and translation.weight.tolist() == [1.0]
+    assert len(pd.read_csv(whole / "panel_unlabelled.tsv", sep="\t")) == 2
+    parts = _part_bundles(tmp_path, fasta, db, unamplifiable=())
+    assert sm.read_kernel(tmp_path / "ge" / "mismapping_matrix.npz").kernel.shape[0] == 0
+    out = tmp_path / "combined"
+    _bpk("combine", "--panel", fasta, "--parts", *parts, "-o", out)
+    a, b = (sm.read_kernel(d / "mismapping_matrix.npz") for d in (whole, out))
+    assert a.source_ids == b.source_ids
+    np.testing.assert_allclose(a.kernel.toarray(), b.kernel.toarray())
+    pd.testing.assert_frame_equal(_table(whole / "panel_translation.tsv"),
+                                  _table(out / "panel_translation.tsv"))
+    assert len(pd.read_csv(out / "panel_unlabelled.tsv", sep="\t")) == 2

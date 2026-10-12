@@ -30,7 +30,8 @@ process MATRIX_KEY {
         sim_error_model: params.sim_error_model, sim_n_per_ref: params.sim_n_per_ref,
         sim_read_len: params.sim_read_len, flat_sub_rate: params.flat_sub_rate,
         flat_ins_rate: params.flat_ins_rate, flat_del_rate: params.flat_del_rate,
-        fwd_primer: params.fwd_primer, rev_primer: params.rev_primer,
+        fwd_primer: meta.fwd_primer ?: params.fwd_primer,
+        rev_primer: meta.rev_primer ?: params.rev_primer,
         primer_mismatches: params.primer_mismatches, trim_primers: params.trim_primers,
         // ponytail: keyed by path, like the reference set; hash it if mixes get edited in place.
         primer_mix: params.primer_mix ?: '',

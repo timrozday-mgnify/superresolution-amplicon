@@ -189,8 +189,10 @@ def test_panel_align_kernel_redecays_exactly_and_fits_a_latent_decay(tmp_path: P
     kernel = prep / "align_kernel.npz"
     args = dict(prepared=prep, db_amplicons=db, tau=1, distance_decay=0.1,
                 ambiguity_weight=0.3, out=kernel)
-    with pytest.raises(SystemExit, match="no home label"):
-        bpk.align(SimpleNamespace(home_mseq=None, **args))       # d is not in the database
+    # d is not in the database: with no MAPseq to label it, it has no home and is dropped.
+    bpk.align(SimpleNamespace(home_mseq=None, **args))
+    assert sm.read_kernel(kernel).source_ids == [a]
+    assert pd.read_csv(prep / "panel_unlabelled.tsv", sep="\t").source.tolist() == [d]
     home = _write_mseq(tmp_path / "home.mseq", [(a, "g1|0|A"), (d, "g4|0|C")])
     bpk.align(SimpleNamespace(home_mseq=home, **args))
 
