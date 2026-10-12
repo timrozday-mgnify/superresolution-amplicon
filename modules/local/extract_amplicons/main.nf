@@ -18,6 +18,11 @@ process EXTRACT_AMPLICONS {
     // (identical) files instead of all but one failing. The workflow takes their parent.
     tuple val(meta), path("${meta.id}_amplicons/amplicons.fasta"), path("${meta.id}_amplicons/references.tax"),
         path("${meta.id}_amplicons/translation_table.tsv"), path("${meta.id}_amplicons/refseq_index.csv"), emit: dir
+    // Which accessions this extraction labels at all: one copy shared by every kernel
+    // built on it, since a kernel keeps only its own labels' accessions
+    // (sparse_matrix.write_db_refs). Named by the amplicons' digest, so the published
+    // copy sits beside the bundles whose kernels resolve it by that name.
+    tuple val(meta), path("${meta.id}_amplicons/db_refs_*.npz"), emit: db_refs
     path "versions.yml",                           emit: versions
 
     when:
@@ -49,6 +54,8 @@ process EXTRACT_AMPLICONS {
     printf '#cutoff: 0.00:0.08\\n#name: refdb\\n#levels: Kingdom Genome Copy\\n%s\\tBacteria;ref;%s\\n' "\$REF_ID" "\$REF_ID" > references.tax
     printf 'genome_id\\trefseq\\tweight\\nref\\t%s\\t1.0\\n' "\$REF_ID" > translation_table.tsv
     printf 'refseq,genome,amplicon_len,amplifiable\\n%s,ref,12,True\\n' "\$REF_ID" > refseq_index.csv
+    # Named by the amplicons' digest, as write_db_refs names it; nothing reads a stub's.
+    touch "db_refs_\$(sha256sum amplicons.fasta | awk '{print \$1}' | cut -c1-16).npz"
     cd ..
 
     cat <<-END_VERSIONS > versions.yml

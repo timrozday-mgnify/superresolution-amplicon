@@ -26,7 +26,9 @@ from scipy import sparse
 
 # Bump whenever the alignment kernel's definition changes; MATRIX_KEY hashes it too
 # (modules/local/matrix_key/main.nf), so a stale kernel is never silently reused.
-KERNEL_VERSION = 3
+# 4: the label space is compacted to the columns the kernel gives a value to (_compact),
+#    and the database's full accession list moved to a shared db_refs file.
+KERNEL_VERSION = 4
 
 
 def _stored_version(archive) -> int:
@@ -47,6 +49,101 @@ def _strata_arrays(matrix: sparse.csr_array, strata) -> dict:
         raise ValueError("stored distance decay must be in (0, 1]")
     return {"distances": distances.data.astype(np.int16),
             "decay": np.float64(decay)}
+
+
+def _compact(kernel: sparse.csr_array, label_ids: list[str], home: np.ndarray,
+             ref_headers, label_of_ref, strata, neighbours):
+    """Restrict the label space to the columns this kernel gives a value to.
+
+    Those are its nonzeros, every source's home label and every neighbour label. A label
+    with none of the three carries no mass and no distance, so inference merges it into a
+    zero-count sink -- which ``infer_composition._subset_kernel`` already does, exactly,
+    for every label a sample has no read on. Dropping them here is the same merge done
+    once at build time instead of once per sample, and over a whole database it is almost
+    everything: a one-genome part of SILVA-SSU keeps 278 of 463,499 columns.
+
+    A database accession survives only where its label does. Whether a hit on one of the
+    others is in this database at all -- an unexplained read rather than a foreign one --
+    is what the shared ``db_refs`` file answers; see ``write_db_refs``.
+    """
+    n_lab = kernel.shape[1]
+    home = np.asarray(home, dtype=np.int64)
+    label_of_ref = np.asarray([] if label_of_ref is None else label_of_ref, dtype=np.int64)
+    # read_kernel reports an index out of range; compacting one would raise IndexError here
+    # instead, and a kernel this broken has no label space worth compacting.
+    for idx in (home, label_of_ref):
+        if len(idx) and (idx.min() < 0 or idx.max() >= n_lab):
+            return kernel, label_ids, home, ref_headers, label_of_ref, strata, neighbours
+    keep = np.zeros(n_lab, dtype=bool)
+    keep[kernel.indices] = True
+    keep[home] = True
+    if neighbours is not None:
+        keep[np.asarray(neighbours[1], dtype=np.int64)] = True
+    kept = np.flatnonzero(keep)
+    if len(kept) == n_lab:
+        return kernel, label_ids, home, ref_headers, label_of_ref, strata, neighbours
+    position = np.full(n_lab, -1, dtype=np.int64)
+    position[kept] = np.arange(len(kept))
+    shape = (kernel.shape[0], len(kept))
+    # Renumbering the columns keeps the pattern, so the strata ride along on it unchanged.
+    compacted = sparse.csr_array((kernel.data, position[kernel.indices], kernel.indptr),
+                                 shape=shape)
+    if strata is not None:
+        distances = strata[0].tocsr()
+        strata = (sparse.csr_array((distances.data, position[distances.indices],
+                                    distances.indptr), shape=shape), strata[1])
+    if len(label_of_ref):
+        on_kept = keep[label_of_ref]
+        ref_headers = [h for h, k in zip(ref_headers, on_kept) if k]
+        label_of_ref = position[label_of_ref[on_kept]]
+    if neighbours is not None:
+        source, label, distance = (np.asarray(v, dtype=np.int64) for v in neighbours)
+        neighbours = (source, position[label], distance)
+    return (compacted, [label_ids[i] for i in kept], position[home], ref_headers,
+            label_of_ref, strata, neighbours)
+
+
+DB_REFS_PREFIX = "db_refs_"
+
+
+def db_refs_name(db_amplicons_sha256: str) -> str:
+    """The file name holding the accessions of the database with this digest."""
+    return f"{DB_REFS_PREFIX}{db_amplicons_sha256[:16]}.npz"
+
+
+def write_db_refs(directory: Path, db_amplicons_sha256: str, ref_headers) -> Path:
+    """Write the database's amplifiable accessions, shared by every kernel built on it.
+
+    A compacted kernel (``_compact``) keeps only the accessions whose label it has a value
+    for, so it can no longer tell a hit on another entry of its own database -- an
+    unexplained read, which is background mass -- from a hit on some other database, which
+    is a wrong pairing and must not be counted at all. This file is what answers that, and
+    it is a property of the extraction (the database and the primers) alone: one copy
+    serves every kernel built from the same amplicons, which is what its digest names.
+    """
+    path = Path(directory) / db_refs_name(db_amplicons_sha256)
+    np.savez_compressed(
+        path,
+        format=np.asarray("db_refs"),
+        db_amplicons_sha256=np.asarray(db_amplicons_sha256),
+        ref_headers=np.frombuffer("\n".join(ref_headers).encode(), dtype=np.uint8),
+    )
+    return path
+
+
+def read_db_refs(path: Path, db_amplicons_sha256: str = "") -> set[str]:
+    """Load the accession set written by ``write_db_refs``, checking whose database it is."""
+    try:
+        with np.load(path, allow_pickle=False) as archive:
+            if str(archive["format"]) != "db_refs":
+                raise ValueError("not a db_refs file")
+            stored = str(archive["db_amplicons_sha256"])
+            headers = archive["ref_headers"].tobytes().decode()
+    except (KeyError, OSError, ValueError) as exc:
+        raise ValueError(f"invalid database accession file {path}") from exc
+    if db_amplicons_sha256 and stored != db_amplicons_sha256:
+        raise ValueError(f"{path} holds database {stored[:12]}, not {db_amplicons_sha256[:12]}")
+    return set(headers.split("\n")) if headers else set()
 
 
 def _read_strata(archive, pattern: sparse.csr_array):
@@ -90,6 +187,9 @@ def write_kernel(path: Path, kernel: sparse.csr_array, source_ids: list[str],
     which the presence evidence needs to expect sequencing-error spill-over.
     """
     kernel = kernel.tocsr()
+    (kernel, label_ids, home, ref_headers, label_of_ref, strata,
+     neighbours) = _compact(kernel, list(label_ids), home, list(ref_headers), label_of_ref,
+                            strata, neighbours)
     per_source = {"n_simulated": n_simulated, "n_unmapped": n_unmapped}
     np.savez_compressed(
         path,
@@ -114,10 +214,14 @@ def write_kernel(path: Path, kernel: sparse.csr_array, source_ids: list[str],
     )
 
 
-def read_kernel(path: Path) -> SimpleNamespace:
+def read_kernel(path: Path, db_refs: Path | None = None) -> SimpleNamespace:
     """Load and validate a rectangular kernel written by ``write_kernel``.
 
     An all-zero row is allowed: a source no read can come from.
+
+    ``k.db_refs`` is the database's full accession set when one is to hand: ``db_refs``
+    names it, else ``db_refs_<digest>.npz`` beside the kernel, else it is ``None`` and a
+    hit the kernel does not label cannot be told from a foreign one (``write_db_refs``).
     """
     try:
         with np.load(path, allow_pickle=False) as archive:
@@ -157,6 +261,13 @@ def read_kernel(path: Path) -> SimpleNamespace:
         raise ValueError(f"mis-mapping kernel {path} has a label index out of range")
     if not np.isfinite(k.kernel.data).all() or (k.kernel.data < 0).any():
         raise ValueError(f"mis-mapping kernel {path} must contain finite, non-negative values")
+    # Beside the kernel is a combined bundle's own copy; one level up is the published
+    # mismapping/ directory, where the extraction puts the one copy its parts share.
+    name = db_refs_name(k.db_amplicons_sha256)
+    found = next((p for p in (Path(path).parent / name, Path(path).parent.parent / name)
+                  if p.exists()), None)
+    k.db_refs = (read_db_refs(db_refs, k.db_amplicons_sha256) if db_refs
+                 else read_db_refs(found, k.db_amplicons_sha256) if found else None)
     rows = np.asarray(k.kernel.sum(axis=1)).ravel()
     if not np.allclose(rows[rows > 0], 1.0, rtol=1e-6, atol=1e-8):
         raise ValueError(f"mis-mapping kernel {path} must be row-stochastic")

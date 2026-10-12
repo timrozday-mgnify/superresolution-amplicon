@@ -482,7 +482,10 @@ def run(a) -> None:
         "n_labels_unexplained": c.n_labels_unexplained,
         "unexplained_fraction": float(inferred[G]),
         "observed_unexplained_fraction": float(y[-1] / total) if total else 0.0,
-        "n_reads": total, "n_foreign_hits": c.n_foreign_hits, "min_infer_reads": min_infer_reads,
+        "n_reads": total, "n_foreign_hits": c.n_foreign_hits,
+        # Hits on this database that the kernel keeps no label for: U's other half, and
+        # with a compacted kernel (KERNEL_VERSION 4) nearly all of it.
+        "n_unlabelled_hits": c.n_unlabelled_hits, "min_infer_reads": min_infer_reads,
         "n_genomes": G, "n_entries": len(c.entries) - 1, "status": "no_reference_hits" if no_hits else fit_status,
         "fit_status": fit_status, "posterior_draw_count": len(draws),
         **{key: json.dumps(v) for key, v in diag.items()},
@@ -536,20 +539,31 @@ def _panel_context(kernel_path: Path, amplicon_dir: Path, obs_mseq, min_identity
     identifiable = _panel_identifiability(K, genome_of_row[:S], weight[:S], entry_of[:G])
 
     # Observed reads per database label. A hit outside the kernel's database is a
-    # different database, not background, so it is counted and warned about.
+    # different database, not background, so it is counted and warned about. A hit on an
+    # entry of *this* database that the kernel keeps no column for (sparse_matrix._compact
+    # drops every label no source reaches) is background, exactly as a hit on a kept
+    # column no source reaches is: `unlabelled` joins U below. Telling the two apart is
+    # what the db_refs file is for, so without one every such hit is taken as background.
     label_of_hit = dict(zip(k.ref_headers, k.label_of_ref.tolist()))
     counts = np.zeros(K.shape[1])
-    foreign = 0
+    foreign = unlabelled = 0
     for path in obs_mseq:
         for _, hit in si.iter_mseq(path, min_identity):
             label = label_of_hit.get(hit)
-            if label is None:
-                foreign += 1
-            else:
+            if label is not None:
                 counts[label] += 1
+            elif k.db_refs is None or hit in k.db_refs:
+                unlabelled += 1
+            else:
+                foreign += 1
     if foreign:
         log.warning("%d observed hit(s) are not in the kernel's database (%s); ignored",
                     foreign, k.db_amplicons_sha256[:12] or "unknown sha256")
+    if unlabelled and k.db_refs is None:
+        log.warning("%d observed hit(s) are on no label this kernel keeps, and no %s is "
+                    "beside it, so a hit on another database cannot be told from an "
+                    "unexplained one; counted as unexplained",
+                    unlabelled, sm.db_refs_name(k.db_amplicons_sha256))
     observed = np.flatnonzero(counts)
     reached = np.zeros(K.shape[1], dtype=bool)
     reached[K.nonzero()[1]] = True
@@ -568,7 +582,8 @@ def _panel_context(kernel_path: Path, amplicon_dir: Path, obs_mseq, min_identity
         fitted_distances.data -= 1.0
         strata = (fitted_distances, k.strata[1])
     fitted_home = np.append(sub_home, u)
-    y = np.concatenate([counts[explained], np.zeros(n_sink), [counts[unexplained].sum()]])
+    y = np.concatenate([counts[explained], np.zeros(n_sink),
+                        [counts[unexplained].sum() + unlabelled]])
     # Reads on each panel source's home label next to its copy weight: the observed copy
     # ratios, which a wrong reference copy structure shows up in before any fit does.
     source_home = dict(zip(k.source_ids, k.home.tolist()))
@@ -583,7 +598,8 @@ def _panel_context(kernel_path: Path, amplicon_dir: Path, obs_mseq, min_identity
         genomes=panel_genomes + ["background"], entries=entries, entry_of=entry_of,
         identifiable=identifiable, n_rows=S,
         n_sources=len(set(rows)), n_labels_observed=len(observed),
-        n_labels_unexplained=len(unexplained), n_foreign_hits=foreign)
+        n_labels_unexplained=len(unexplained), n_foreign_hits=foreign,
+        n_unlabelled_hits=unlabelled)
 
 
 def main() -> None:

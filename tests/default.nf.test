@@ -773,12 +773,18 @@ nextflow_pipeline {
             }
         }
         then {
-            def provenance = file("${params.outdir}/mismapping").listFiles().collect {
+            def published = file("${params.outdir}/mismapping").listFiles()
+            def provenance = published.findAll { it.name.startsWith('panel_') }.collect {
                 new groovy.json.JsonSlurper().parseText(new File(it, 'provenance.json').text) }
             assertAll(
                 { assert workflow.success },
                 // The amplicons depend on the primers; the clustering does not.
                 { assert workflow.trace.succeeded().findAll { it.name.contains(':EXTRACT_AMPLICONS (') }.size() == 2 },
+                // db_refs is published beside the bundles, holding the accessions their
+                // kernels drop: each keeps only its own labels' (_compact). One per
+                // extraction, but the stub's amplicons ignore the primers, so both
+                // extractions here hash to the same name and only one file lands.
+                { assert published.findAll { it.name.startsWith('db_refs_') }.size() == 1 },
                 { assert workflow.trace.succeeded().findAll { it.name.contains(':MAPSEQ_CLUSTER (') }.size() == 1 },
                 { assert workflow.trace.succeeded().findAll { it.name.contains(':PANEL_ALIGN (') }.size() == 2 },
                 // Each kernel records the pair it was cut with: the row's, else the default.
