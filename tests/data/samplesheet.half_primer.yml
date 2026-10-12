@@ -1,0 +1,4 @@
+- id: half
+  references: tests/data/refs.fasta
+  panel_references: tests/data/refs.fasta
+  fwd_primer: GTGCCAGCMGCCGCGGTAA

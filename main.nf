@@ -10,6 +10,11 @@ def resolveFile(String p) {
         : file("${workflow.projectDir}/${p}", checkIfExists: true)
 }
 
+// A row's own primer pair, as meta entries; none when it names none.
+def rowPrimers(row) {
+    row.fwd_primer ? [fwd_primer: row.fwd_primer.toString(), rev_primer: row.rev_primer.toString()] : [:]
+}
+
 workflow {
     main:
     if (!params.input) {
@@ -19,7 +24,8 @@ workflow {
     // YAML samplesheet: a list of sample entries, each:
     //   id, reads (or fastq_1[/fastq_2]), platform, references (optional),
     //   error_model (optional), mseq (optional), merged (optional),
-    //   panel_references (optional), panel_taxa (optional)
+    //   panel_references (optional), panel_taxa (optional),
+    //   fwd_primer + rev_primer (optional; override --fwd_primer/--rev_primer)
     def loaded = new org.yaml.snakeyaml.Yaml().load(file(params.input, checkIfExists: true).text)
     def rows = (loaded instanceof Map) ? loaded.samples : loaded
     if (!(rows instanceof List)) {
@@ -34,6 +40,16 @@ workflow {
     }
     if (params.sim_read_structure == 'pairs' && params.trim_primers.toString() == 'true') {
         error "--sim_read_structure pairs simulates AAP merged reads, which keep their primers: set --trim_primers false"
+    }
+
+    // Per-row primers (`fwd_primer` + `rev_primer`) override --fwd_primer/--rev_primer, so
+    // one run can extract and build under several primer pairs, e.g. a primer sweep. A
+    // row's pair goes into its meta only when it names one, so a run that sets none keeps
+    // every task's cache key.
+    rows.each { row ->
+        if (!row.fwd_primer != !row.rev_primer) {
+            error "Sample ${row.id}: give both fwd_primer and rev_primer, or neither"
+        }
     }
 
     ch_rows = Channel.fromList(rows)
@@ -117,7 +133,7 @@ workflow {
         // reference set: supplying it skips READS_TO_FASTA + MAPSEQ_OBS. Added only when
         // present so the mapping tasks of runs that don't use it keep their cached hash.
         if (row.mseq) meta.mseq = resolveFile(row.mseq.toString())
-        [ meta, reads ]
+        [ meta + rowPrimers(row), reads ]
     }
 
     // A supplied kernel with no database named anywhere: its bundle already maps every
@@ -129,7 +145,7 @@ workflow {
     ch_refs = ch_rows.map { row ->
         def ref = row.references ?: params.references
         if (!ref && !bundle_only) error "Sample ${row.id}: no references (set samplesheet 'references' or --references)"
-        def meta = [ id: row.id, platform: (row.platform ?: params.platform) ]
+        def meta = [ id: row.id, platform: (row.platform ?: params.platform) ] + rowPrimers(row)
         // A supplied genome/taxon panel can reinterpret this sample's database labels. A
         // normal sample instead uses every extracted database V4 group as its panel.
         def panel = row.panel_references ?: params.panel_references

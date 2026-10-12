@@ -1,0 +1,12 @@
+# One database, one panel, two primer pairs in one run: each row's primers override
+# --fwd_primer/--rev_primer, as a per-genome primer sweep's rows do.
+- id: v4_default
+  platform: hq-illumina
+  references: tests/data/refs.fasta
+  panel_references: tests/data/refs.fasta
+- id: v4_515f
+  platform: hq-illumina
+  references: tests/data/refs.fasta
+  panel_references: tests/data/refs.fasta
+  fwd_primer: GTGCCAGCMGCCGCGGTAA
+  rev_primer: GGACTACHVGGGTWTCTAAT

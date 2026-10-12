@@ -96,6 +96,7 @@ YAML list of samples (or a map with `samples:`). Per sample:
 | `merge_rate` | no | Fraction of input pairs that merged (`bin/aap_samplesheet.py` writes it). Below 0.8 on a `merged: true` row, `--mismapping_method align` is refused: merging lost reads, likely more from some sources than others, and edit distances cannot express that. Use `simulate --sim_read_structure pairs`. |
 | `merged` | no | `true` for reads that are already merged pairs, e.g. amplicon-analysis-pipeline's `qc/<id>.merged.fastq.gz`. They are never merged again or primer-trimmed, and the run needs `--trim_primers false` so the simulated reads keep their primers too. Pass `--primer_mix assets/primer_mix_emp_v4.tsv` for AAP's EMP 515F/806R reads, so those primers carry the real oligo mix. `bin/aap_samplesheet.py` writes such rows from an AAP output directory. |
 | `panel_references` | no | Genome panel for this sample; overrides `--panel_references`. See [Panel reinterpretation](#panel-reinterpretation). |
+| `fwd_primer` + `rev_primer` | no | This sample's primer pair; overrides `--fwd_primer`/`--rev_primer`. Give both or neither. Rows under different pairs extract their own amplicons but share one clustering of the database, so one run can sweep primer pairs. |
 | `panel_taxa` | no | Taxon panel entries for this sample; overrides `--panel_taxa`. See [Panel reinterpretation](#panel-reinterpretation). |
 
 \* provide either `reads` or `fastq_1` — or neither, on a row that carries `mseq`
@@ -354,7 +355,7 @@ Reference amplicons (in-silico PCR):
 
 | param | default | description |
 |-------|---------|-------------|
-| `--fwd_primer` / `--rev_primer` | V4 515F / 806R | Amplicon primers. |
+| `--fwd_primer` / `--rev_primer` | V4 515F / 806R | Amplicon primers; a samplesheet row's `fwd_primer`/`rev_primer` override them. |
 | `--primer_mismatches` | `3` | Allowed primer mismatches. |
 | `--amplicon_cache` | – | Directory that keeps each reference set's extracted amplicons and, when no `.mscluster` ships beside the FASTA, its mapseq clustering (`storeDir`), keyed by the reference FASTA (path, size, mtime), primers and extractor code. Runs pointed at the same directory reuse them instead of rebuilding — at SILVA/GTDB scale the clustering alone is tens of minutes. The cache is unlocked: warm it with one run before starting several on the same set at once. |
 | `--trim_primers` | `true` | Trim primers off observed reads before mapping, and simulate the matrix and panel reads from primer-flanked amplicons trimmed the same way. Set `false` if reads are already primer-trimmed. |
