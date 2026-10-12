@@ -287,7 +287,10 @@ build_panel_kernel.py combine --panel panel.fasta --parts results/mismapping/pan
 ```
 
 The result equals the kernel the whole panel builds (`tests/test_panel_combine.py`), and
-its provenance names `panel.fasta`, so `--panel_kernel` accepts it. Under
+its provenance names `panel.fasta`, so `--panel_kernel` accepts it. Each part keeps only
+the labels it has a value for, so `combine` takes the union of theirs; it copies the
+parts' `db_refs_<digest>.npz` into the panel's bundle, from beside them or from
+`--db-refs`, which makes that bundle all inference needs. Under
 `--panel_kernel_only`, a genome the primers cannot amplify gets no bundle, not a failed
 run. `combine` accepts a missing genome only if the parts' primers cannot amplify it.
 Panel weights belong at `combine`, not in the parts. The MAPseq clustering is keyed by
@@ -432,6 +435,16 @@ nextflow run main.nf --input one_sample.yml --references /hps/.../SILVA-SSU.fast
 nextflow run main.nf --input all_samples.yml --references ~/db/SILVA-SSU.fasta \
     --panel_kernel panel_<key> --outdir results
 ```
+
+**Send `db_refs_<digest>.npz` with the bundle.** A kernel stores only the labels it has a
+value for and only those labels' accessions — a one-genome part of SILVA-SSU keeps 278 of
+463,499 columns, which is 18 kB rather than 21 MB — so it can no longer tell a hit on
+another entry of its own database, which is background, from a hit on another database,
+which is a wrong pairing. `mismapping/db_refs_<digest>.npz` is what tells them apart, and
+one copy serves every bundle built from the same amplicons. A kernel finds it beside
+itself or one level up, so copying `mismapping/` or a `combine`d bundle (which keeps its
+own copy) brings it; without it, every hit outside the kernel's labels is taken as
+background and the run says so.
 
 **Send the `.mscluster` with the FASTA.** The database's identity covers the clustering's
 bytes, and a run that built the clustering itself and a run that found it beside the FASTA
@@ -612,6 +625,8 @@ results/
     panel_<key>/                     rectangular kernel (mismapping_matrix.npz),
                                      panel_sources.tsv, panel_translation.tsv, sources.tsv,
                                      provenance.json (what --panel_kernel checks)
+    db_refs_<digest>.npz             the extraction's accessions, one copy shared by every
+                                     bundle built on it; send it with a bundle (below)
   composition/<id>/
     <id>.inferred_composition.csv    inferred vs observed genome abundances
     <id>.inference_diagnostics.csv   kernel ID/path, fit settings and status, background share

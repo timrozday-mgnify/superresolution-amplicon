@@ -78,6 +78,26 @@ def test_rectangular_kernel_round_trips_and_rejects_a_bad_home(tmp_path: Path) -
         sm.read_kernel(path)
 
 
+def test_a_kernel_keeps_only_the_labels_it_reaches_and_db_refs_holds_the_rest(tmp_path: Path):
+    """A kernel stores the labels it has a value for and their accessions; the
+    extraction's db_refs is what still tells a hit on the rest of its database (an
+    unexplained read) from a hit on another database (a wrong pairing)."""
+    K = sparse.csr_array(np.array([[1.0, 0.0, 0.0]]))
+    path, sha = tmp_path / "kernel.npz", "a" * 64
+    sm.write_kernel(path, K, ["s"], ["l0", "l1", "l2"], np.array([0]),
+                    ref_headers=["r0", "r1", "r2"], label_of_ref=np.array([0, 1, 2]),
+                    db_amplicons_sha256=sha)
+    k = sm.read_kernel(path)
+    assert k.label_ids == ["l0"] and k.kernel.shape == (1, 1)
+    assert k.ref_headers == ["r0"] and k.label_of_ref.tolist() == [0]
+    assert k.db_refs is None, "no db_refs beside the kernel, so the database is unknown"
+
+    sm.write_db_refs(tmp_path, sha, ["r0", "r1", "r2"])
+    assert sm.read_kernel(path).db_refs == {"r0", "r1", "r2"}
+    with pytest.raises(ValueError, match="holds database"):
+        sm.read_db_refs(tmp_path / sm.db_refs_name(sha), "b" * 64)
+
+
 def test_rectangular_projection_sends_unscaled_mass_to_each_home_label() -> None:
     """With a non-identity home, torch and numpy projections equal r @ ((1-s)E + sK)."""
     import torch
@@ -160,7 +180,11 @@ def test_panel_inference_recovers_genomes_and_background(tmp_path: Path) -> None
                                          "gC": "not_identifiable", "background": "background"}
     d = pd.read_csv(out / "inference_diagnostics.csv").iloc[0]
     assert d.kernel_format == "rectangular" and d.n_sources == 2
-    assert d.n_labels_observed == 4 and d.n_labels_unexplained == 1
+    # The kernel keeps only the labels it reaches (l0, l1, l2), so the 1000 reads on l3
+    # arrive as hits on no label of the kernel instead of as an unexplained column. The
+    # background mass is the same either way, which the two fractions below hold to.
+    assert d.n_labels_observed == 3 and d.n_labels_unexplained == 0
+    assert d.n_unlabelled_hits == 1000
     assert np.isclose(d.observed_unexplained_fraction, 0.1)
     assert np.isclose(d.unexplained_fraction, got.background)
     # Each source's home-label reads, beside its copy weight: the observed copy ratios.

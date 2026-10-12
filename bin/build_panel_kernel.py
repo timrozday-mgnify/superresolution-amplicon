@@ -727,11 +727,24 @@ def combine(a) -> None:
     if not chosen:
         raise SystemExit(f"these primers amplify no genome of {a.panel}")
 
-    kernels = {d: sm.read_kernel(d / "mismapping_matrix.npz") for d in set(chosen.values())}
+    kernels = {d: sm.read_kernel(d / "mismapping_matrix.npz", a.db_refs)
+               for d in set(chosen.values())}
     # A part can be empty: a genome whose every copy had no home label (_drop_unlabelled).
     k0 = max(kernels.values(), key=lambda k: k.kernel.shape[0])
-    if any(k.label_ids != k0.label_ids for k in kernels.values()):
-        raise SystemExit("parts were built against different database labels")
+    if len({k.db_amplicons_sha256 for k in kernels.values()}) > 1:
+        raise SystemExit("parts were built against different database amplicons")
+    # Each part keeps only the labels it has a value for (sparse_matrix._compact), so the
+    # panel's label space is their union and every part's columns are renumbered into it.
+    labels = sorted({label for k in kernels.values() for label in k.label_ids})
+    position = {label: i for i, label in enumerate(labels)}
+    column = {d: np.array([position[label] for label in k.label_ids], dtype=np.int64)
+              for d, k in kernels.items()}
+
+    def _row(d, i, matrix):
+        """Part ``d``'s row ``i`` of ``matrix``, renumbered into the union label space."""
+        row = matrix[[i]].tocoo()
+        return sparse.csr_array((row.data, (np.zeros(row.nnz, dtype=np.int64),
+                                            column[d][row.col])), shape=(1, len(labels)))
     # An empty part (no copy with a home label) adds no row.
     tables = [pd.read_csv(d / "panel_translation.tsv", sep="\t") for d in chosen.values()]
     tables = [t for t in tables if not t.empty]
@@ -753,15 +766,16 @@ def combine(a) -> None:
     picks = [where[s] for s in sources.source]
     if not picks:
         raise SystemExit(f"no genome of {a.panel} has a source with a home label")
-    kernel = sparse.csr_array(sparse.vstack([kernels[d].kernel[[i]] for d, i in picks]))
-    home = np.array([kernels[d].home[i] for d, i in picks], dtype=np.int64)
+    kernel = sparse.csr_array(sparse.vstack([_row(d, i, kernels[d].kernel) for d, i in picks]))
+    home = np.array([column[d][kernels[d].home[i]] for d, i in picks], dtype=np.int64)
     strata = None
     if k0.strata is not None:
-        strata = (sparse.vstack([kernels[d].strata[0][[i]] for d, i in picks]), k0.strata[1])
+        strata = (sparse.vstack([_row(d, i, kernels[d].strata[0]) for d, i in picks]),
+                  k0.strata[1])
     row_of = {pick: r for r, pick in enumerate(picks)}
     neighbours = None
     if k0.neighbours is not None:
-        n = [(row_of[(d, s)], label, dist) for d, k in kernels.items()
+        n = [(row_of[(d, s)], column[d][label], dist) for d, k in kernels.items()
              for s, label, dist in zip(*k.neighbours) if (d, s) in row_of]
         neighbours = tuple(np.asarray(c, dtype=np.int64) for c in zip(*n)) if n else (
             np.zeros(0, np.int64),) * 3
@@ -796,14 +810,30 @@ def combine(a) -> None:
                   if (d / "panel_unlabelled.tsv").exists()]
     if unlabelled:
         pd.concat(unlabelled).to_csv(a.out / "panel_unlabelled.tsv", sep="\t", index=False)
+    # Each part lists the accessions of its own labels only, so the panel's map is their
+    # union; a label two parts share brings the same accessions from both.
+    ref_label = {h: column[d][label] for d, k in kernels.items()
+                 for h, label in zip(k.ref_headers, k.label_of_ref.tolist())}
+    # A hit on neither is a read on some other entry of this database (unexplained) or on
+    # another database (foreign); the panel's bundle carries the accession set that tells
+    # them apart, so inference against it needs nothing else.
+    db_refs = next((k.db_refs for k in kernels.values() if k.db_refs is not None), None)
+    if db_refs is None:
+        log.warning("no %s beside the parts or at --db-refs: inference on this panel will "
+                    "take every hit outside its labels as unexplained",
+                    sm.db_refs_name(k0.db_amplicons_sha256))
+    else:
+        sm.write_db_refs(a.out, k0.db_amplicons_sha256, sorted(db_refs))
     sm.write_kernel(a.out / "mismapping_matrix.npz", kernel, sources.source.tolist(),
-                    k0.label_ids, home, ref_headers=k0.ref_headers,
-                    label_of_ref=k0.label_of_ref, db_amplicons_sha256=k0.db_amplicons_sha256,
+                    labels, home, ref_headers=list(ref_label),
+                    label_of_ref=np.fromiter(ref_label.values(), dtype=np.int64,
+                                             count=len(ref_label)),
+                    db_amplicons_sha256=k0.db_amplicons_sha256,
                     provenance={**k0.provenance, "combined": provenance["parts"]},
                     strata=strata, neighbours=neighbours, kernel_version=k0.kernel_version,
                     **per_source)
     zeros = np.zeros(len(sources), dtype=np.int64)
-    source_table(sources, kernel, home, sources.source.map(identity).to_numpy(), k0.label_ids,
+    source_table(sources, kernel, home, sources.source.map(identity).to_numpy(), labels,
                  *(zeros if v is None else v for v in per_source.values())).to_csv(
         a.out / "panel_sources.tsv", sep="\t", index=False, float_format="%.4f")
     log.info("%d genome part(s) -> %d sources x %d labels in %s", len(chosen), *kernel.shape,
@@ -884,6 +914,9 @@ def main() -> None:
                    help="one-genome mismapping/panel_<key>/ bundles, one primer pair's")
     c.add_argument("--panel-weights", type=Path,
                    help="TSV genome_id<TAB>source<TAB>weight, as prepare's")
+    c.add_argument("--db-refs", type=Path,
+                   help="the extraction's db_refs_<digest>.npz, copied into the panel's "
+                        "bundle; found beside the parts or one level up when not given")
     c.add_argument("-o", "--out", type=Path, required=True)
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")

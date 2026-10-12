@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import logging
 import multiprocessing
 from collections import Counter
@@ -40,6 +41,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import sparse_matrix
 from scipy import sparse
 
 log = logging.getLogger("subspecies_infer")
@@ -352,6 +354,13 @@ def stage_amplicons(args) -> None:
             fh.write(f">{h}\n{s}\n")
     # Over every entry, amplifiable or not: MAPseq maps against the whole DB FASTA.
     write_mapseq_tax([header for header, _ in records], out / "references.tax")
+    # Which accessions this extraction labels at all. A kernel keeps only the accessions
+    # of the labels it reaches (sparse_matrix._compact), and this is what tells a hit on
+    # one of the rest -- an unexplained read -- from a hit on another database. It belongs
+    # here because it is a property of the extraction alone, so the parts of a panel (one
+    # per genome, hundreds under a primer sweep) share this single copy of it.
+    sparse_matrix.write_db_refs(
+        out, hashlib.sha256((out / "amplicons.fasta").read_bytes()).hexdigest(), refseqs)
 
     print(f"amplicons: {len(refseqs)} amplifiable refs / {len(records)} DB entries, "
           f"{len(genomes)} genomes -> {out}")
