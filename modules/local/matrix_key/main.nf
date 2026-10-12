@@ -2,7 +2,7 @@ process MATRIX_KEY {
     tag "$meta.id"
     label 'process_medium'
 
-    container "ghcr.io/timrozday-mgnify/sra-skiver:${params.sra_skiver_tag}"
+    container "ghcr.io/timrozday-mgnify/sramp-python:${params.sramp_python_tag}"
 
     input:
     // mapseq_db: the MAPseq database's identity (the workflow's ch_sets). Every label in the

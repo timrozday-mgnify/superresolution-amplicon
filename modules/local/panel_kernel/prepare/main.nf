@@ -5,7 +5,7 @@ process PANEL_PREPARE {
     tag "$meta.id"
     label 'process_low'
 
-    container "ghcr.io/timrozday-mgnify/sra-skiver:${params.sra_skiver_tag}"
+    container "ghcr.io/timrozday-mgnify/sramp-python:${params.sramp_python_tag}"
 
     input:
     tuple val(meta), path(panel), path(panel_taxa), path(db_amplicons), path(amplicon_dir)

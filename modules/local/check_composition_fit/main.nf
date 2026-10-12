@@ -2,7 +2,7 @@ process CHECK_COMPOSITION_FIT {
     tag "$meta.id"
     label 'process_medium'
 
-    container "ghcr.io/timrozday-mgnify/sra-skiver:${params.sra_skiver_tag}"
+    container "ghcr.io/timrozday-mgnify/sramp-python:${params.sramp_python_tag}"
 
     input:
     tuple val(meta), path(amplicon_dir), path(mismapping_matrix), path(obs_mseq),
@@ -19,6 +19,9 @@ process CHECK_COMPOSITION_FIT {
     def args = task.ext.args ?: ''
     def prefix = task.ext.prefix ?: "${meta.id}"
     """
+    # torch sizes its thread pool to every CPU the container sees, not the task's share,
+    # so concurrent tasks oversubscribe the host. Nov2025's 50 samples: 161 s -> 115 s.
+    export OMP_NUM_THREADS=${task.cpus} MKL_NUM_THREADS=${task.cpus}
     check_composition_fit.py \\
         --composition ${composition} \\
         --posterior-draws ${posterior_draws} \\

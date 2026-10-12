@@ -35,9 +35,10 @@ space the reads cannot identify. The whole-database panel is for small reference
 ## Quick start
 
 ```bash
-# Build the container (once); build context is the repo root for vendor/skiver.
-# On amd64. (Apple Silicon: see "Building on Apple Silicon" below.)
+# Build the containers (once); build context is the repo root for vendor/skiver.
+# sra-skiver on amd64 only (Apple Silicon: see "Building on Apple Silicon" below).
 docker build -f containers/skiver/Dockerfile -t ghcr.io/timrozday-mgnify/sra-skiver:latest .
+docker build -f containers/python/Dockerfile -t ghcr.io/timrozday-mgnify/sramp-python:latest .
 
 # Run on the bundled tiny fixture.
 nextflow run main.nf -profile docker -c tests/nextflow.config \
@@ -45,7 +46,7 @@ nextflow run main.nf -profile docker -c tests/nextflow.config \
     --outdir results
 ```
 
-Outputs land under `results/` (see [Outputs](#outputs)). The image is also built and
+Outputs land under `results/` (see [Outputs](#outputs)). The images are also built and
 published to GHCR by `.github/workflows/build-images.yml` on every push to the default
 branch, so on HPC you can just pull it (see [HPC](#hpc-singularity--apptainer)).
 
@@ -57,13 +58,15 @@ branch, so on HPC you can just pull it (see [HPC](#hpc-singularity--apptainer)).
 ## HPC (Singularity / Apptainer)
 
 The pipeline is designed to run on HPC with Singularity/Apptainer. Both profiles pull
-the same image; `autoMounts` is enabled.
+the same images; `autoMounts` is enabled.
 
 ```bash
 # Pre-pull the image to a shared cache (avoids every task re-pulling).
 export NXF_SINGULARITY_CACHEDIR=/shared/singularity_cache
 singularity pull "$NXF_SINGULARITY_CACHEDIR/sra-skiver-latest.img" \
     docker://ghcr.io/timrozday-mgnify/sra-skiver:latest
+singularity pull "$NXF_SINGULARITY_CACHEDIR/sramp-python-latest.img" \
+    docker://ghcr.io/timrozday-mgnify/sramp-python:latest
 
 nextflow run main.nf -profile singularity \
     --input samplesheet.yml \
@@ -585,7 +588,7 @@ groups, and inference over more than a few hundred members collapses to a near-u
 composition (entry TV 0.21–0.35, `model_misfit` on every sample). Both in
 [dev/panel_silva_sweep.md](dev/panel_silva_sweep.md).
 
-Containers: `--sra_skiver_tag` (default `latest`), `--mapseq_tag` (default
+Containers: `--sra_skiver_tag` and `--sramp_python_tag` (default `latest`), `--mapseq_tag` (default
 `2.1.1b--hc47f52e_1`). Resources: `--max_cpus`, `--max_memory`, `--max_time`.
 
 ## Outputs
@@ -666,10 +669,20 @@ The benchmark exposes these as `--sr_amplicon_mismapping_method` and
 
 ## Containers
 
-Two images. Read mapping runs in the stock mapseq biocontainer
-(`quay.io/biocontainers/mapseq:${mapseq_tag}`, Singularity via depot.galaxyproject.org);
-everything else runs in `sra-skiver`: the skiver Rust binary + its Python error-model
-library, plus torch (CPU), Pyro, and Quarto. Built from
+Three images:
+
+- **mapseq** — read mapping, the stock biocontainer
+  (`quay.io/biocontainers/mapseq:${mapseq_tag}`, Singularity via depot.galaxyproject.org).
+- **`sramp-python`** — every step that does not need skiver: amplicon extraction, matrix
+  keys, panel preparation, read conversion, composition inference and its fit check.
+  numpy/scipy/pandas, torch (CPU), Pyro and edlib, from `containers/python/Dockerfile`.
+  Published for **amd64 and arm64**, so reinterpreting a run over a supplied kernel
+  (`--panel_kernel`), which uses only this image, runs natively on Apple Silicon under
+  `-profile docker`. Under amd64 emulation, inference ran ~4.5x slower.
+- **`sra-skiver`** — error-model training (skiver), read simulation, the panel kernel
+  builds (`PANEL_KERNEL`, and `PANEL_ALIGN`, whose `--align_distance_decay auto` samples a
+  skiver model) and the error-model report: the skiver Rust binary + its Python
+  error-model library, plus torch (CPU), Pyro, and Quarto. Built from
 `containers/skiver/Dockerfile` with **build context = repo root** so the
 `vendor/skiver` submodule is visible. Clone with submodules:
 

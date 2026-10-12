@@ -5,7 +5,7 @@ process READS_TO_FASTA {
     tag "$meta.id"
     label 'process_medium'
 
-    container "ghcr.io/timrozday-mgnify/sra-skiver:${params.sra_skiver_tag}"
+    container "ghcr.io/timrozday-mgnify/sramp-python:${params.sramp_python_tag}"
 
     input:
     tuple val(meta), path(reads)
