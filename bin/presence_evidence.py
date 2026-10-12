@@ -42,7 +42,15 @@ DEFAULT_FLOOR = 0.5       # reads expected on any label from nothing (barcode ho
 # Spill-over per read of the parent, used when a sample has too few clean neighbour pairs
 # to calibrate on. Nov2025's one-edit neighbours held 0.02-2.5% of their parent's reads.
 DEFAULT_RATES = {1: 0.02, 2: 0.002}
-RATE_QUANTILE = 0.95
+# Read the rate off a fixed rank from the top, not off a quantile. Most of a parent's
+# neighbours are database labels no read in the sample lands on, and how many of those the
+# kernel lists is a property of the neighbour search, not of the sample: only a handful of
+# pairs can carry spill at all. A 0.95 quantile measured that spill over the ~10-pair
+# lists this was calibrated against and zero over the ~340-pair lists the search now
+# finds, which drops expected_noise to DEFAULT_FLOOR and calls an absent strain present.
+# Rank 2 is what the quantile amounted to on the short lists -- just below the maximum, so
+# no single spurious pair sets the rate -- and it does not count the pairs beneath it.
+RATE_RANK = 2
 MIN_PARENT_READS = 1000   # neighbours of a member claiming fewer are too noisy to calibrate on
 MIN_PAIRS = 10
 EM_STEPS = 2000
@@ -92,7 +100,7 @@ def _greedy(counts: np.ndarray, groups: dict):
 
 
 def _spill_rates(counts, source_reads, source_neighbours, panel_labels):
-    """Step 2: per-distance spill rate, a high quantile over clean neighbour pairs.
+    """Step 2: per-distance spill rate, the ``RATE_RANK``-th largest ratio among clean pairs.
 
     A pair is (amplicon, non-panel label within reach of that amplicon only); its ratio is
     the label's reads over the reads the amplicon should carry (every claiming member's
@@ -110,8 +118,8 @@ def _spill_rates(counts, source_reads, source_neighbours, panel_labels):
     rates, n_pairs = {}, {}
     for d, default in DEFAULT_RATES.items():
         n_pairs[d] = len(ratios[d])
-        rates[d] = (float(np.quantile(ratios[d], RATE_QUANTILE)) if len(ratios[d]) >= MIN_PAIRS
-                    else default)
+        rates[d] = (float(np.partition(ratios[d], -RATE_RANK)[-RATE_RANK])
+                    if len(ratios[d]) >= MIN_PAIRS else default)
     return rates, n_pairs
 
 
