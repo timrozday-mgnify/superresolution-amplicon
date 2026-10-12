@@ -4,7 +4,7 @@
 # `--align_distance_decay auto` samples a skiver error model) stay in sra-skiver.
 #
 # No Rust build, so it builds for arm64 as well as amd64: an Apple-silicon laptop runs
-# it natively under Docker instead of emulating x86, which made inference ~4.5x slower.
+# it natively under Docker instead of emulating x86, which doubled inference time.
 #   docker build -f containers/python/Dockerfile -t sramp-python .
 FROM python:3.11-slim-bookworm
 

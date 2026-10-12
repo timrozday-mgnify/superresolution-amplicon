@@ -678,7 +678,7 @@ Three images:
   numpy/scipy/pandas, torch (CPU), Pyro and edlib, from `containers/python/Dockerfile`.
   Published for **amd64 and arm64**, so reinterpreting a run over a supplied kernel
   (`--panel_kernel`), which uses only this image, runs natively on Apple Silicon under
-  `-profile docker`. Under amd64 emulation, inference ran ~4.5x slower.
+  `-profile docker`. Under amd64 emulation, each inference took twice as long.
 - **`sra-skiver`** — error-model training (skiver), read simulation, the panel kernel
   builds (`PANEL_KERNEL`, and `PANEL_ALIGN`, whose `--align_distance_decay auto` samples a
   skiver model) and the error-model report: the skiver Rust binary + its Python
