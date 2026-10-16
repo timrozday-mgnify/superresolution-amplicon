@@ -221,8 +221,11 @@ def override_weights(rows: list[dict], path: Path) -> list[dict]:
     that source from the genome. Every named source must be one of the genome's own
     extracted amplicons, so a typo or a stale v4g id fails rather than inventing one.
     It exists for a member whose reference genome's copies disagree with the cultured
-    strain's, as reads show it -- V. parvula DSM 2008 on CP001820 has 1:2:1, every
-    Nov2025 sample 3:1:0.
+    strain's, as reads show it. Label counts are not that evidence: alleles a base or
+    two apart share a database label, so a genome's 1:2:1 and a 3:1:0 override predict
+    the same counts, and the override wins by default. Measure the split on reads at
+    sequence level -- the V. parvula DSM 2008 override this was written for turned out
+    to be the label artefact, not CP001820's copies, and was removed.
     """
     override = pd.read_csv(path, sep="\t", comment="#")
     if not {"genome_id", "source", "weight"} <= set(override.columns):
