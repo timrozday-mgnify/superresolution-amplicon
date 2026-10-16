@@ -181,12 +181,29 @@ def _home_labels(home_mseq: Path, src: dict[str, int], label_of_hit: dict[str, i
     """Each source's MAPseq label (-1 when unhit) and identity, from the sources' own mapping.
 
     An exact hit (identity 1) on a label other than the source's own V4 group is a tie
-    MAPseq broke, not a relabel: both references match every base it scored. It breaks
-    them badly when one carries Ns -- a draft genome's assembly gap inside V4 extracts a
-    malformed singleton group that scores 1 against everything it covers, and won
-    S. salivarius's home away from the 4,867 references real reads land on. So an exact
-    tie keeps the source's own group whenever the database has it. A relabel below
-    identity 1 (2acb -> 81c3 at 0.996) is what MAPseq does to real reads too, and stands.
+    MAPseq broke, not a relabel: both references match every base it scored. Real reads
+    from the source are tied the same way, by the same mapper against the same database,
+    so the two labels are not separable here and one of them will take both sources'
+    reads. The tie goes to whichever label the database supports more -- the group with
+    more references -- and the source's own group keeps a draw.
+
+    That cuts both ways, which is why the count decides and not a fixed preference:
+
+    * A malformed group wins a tie it should lose. A draft genome's assembly gap inside
+      V4 extracts a singleton group that scores 1 against everything it covers, and won
+      S. salivarius's home away from the 4,867 references real reads land on. 4,867 > 1,
+      so the source keeps its own group.
+    * A real group loses a tie it should win. V. parvula CP001820's 2-copy V4 allele is
+      one base from its 1-copy allele; MAPseq puts both on the 1-copy allele's 1,059
+      references and leaves 143 for the 2-copy one. Giving the source its own group back
+      modelled half the organism's reads onto a label that then drew 0.6% of them, and
+      cost V. parvula 3.6x of its abundance in Nov2025. 1,059 > 143, so the source takes
+      MAPseq's label and the two merge: downstream sums the weights of the sources that
+      share a home, so the genome's copy structure is preserved and only the split
+      between two labels nothing can separate is given up.
+
+    A relabel below identity 1 (2acb -> 81c3 at 0.996) is what MAPseq does to real reads
+    too, and stands either way.
 
     MAPseq maps against the whole database, so its hit can also be an entry these primers
     do not amplify, which therefore has no label. 1492R sits at the 3' end of the 16S, where
@@ -196,6 +213,7 @@ def _home_labels(home_mseq: Path, src: dict[str, int], label_of_hit: dict[str, i
     """
     home = np.full(len(src), -1, dtype=np.int64)
     identity = np.full(len(src), np.nan)
+    support = Counter(label_of_hit.values())
     for query, hit, hit_identity in _mseq_rows(home_mseq):
         if query in src and hit in label_of_hit:
             home[src[query]] = label_of_hit[hit]
@@ -208,8 +226,16 @@ def _home_labels(home_mseq: Path, src: dict[str, int], label_of_hit: dict[str, i
                      "own group", source)
             home[i], identity[i] = own[source], 1.0
         elif identity[i] == 1.0:
-            log.info("%s: exact MAPseq tie on %d; keeping its own group", source, home[i])
-            home[i] = own[source]
+            hit_refs, own_refs = support[home[i]], support[own[source]]
+            if hit_refs > own_refs:
+                log.warning("%s: exact MAPseq tie on %d, which has %d database reference(s) "
+                            "to its own group's %d; taking MAPseq's label, so this source "
+                            "merges into it", source, home[i], hit_refs, own_refs)
+            else:
+                log.info("%s: exact MAPseq tie on %d (%d database reference(s) to its own "
+                         "group's %d); keeping its own group", source, home[i], hit_refs,
+                         own_refs)
+                home[i] = own[source]
     return home, identity
 
 

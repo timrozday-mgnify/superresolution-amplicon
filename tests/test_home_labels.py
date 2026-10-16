@@ -34,3 +34,35 @@ def test_hit_without_a_label_keeps_the_sources_own_group(tmp_path):
 def test_unhit_source_keeps_its_own_group(tmp_path):
     home, _ = _home(tmp_path, [("in_db", "", "")])
     assert home[0] == 0
+
+
+def _tie(tmp_path, hit, label_of_hit):
+    """One source, `src|0`'s own group (label 0), tied by MAPseq onto `hit` at identity 1."""
+    mseq = tmp_path / "tie.mseq"
+    mseq.write_text(f"src\t{hit}\t250\t1.0\n")
+    return bpk._home_labels(mseq, {"src": 0}, label_of_hit, {"src": 0})
+
+
+def test_an_exact_tie_goes_to_the_better_supported_label(tmp_path):
+    """A tie means the mapper cannot separate the two labels, so real reads from this
+    source land wherever its references do. The bigger group takes them.
+
+    Keeping the source's own group regardless is what modelled half of V. parvula's
+    reads onto a label that then drew 0.6% of them.
+    """
+    # The source's own group has 2 references, MAPseq's tied label has 4.
+    label_of_hit = {"own|0": 0, "own|1": 0, "big|0": 1, "big|1": 1, "big|2": 1, "big|3": 1}
+    home, identity = _tie(tmp_path, "big|0", label_of_hit)
+    assert home[0] == 1 and identity[0] == 1.0       # merges into the bigger group
+
+
+def test_an_exact_tie_on_a_thinner_label_keeps_the_sources_own_group(tmp_path):
+    """The S. salivarius case: a malformed singleton scores 1 against everything it
+    covers and must not win the home of the references real reads land on."""
+    label_of_hit = {"own|0": 0, "own|1": 0, "own|2": 0, "singleton|0": 1}
+    home, _ = _tie(tmp_path, "singleton|0", label_of_hit)
+    assert home[0] == 0
+
+    # A draw keeps the source's own group too: nothing argues for moving it.
+    home, _ = _tie(tmp_path, "other|0", {"own|0": 0, "other|0": 1})
+    assert home[0] == 0
