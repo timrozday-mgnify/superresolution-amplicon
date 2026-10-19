@@ -534,6 +534,28 @@ nextflow_pipeline {
         }
     }
 
+    test("home_query_primers is recorded in the panel kernel's provenance - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input              = "${projectDir}/assets/samplesheet.example.yml"
+                outdir             = "$outputDir"
+                home_query_primers = true
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert new groovy.json.JsonSlurper().parse(
+                         file("${params.outdir}/mismapping").listFiles()
+                             .find { it.name.startsWith('panel_') }
+                             .toPath().resolve('provenance.json').toFile())
+                         .home_query_primers == true }
+            )
+        }
+    }
+
     test("alignment builds a panel kernel without simulation - stub") {
         tag "stub"
         options "-stub"

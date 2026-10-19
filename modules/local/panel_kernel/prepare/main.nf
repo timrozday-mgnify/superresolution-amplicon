@@ -15,6 +15,7 @@ process PANEL_PREPARE {
     output:
     tuple val(meta), path("${meta.id}_prepared"),               emit: prepared
     tuple val(meta), path("${meta.id}_prepared/sources.fasta"), emit: sources
+    tuple val(meta), path("${meta.id}_prepared/home_queries.fasta"), emit: home_queries
     path "versions.yml",                                        emit: versions
 
     when:
@@ -43,6 +44,7 @@ process PANEL_PREPARE {
     """
     mkdir -p ${meta.id}_prepared
     printf '>v4g_0000000000000000\\nACGTACGTACGT\\n' > ${meta.id}_prepared/sources.fasta
+    cp ${meta.id}_prepared/sources.fasta ${meta.id}_prepared/home_queries.fasta
     printf 'genome_id\\tsource\\tweight\\nref\\tv4g_0000000000000000\\t1.0\\n' > ${meta.id}_prepared/panel_translation.tsv
     printf 'source\\tgenomes\\tin_db\\nv4g_0000000000000000\\tref\\tTrue\\n' > ${meta.id}_prepared/sources.tsv
 
