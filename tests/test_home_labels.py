@@ -84,7 +84,7 @@ def _prepare(tmp_path, **flags):
 
 
 def test_home_queries_carry_the_primers_only_when_asked(tmp_path):
-    """AAP's merged reads keep both primers (each mate's 3' read-through is not trimmed),
+    """AAP's merged reads keep both primers (the OTU path trims none before MAPseq),
     and MAPseq places them differently: V. parvula's 2-copy allele lands on its 1-copy
     allele's references only with the primers attached. The home query must match."""
     source = bpk.v4g("ACGTACGTAC")
