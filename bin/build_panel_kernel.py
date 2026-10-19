@@ -387,6 +387,13 @@ def prepare(a) -> None:
     sources.to_csv(a.out / "sources.tsv", sep="\t", index=False)
     with open(a.out / "sources.fasta", "w") as fh:
         fh.writelines(f">{s}\n{sequence[s]}\n" for s in sources.source)
+    # What MAPSEQ_PANEL_HOME maps. The home label is where a source's real reads land, so
+    # the query must look like a real read: with --home-query-primers it carries the
+    # primers as given, IUPAC codes and all. Without the flag it is sources.fasta.
+    flank = ((a.fwd_primer, si.revcomp(a.rev_primer)) if getattr(a, "home_query_primers", False)
+             else ("", ""))
+    with open(a.out / "home_queries.fasta", "w") as fh:
+        fh.writelines(f">{s}\n{flank[0]}{sequence[s]}{flank[1]}\n" for s in sources.source)
     n_genomes = translation.genome_id.nunique() if whole_database else len(copies)
     log.info("%d genomes (%d unamplifiable, dropped), %d distinct sources, %d in the "
              "database, %d shared", n_genomes, len(dropped), len(sources),
@@ -896,6 +903,11 @@ def main() -> None:
                         "copy-count weights")
     p.add_argument("--allow-empty", action="store_true",
                    help="write an empty preparation, not fail, when nothing amplifies")
+    # ponytail: temporary. Remove once AAP trims the read-through primer off each mate's
+    # 3' end; its merged reads then match the primer-trimmed amplicon again.
+    p.add_argument("--home-query-primers", action="store_true",
+                   help="map each source for its home label with --fwd-primer and the reverse "
+                        "complement of --rev-primer attached, as untrimmed merged reads carry them")
     p.add_argument("-o", "--out", type=Path, required=True)
     b = sub.add_parser("build")
     b.add_argument("--prepared", type=Path, required=True)
@@ -912,7 +924,7 @@ def main() -> None:
     al.add_argument("--prepared", type=Path, required=True)
     al.add_argument("--db-amplicons", type=Path, required=True)
     al.add_argument("--home-mseq", type=Path, default=None,
-                    help="MAPseq of sources.fasta; without it each source's home is its own group")
+                    help="MAPseq of home_queries.fasta; without it each source's home is its own group")
     al.add_argument("--tau", type=int, default=1)
     al.add_argument("--distance-decay", default="0.007",
                     help="weight a label d edits away by c**d, or 'auto' to measure c")

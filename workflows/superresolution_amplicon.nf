@@ -331,7 +331,7 @@ workflow SUPERRESOLUTION_AMPLICON {
                 flat_del_rate: params.flat_del_rate, mapseq_args: params.mapseq_args,
                 mapseq_min_identity: params.mapseq_min_identity, mapseq_tag: params.mapseq_tag,
                 seed: params.seed, samples: members
-            ]
+            ] + (params.home_query_primers.toString() == 'true' ? [home_query_primers: true] : [:])
             [[id: id, matrix_key: id, panel: panel, panel_taxa: panel_taxa,
               model_identity: rep[3], members: members, db_id: rep[0].id,
               provenance: provenance] + rep[0].subMap(['fwd_primer', 'rev_primer']),
@@ -376,11 +376,15 @@ workflow SUPERRESOLUTION_AMPLICON {
             log.warn "${meta.members.join(', ')}: no panel genome amplifies; no kernel built"
             false
         }
-        // [ meta, sources, fasta, tax, mscluster ] against the representative's database.
+        // [ meta, home queries, fasta, tax, mscluster ] against the representative's
+        // database. The home queries are sources.fasta, primer-flanked under
+        // --home_query_primers.
         ch_panel_db = ch_panel_sources
-            .map { meta, sources -> [ meta.db_id, meta, sources ] }
+            .map { meta, sources -> [ meta.id, meta ] }
+            .join(PANEL_PREPARE.out.home_queries.map { meta, queries -> [ meta.id, queries ] })
+            .map { id, meta, queries -> [ meta.db_id, meta, queries ] }
             .combine(ch_db, by: 0)
-            .map { db_id, meta, sources, fasta, tax, mscluster -> [ meta, sources, fasta, tax, mscluster ] }
+            .map { db_id, meta, queries, fasta, tax, mscluster -> [ meta, queries, fasta, tax, mscluster ] }
         MAPSEQ_PANEL_HOME(ch_panel_db)
         // [ panel id, database amplicons.fasta ]
         ch_db_amplicons = ch_panel_groups.map { meta, panel, d, model -> [ meta.id, d.resolve('amplicons.fasta') ] }

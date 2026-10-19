@@ -14,7 +14,7 @@ process MATRIX_KEY {
     path "versions.yml", emit: versions
 
     script:
-    def settings = [
+    def settings = ([
         // Must equal sparse_matrix.KERNEL_VERSION (tests/test_measured_mismapping.py checks).
         kernel_version: 4,
         panel: meta.panel ?: 'database', panel_taxa: meta.panel_taxa ?: '',
@@ -38,7 +38,10 @@ process MATRIX_KEY {
         sim_read_structure: params.sim_read_structure, sim_mate_len: params.sim_mate_len,
         mapseq_args: params.mapseq_args, mapseq_min_identity: params.mapseq_min_identity,
         mapseq_tag: params.mapseq_tag, mapseq_db: mapseq_db, seed: params.seed, identity: identity
-    ].collect { k, v -> "${k}=${v}" }.sort().join('\n')
+    ] + (
+        // Only when on, so the key of every run without the temporary flag is unchanged.
+        params.home_query_primers.toString() == 'true' ? [home_query_primers: true] : [:]
+    )).collect { k, v -> "${k}=${v}" }.sort().join('\n')
     """
     sha256sum ${amplicon_dir}/amplicons.fasta | awk '{print \$1}' > reference_sha256.txt
     { cat reference_sha256.txt; printf '%s\\n' '${settings}'; sha256sum ${identity_file} | awk '{print \$1}'; } | sha256sum | awk '{print \$1}' > matrix_key.txt
