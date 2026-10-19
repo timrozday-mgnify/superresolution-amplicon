@@ -295,11 +295,17 @@ _TAX_HEADER = ("#cutoff: 0.00:0.08 0.80:0.35 0.95:0.05\n"
 
 
 def write_mapseq_tax(headers: list[str], path: Path) -> None:
-    """Write the mapseq ``.tax`` sidecar: ``<header>\\tBacteria;<genome>;<header>``."""
+    """Write the mapseq ``.tax`` sidecar: ``<header>\\t<kingdom>;<genome>;<header>``.
+
+    The kingdom is Archaea for a header carrying the panel's cmsearch ``SSU_rRNA_archaea``
+    tag (e.g. M. smithii) and Bacteria otherwise; headers without the tag (GTDB, SILVA)
+    say Bacteria whatever their domain, as nothing reads this field.
+    """
     with open(path, "w") as fh:
         fh.write(_TAX_HEADER)
         for h in headers:
-            fh.write(f"{h}\tBacteria;{genome_of_header(h)};{h}\n")
+            kingdom = "Archaea" if "SSU_rRNA_archaea" in h else "Bacteria"
+            fh.write(f"{h}\t{kingdom};{genome_of_header(h)};{h}\n")
 
 
 def stage_amplicons(args) -> None:
@@ -898,7 +904,7 @@ def demo_amplicons() -> None:
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         db = td / "db.fasta"
-        headers = ["gA|0|x", "gA|1|y", "gB|0|z"]
+        headers = ["gA|0|x", "gA|1|y", "gB|0|ENA|Z1|Z1.1-SSU_rRNA_archaea/1-1500"]
         with open(db, "w") as fh:
             for i, h in enumerate(headers):
                 fh.write(f">{h}\n{seq[:-3] + 'ACG'[i]}\n")   # all amplifiable
@@ -914,6 +920,7 @@ def demo_amplicons() -> None:
         tax = (td / "out" / "references.tax").read_text().splitlines()
         assert tax[0].startswith("#cutoff:") and len(tax) == 3 + len(headers) + 1, tax
         assert tax[3] == "gA|0|x\tBacteria;gA;gA|0|x", tax[3]
+        assert tax[5].startswith(f"{headers[2]}\tArchaea;gB;"), tax[5]
         # A bare SILVA accession (no '|') is its own genome, amplicon or not.
         assert tax[-1] == "AB1.1.1500\tBacteria;AB1.1.1500;AB1.1.1500", tax[-1]
         assert genome_of_header("AB1.1.1500") == "AB1.1.1500"
