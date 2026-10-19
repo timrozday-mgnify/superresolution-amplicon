@@ -903,11 +903,10 @@ def main() -> None:
                         "copy-count weights")
     p.add_argument("--allow-empty", action="store_true",
                    help="write an empty preparation, not fail, when nothing amplifies")
-    # ponytail: temporary. Remove once AAP trims the read-through primer off each mate's
-    # 3' end; its merged reads then match the primer-trimmed amplicon again.
     p.add_argument("--home-query-primers", action="store_true",
                    help="map each source for its home label with --fwd-primer and the reverse "
-                        "complement of --rev-primer attached, as untrimmed merged reads carry them")
+                        "complement of --rev-primer attached, as reads that keep their primers "
+                        "are mapped (AAP's OTU path trims none)")
     p.add_argument("-o", "--out", type=Path, required=True)
     b = sub.add_parser("build")
     b.add_argument("--prepared", type=Path, required=True)

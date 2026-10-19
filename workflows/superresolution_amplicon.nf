@@ -35,6 +35,14 @@ def fileDigest(path) {
     md.digest().encodeHex().toString()
 }
 
+// Whether each panel source's home query carries the primers: --home_query_primers, else
+// whatever the reads keep (--trim_primers false: primers on, as on AAP's OTU path).
+// MATRIX_KEY applies the same rule.
+def homeQueryPrimers() {
+    params.home_query_primers != null ? params.home_query_primers.toString() == 'true'
+                                      : params.trim_primers.toString() != 'true'
+}
+
 workflow SUPERRESOLUTION_AMPLICON {
     take:
     ch_reads      // [ meta, [ reads ] ]                (meta.id, meta.platform)
@@ -331,7 +339,7 @@ workflow SUPERRESOLUTION_AMPLICON {
                 flat_del_rate: params.flat_del_rate, mapseq_args: params.mapseq_args,
                 mapseq_min_identity: params.mapseq_min_identity, mapseq_tag: params.mapseq_tag,
                 seed: params.seed, samples: members
-            ] + (params.home_query_primers.toString() == 'true' ? [home_query_primers: true] : [:])
+            ] + (homeQueryPrimers() ? [home_query_primers: true] : [:])
             [[id: id, matrix_key: id, panel: panel, panel_taxa: panel_taxa,
               model_identity: rep[3], members: members, db_id: rep[0].id,
               provenance: provenance] + rep[0].subMap(['fwd_primer', 'rev_primer']),
