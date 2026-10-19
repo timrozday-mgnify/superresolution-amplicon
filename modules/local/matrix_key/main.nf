@@ -39,8 +39,11 @@ process MATRIX_KEY {
         mapseq_args: params.mapseq_args, mapseq_min_identity: params.mapseq_min_identity,
         mapseq_tag: params.mapseq_tag, mapseq_db: mapseq_db, seed: params.seed, identity: identity
     ] + (
-        // Only when on, so the key of every run without the temporary flag is unchanged.
-        params.home_query_primers.toString() == 'true' ? [home_query_primers: true] : [:]
+        // Only when on, so runs whose home queries are the trimmed amplicons keep their key.
+        // Same rule as the workflow's provenance: --home_query_primers, else --trim_primers.
+        (params.home_query_primers != null ? params.home_query_primers.toString() == 'true'
+                                           : params.trim_primers.toString() != 'true')
+            ? [home_query_primers: true] : [:]
     )).collect { k, v -> "${k}=${v}" }.sort().join('\n')
     """
     sha256sum ${amplicon_dir}/amplicons.fasta | awk '{print \$1}' > reference_sha256.txt

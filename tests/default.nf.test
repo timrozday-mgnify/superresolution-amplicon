@@ -534,14 +534,14 @@ nextflow_pipeline {
         }
     }
 
-    test("home_query_primers is recorded in the panel kernel's provenance - stub") {
+    test("untrimmed reads get primer-flanked home queries by default - stub") {
         tag "stub"
         options "-stub"
         when {
             params {
-                input              = "${projectDir}/assets/samplesheet.example.yml"
-                outdir             = "$outputDir"
-                home_query_primers = true
+                input        = "${projectDir}/assets/samplesheet.example.yml"
+                outdir       = "$outputDir"
+                trim_primers = false
             }
         }
         then {
@@ -552,6 +552,29 @@ nextflow_pipeline {
                              .find { it.name.startsWith('panel_') }
                              .toPath().resolve('provenance.json').toFile())
                          .home_query_primers == true }
+            )
+        }
+    }
+
+    test("home_query_primers false overrides untrimmed reads - stub") {
+        tag "stub"
+        options "-stub"
+        when {
+            params {
+                input              = "${projectDir}/assets/samplesheet.example.yml"
+                outdir             = "$outputDir"
+                trim_primers       = false
+                home_query_primers = false
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert !new groovy.json.JsonSlurper().parse(
+                         file("${params.outdir}/mismapping").listFiles()
+                             .find { it.name.startsWith('panel_') }
+                             .toPath().resolve('provenance.json').toFile())
+                         .containsKey('home_query_primers') }
             )
         }
     }
