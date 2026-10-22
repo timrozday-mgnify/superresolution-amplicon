@@ -361,8 +361,6 @@ def run(a) -> None:
     merge into one zero-count sink (``_subset_kernel``). ``theta`` is over the panel genomes
     plus ``background``, whose mass is reported as ``unexplained_fraction``.
     """
-    import torch
-
     c = _panel_context(a.mismapping_matrix, a.amplicon_dir, a.obs_mseq, a.min_identity,
                        a.no_mismapping)
     fitted, fitted_home, y, genome_of_row, weight = (c.fitted, c.home, c.y, c.genome_of_row,
@@ -396,29 +394,19 @@ def run(a) -> None:
     if no_hits or low_depth:
         inferred, theta_obs = np.zeros(G + 1), np.zeros(G + 1)
     else:
-        if infer_decay:
-            M = si.DecayKernel(fitted, c.strata[0], c.strata[1], home=fitted_home)
+        init = np.clip(theta_obs, 1e-4, None)
+        if getattr(a, "backend", "pyro") == "numpy":
+            samples, point, diag, losses = _fit_numpy(a, fitted, fitted_home, y, genome_of_row,
+                                                      weight, G + 1, init / init.sum())
         else:
-            coo = fitted.tocoo()
-            M = (torch.sparse_coo_tensor(
-                    torch.tensor(np.vstack([coo.row, coo.col]), dtype=torch.long),
-                    torch.tensor(coo.data, dtype=torch.float64), size=fitted.shape).coalesce(),
-                 torch.tensor(sm.home_entries(fitted, fitted_home), dtype=torch.float64),
-                 None, torch.tensor(fitted_home, dtype=torch.long))
-        T = (torch.tensor(genome_of_row, dtype=torch.long),
-             torch.tensor(weight, dtype=torch.float64), G + 1)
-        init = torch.tensor(np.clip(theta_obs, 1e-4, None), dtype=torch.float64)
-        fa = _fit_args(a)
-        fa.use_mismapping = True             # --no-mismapping already replaced K above
-        samples, point, diag, losses = si._fit(
-            a.mode, M, T, a.alpha, float(total), torch.tensor(y / total, dtype=torch.float64),
-            "dirichlet_multinomial", init / init.sum(), fa, desc=a.sample_id)
+            samples, point, diag, losses = _fit_pyro(a, fitted, fitted_home, y, genome_of_row,
+                                                     weight, G + 1, init / init.sum(), infer_decay,
+                                                     c.strata)
         other_draws = diag.pop("_posterior_draws")
         draws = np.asarray(other_draws.pop("theta_eff"), dtype=np.float64)
-        inferred = point.numpy()
+        inferred = point
         if samples is not None:
-            lo = torch.quantile(samples, 0.05, dim=0).numpy()
-            hi = torch.quantile(samples, 0.95, dim=0).numpy()
+            lo, hi = np.quantile(samples, [0.05, 0.95], axis=0)
         presence = np.array(diag.pop("presence_prob", [np.nan] * (G + 1)))
 
     fit_status = "low_depth" if low_depth else "ok"
@@ -494,6 +482,44 @@ def run(a) -> None:
         pd.DataFrame({"sample": a.sample_id, "step": range(len(losses)),
                       "loss": losses}).to_csv(out / "loss_trace.csv", index=False)
     print(f"infer[{a.mode}]: sample {a.sample_id}, {G} panel genomes + background -> {out}")
+
+
+def _fit_pyro(a, fitted, home, y, genome_of_row, weight, n_genomes, init, infer_decay, strata):
+    """``si._fit`` on torch tensors; returns numpy ``(samples, point, diag, losses)``."""
+    import torch
+
+    if infer_decay:
+        M = si.DecayKernel(fitted, strata[0], strata[1], home=home)
+    else:
+        coo = fitted.tocoo()
+        M = (torch.sparse_coo_tensor(
+                torch.tensor(np.vstack([coo.row, coo.col]), dtype=torch.long),
+                torch.tensor(coo.data, dtype=torch.float64), size=fitted.shape).coalesce(),
+             torch.tensor(sm.home_entries(fitted, home), dtype=torch.float64),
+             None, torch.tensor(home, dtype=torch.long))
+    T = (torch.tensor(genome_of_row, dtype=torch.long),
+         torch.tensor(weight, dtype=torch.float64), n_genomes)
+    fa = _fit_args(a)
+    fa.use_mismapping = True             # --no-mismapping already replaced K
+    total = float(y.sum())
+    samples, point, diag, losses = si._fit(
+        a.mode, M, T, a.alpha, total, torch.tensor(y / total, dtype=torch.float64),
+        "dirichlet_multinomial", torch.tensor(init, dtype=torch.float64), fa, desc=a.sample_id)
+    return (None if samples is None else samples.numpy()), point.numpy(), diag, losses
+
+
+def _fit_numpy(a, fitted, home, y, genome_of_row, weight, n_genomes, init):
+    """The same VI fit without torch (``numpy_vi``): Pyodide's path."""
+    import numpy_vi as nv
+
+    if a.mode != "vi" or getattr(a, "infer_distance_decay", False) or getattr(a, "horseshoe", False):
+        raise SystemExit("--backend numpy fits --mode vi only, without --infer-distance-decay "
+                         "or --horseshoe")
+    problem = nv.Problem(fitted, home, sm.home_entries(fitted, home), genome_of_row, weight,
+                         n_genomes, y, alpha=a.alpha, s_sigma=getattr(a, "s_sigma", 0.3),
+                         use_presence=not a.no_presence, presence_prior=a.presence_prior,
+                         presence_temp=a.presence_temp)
+    return nv.fit(problem, init, steps=a.steps, lr=a.lr, num_samples=a.num_samples, seed=a.seed)
 
 
 def _panel_context(kernel_path: Path, amplicon_dir: Path, obs_mseq, min_identity,
@@ -619,6 +645,8 @@ def main() -> None:
     ap.add_argument("--mismapping-matrix-path", default=None,
                     help="output-relative canonical matrix path for diagnostics")
     ap.add_argument("--mode", choices=["nuts", "vi", "mle"], default="vi")
+    ap.add_argument("--backend", choices=["pyro", "numpy"], default="pyro",
+                    help="numpy: the same --mode vi fit without torch (numpy_vi.py), for Pyodide")
     ap.add_argument("--alpha", type=float, default=0.5, help="Dirichlet prior concentration")
     ap.add_argument("--no-mismapping", action="store_true",
                     help="disable the mis-mapping correction (r_obs=r_true baseline)")
