@@ -17,6 +17,7 @@ Every kernel also carries ``kernel_version``; a file without the field reads as 
 
 from __future__ import annotations
 
+import functools
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -131,19 +132,31 @@ def write_db_refs(directory: Path, db_amplicons_sha256: str, ref_headers) -> Pat
     return path
 
 
-def read_db_refs(path: Path, db_amplicons_sha256: str = "") -> set[str]:
-    """Load the accession set written by ``write_db_refs``, checking whose database it is."""
+def read_db_refs(path: Path, db_amplicons_sha256: str = "") -> frozenset[str]:
+    """Load the accession set written by ``write_db_refs``, checking whose database it is.
+
+    Each file is read once per process and the set shared: it holds millions of
+    accessions, and ``combine`` reads one per part, which made 24 parts peak at 4.8 GB.
+    """
     try:
-        with np.load(path, allow_pickle=False) as archive:
-            if str(archive["format"]) != "db_refs":
-                raise ValueError("not a db_refs file")
-            stored = str(archive["db_amplicons_sha256"])
-            headers = archive["ref_headers"].tobytes().decode()
+        stat = Path(path).stat()
+        stored, refs = _load_db_refs(str(Path(path).resolve()), stat.st_mtime_ns, stat.st_size)
     except (KeyError, OSError, ValueError) as exc:
         raise ValueError(f"invalid database accession file {path}") from exc
     if db_amplicons_sha256 and stored != db_amplicons_sha256:
         raise ValueError(f"{path} holds database {stored[:12]}, not {db_amplicons_sha256[:12]}")
-    return set(headers.split("\n")) if headers else set()
+    return refs
+
+
+@functools.lru_cache(maxsize=4)
+def _load_db_refs(path: str, _mtime_ns: int, _size: int) -> tuple[str, frozenset[str]]:
+    """``(digest, accessions)`` of a db_refs file; keyed by its stat, so a rewrite is reread."""
+    with np.load(path, allow_pickle=False) as archive:
+        if str(archive["format"]) != "db_refs":
+            raise ValueError("not a db_refs file")
+        stored = str(archive["db_amplicons_sha256"])
+        headers = archive["ref_headers"].tobytes().decode()
+    return stored, frozenset(headers.split("\n")) if headers else frozenset()
 
 
 def _read_strata(archive, pattern: sparse.csr_array):
