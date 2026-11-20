@@ -111,6 +111,22 @@ def db_groups(db_amplicons: Path) -> tuple[list[str], list[str], np.ndarray, lis
     return _db_groups(str(Path(db_amplicons).resolve()), stat.st_size, stat.st_mtime_ns)
 
 
+def file_sha256(path: Path) -> str:
+    """The file's sha256, read in 1 MB chunks (a pair's amplicons are ~0.5 GB), and kept
+    for the file as it is, as :func:`db_groups` is."""
+    stat = Path(path).stat()
+    return _file_sha256(str(Path(path).resolve()), stat.st_size, stat.st_mtime_ns)
+
+
+@functools.lru_cache(maxsize=4)
+def _file_sha256(path: str, _size: int, _mtime_ns: int) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while chunk := fh.read(1 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 @functools.lru_cache(maxsize=1)
 def _db_groups(path: str, _size: int, _mtime_ns: int):
     records = si.read_fasta(Path(path))
@@ -504,7 +520,7 @@ def build(a) -> None:
                   **dict(x.split("=", 1) for x in a.provenance)}
     sm.write_kernel(a.out, kernel, source_ids, label_ids, home, ref_headers=headers,
                     label_of_ref=label_of_ref,
-                    db_amplicons_sha256=hashlib.sha256(a.db_amplicons.read_bytes()).hexdigest(),
+                    db_amplicons_sha256=file_sha256(a.db_amplicons),
                     n_simulated=n_simulated, n_unmapped=n_unmapped, provenance=provenance)
     source_table(sources, kernel, home, home_identity, label_ids, n_simulated, n_unmapped).to_csv(
         a.out.with_name("panel_sources.tsv"), sep="\t", index=False, float_format="%.4f")
@@ -667,7 +683,7 @@ def align(a) -> None:
                   "home_mseq": None if a.home_mseq is None else str(a.home_mseq)}
     sm.write_kernel(a.out, kernel, source_ids, label_ids, home, ref_headers=headers,
                     label_of_ref=label_of_ref,
-                    db_amplicons_sha256=hashlib.sha256(a.db_amplicons.read_bytes()).hexdigest(),
+                    db_amplicons_sha256=file_sha256(a.db_amplicons),
                     provenance=provenance, strata=strata, neighbours=neighbours)
     zeros = np.zeros(len(source_ids), dtype=np.int64)
     source_table(sources, kernel, home, home_identity, label_ids, zeros, zeros).to_csv(
