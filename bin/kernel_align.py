@@ -283,5 +283,6 @@ def ambiguity_weights(seqs: list[str], weight: float) -> np.ndarray | None:
     """
     if weight == 1.0:
         return None
-    k = np.array([sum(c not in _BASES for c in s) for s in seqs], dtype=np.float64)
+    k = np.fromiter((len(s) - sum(map(s.count, _BASES)) for s in seqs), dtype=np.float64,
+                    count=len(seqs))
     return weight ** k

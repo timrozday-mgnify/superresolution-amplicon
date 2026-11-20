@@ -30,6 +30,7 @@ into a panel's bundle, so each genome is prepared once and any panel of them ass
 from __future__ import annotations
 
 import argparse
+import functools
 import gzip
 import hashlib
 import logging
@@ -100,12 +101,29 @@ def panel_copies(panel: Path, fwd: str, rev: str, max_mismatch: int,
 
 def db_groups(db_amplicons: Path) -> tuple[list[str], list[str], np.ndarray, list[str]]:
     """Return database headers, sorted group ids, each header's group index and each
-    group's sequence."""
-    records = si.read_fasta(db_amplicons)
-    ids, first, label_of_ref = np.unique([v4g(s) for _, s in records], return_index=True,
-                                         return_inverse=True)
-    return ([h for h, _ in records], ids.tolist(), label_of_ref.astype(np.int64),
-            [records[i][1] for i in first])
+    group's sequence.
+
+    Kept for the file as it is now (path, size, mtime): ``prepare`` and ``align`` both read
+    it, and a process that builds several genomes' parts (the browser) groups the database
+    once. The answer is shared, so callers only read it.
+    """
+    stat = Path(db_amplicons).stat()
+    return _db_groups(str(Path(db_amplicons).resolve()), stat.st_size, stat.st_mtime_ns)
+
+
+@functools.lru_cache(maxsize=1)
+def _db_groups(path: str, _size: int, _mtime_ns: int):
+    records = si.read_fasta(Path(path))
+    # Each distinct sequence hashed once: a pair's amplicons repeat a group ~4x on SILVA.
+    label_of_seq = {seq: v4g(seq) for seq in dict.fromkeys(s for _, s in records)}
+    seq_of_label: dict[str, str] = {}
+    for seq, label in label_of_seq.items():  # first occurrence, as np.unique's return_index
+        seq_of_label.setdefault(label, seq)
+    ids = sorted(seq_of_label)
+    index = {label: i for i, label in enumerate(ids)}
+    label_of_ref = np.fromiter((index[label_of_seq[s]] for _, s in records), dtype=np.int64,
+                               count=len(records))
+    return [h for h, _ in records], ids, label_of_ref, [seq_of_label[label] for label in ids]
 
 
 def _ranks(lineage: str) -> tuple[str, ...]:
