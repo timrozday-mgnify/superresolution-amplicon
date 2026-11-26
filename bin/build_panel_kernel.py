@@ -211,7 +211,7 @@ def taxon_members(taxa: list[tuple[str, str]], headers: list[str], label_ids: li
 
 
 def _home_labels(home_mseq: Path, src: dict[str, int], label_of_hit: dict[str, int],
-                 own: dict[str, int]):
+                 own: dict[str, int], n_amplified: int | None = None):
     """Each source's MAPseq label (-1 when unhit) and identity, from the sources' own mapping.
 
     An exact hit (identity 1) on a label other than the source's own V4 group is a tie
@@ -240,10 +240,16 @@ def _home_labels(home_mseq: Path, src: dict[str, int], label_of_hit: dict[str, i
     too, and stands either way.
 
     MAPseq maps against the whole database, so its hit can also be an entry these primers
-    do not amplify, which therefore has no label. 1492R sits at the 3' end of the 16S, where
-    many SILVA entries are truncated, so for 1100F-1492R that is common. A source whose
-    hit has no label, or that is unhit, likewise keeps its own group when the database has
-    it: some complete entry amplifies to exactly its sequence.
+    do not amplify. 1492R sits at the 3' end of the 16S, where many SILVA entries are
+    truncated, so for 27F-1492R a third of the 20HM sources hit one, often exactly. Real
+    reads follow: in a simulated 27F-1492R mock, 52% of Collinsella's reads hit
+    GQ898710.1.1465, which has no amplicon. Such an entry has its own label (labels
+    ``n_amplified`` on, ``_add_unamplified``), and the source takes it outright: the
+    reference-count rule above cannot apply, since one accession is one reference, and the
+    source's own group, however many references it has, is not where MAPseq puts its reads.
+    Without such labels (``n_amplified`` None) a hit with no label falls through below.
+    A source that is unhit, or whose hit has no label, keeps its own group when the
+    database has it: some complete entry amplifies to exactly its sequence.
     """
     home = np.full(len(src), -1, dtype=np.int64)
     identity = np.full(len(src), np.nan)
@@ -256,9 +262,11 @@ def _home_labels(home_mseq: Path, src: dict[str, int], label_of_hit: dict[str, i
         if source not in own or home[i] == own[source]:
             continue
         if home[i] < 0:
-            log.info("%s: MAPseq's hit has no amplicon under these primers; keeping its "
-                     "own group", source)
+            log.info("%s: unhit, or MAPseq's hit has no label; keeping its own group", source)
             home[i], identity[i] = own[source], 1.0
+        elif n_amplified is not None and home[i] >= n_amplified:
+            log.info("%s: MAPseq's hit has no amplicon under these primers; taking its "
+                     "entry's label", source)
         elif identity[i] == 1.0:
             hit_refs, own_refs = support[home[i]], support[own[source]]
             if hit_refs > own_refs:
@@ -445,12 +453,39 @@ def _mseq_rows(path: Path):
             yield f[0], f[1], f[3]
 
 
+UNAMPLIFIED = "unamp_"   # label of a database entry the primers do not amplify: "unamp_<accession>"
+
+
+def _add_unamplified(mseq_paths, headers: list[str], label_ids: list[str],
+                     label_of_ref: np.ndarray):
+    """Give every database entry hit in ``mseq_paths`` that has no amplicon a label of its own.
+
+    MAPseq maps reads against the whole database, and with a primer at the end of the 16S
+    (27F-1492R) most entries are too short to amplify, so have no V4 group. Reads still
+    land on them: 16.5% of a simulated 27F-1492R mock's reads did, 60-80% for some genomes.
+    Unlabelled, those hits were dropped from the kernel's rows and counted as background
+    in the sample, so a genome lost them twice over. Labelled, the measured kernel predicts
+    them and inference counts them for their source. The new labels follow the database's
+    groups (``n_amplified = len(label_ids)`` beforehand); each has one accession and no
+    sequence. With V4 primers nearly every entry amplifies and this adds few or none.
+    """
+    known = set(headers)
+    extra = sorted({hit for path in mseq_paths for _, hit, _ in _mseq_rows(path)
+                    if hit and hit not in known})
+    if extra:
+        log.info("%d hit database entr(ies) have no amplicon under these primers; each gets "
+                 "its own %s<accession> label", len(extra), UNAMPLIFIED)
+    return (headers + extra, label_ids + [UNAMPLIFIED + h for h in extra],
+            np.concatenate([label_of_ref, len(label_ids) + np.arange(len(extra))]))
+
+
 def _drop_unlabelled(a, sources: pd.DataFrame, home: np.ndarray, identity: np.ndarray):
     """Drop the sources with no home label, and write the bundle's tables to match.
 
-    Such a source's sequence is no amplicon of the database, and MAPseq's hit for it is
-    unhit or an entry the primers do not amplify. Real reads from it land there too, and
-    inference counts them as foreign hits, so it is no source of any label. It is dropped
+    Such a source's sequence is no amplicon of the database, and MAPseq leaves it unhit or
+    gives it no label (an entry with no amplicon gets one, ``_add_unamplified``, when its
+    accession is in the home mapping). Real reads from it land there too, and inference
+    counts them as unexplained or foreign hits, so it is no source of any label. It is dropped
     from its genome, whose other copies are renormalised, and listed in
     ``panel_unlabelled.tsv`` beside the kernel. A genome left with no copy drops out of
     the panel, as an unamplifiable one does; with every source gone the kernel is empty,
@@ -487,10 +522,13 @@ def build(a) -> None:
     source_ids = sources.source.tolist()
     src = {s: i for i, s in enumerate(source_ids)}
     headers, label_ids, label_of_ref, _ = db_groups(a.db_amplicons)
+    own = {label: i for i, label in enumerate(label_ids)}
+    n_amplified = len(label_ids)
+    headers, label_ids, label_of_ref = _add_unamplified([a.home_mseq, a.sim_mseq], headers,
+                                                        label_ids, label_of_ref)
     label_of_hit = dict(zip(headers, label_of_ref.tolist()))
 
-    home, home_identity = _home_labels(a.home_mseq, src, label_of_hit,
-                                       {label: i for i, label in enumerate(label_ids)})
+    home, home_identity = _home_labels(a.home_mseq, src, label_of_hit, own, n_amplified)
     sources, home, home_identity = _drop_unlabelled(a, sources, home, home_identity)
     source_ids = sources.source.tolist()
     src = {s: i for i, s in enumerate(source_ids)}
@@ -580,9 +618,13 @@ def align(a) -> None:
     sequence = dict(si.read_fasta(a.prepared / "sources.fasta"))
     headers, label_ids, label_of_ref, label_seqs = db_groups(a.db_amplicons)
     own = {label: i for i, label in enumerate(label_ids)}
+    # Labels past len(label_seqs) are unamplified entries: a home, never an alignment target.
     if a.home_mseq:
+        headers, label_ids, label_of_ref = _add_unamplified([a.home_mseq], headers,
+                                                            label_ids, label_of_ref)
         home, home_identity = _home_labels(a.home_mseq, src,
-                                           dict(zip(headers, label_of_ref.tolist())), own)
+                                           dict(zip(headers, label_of_ref.tolist())), own,
+                                           len(label_seqs))
     else:
         home = np.array([own.get(s, -1) for s in source_ids], dtype=np.int64)
         home_identity = np.where(home >= 0, 1.0, np.nan)
@@ -634,7 +676,7 @@ def align(a) -> None:
 
     for source_index in source_rows:
         label = sequence_index.get(unique_sequences[source_index])
-        if label is not None and label < len(label_ids):
+        if label is not None and label < len(label_seqs):
             add_candidate(source_index, label, 0)
 
     if a.tau >= 1:
@@ -652,9 +694,9 @@ def align(a) -> None:
                 unique_sequences[left], unique_sequences[right], a.tau)
             if distance > a.tau:
                 continue
-            if left < len(label_ids):
+            if left < len(label_seqs):
                 add_candidate(right, int(left), distance)
-            if right < len(label_ids):
+            if right < len(label_seqs):
                 add_candidate(left, int(right), distance)
 
     rows, cols, weights, dists = [], [], [], []
@@ -674,7 +716,7 @@ def align(a) -> None:
                                      shape=shape)
         distances.data -= 1.0
         strata = (distances, a.distance_decay)
-    neighbours = _neighbours(ka, unique_sequences, source_rows, len(label_ids),
+    neighbours = _neighbours(ka, unique_sequences, source_rows, len(label_seqs),
                              max_ambiguous_bases, max_postings)
     provenance = {"method": "align", "prepared": str(a.prepared), "tau": a.tau,
                   "distance_decay": a.distance_decay, "indel_decay": a.indel_decay,

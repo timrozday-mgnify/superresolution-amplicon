@@ -204,7 +204,12 @@ SILVA-SSU/138.1/SILVA-SSU-tax.txt            --taxonomy (AAP's sk__/s__ form rea
   taxonomy columns, never the hit, which is all the pipeline reads. Lineages come from
   `--taxonomy`.
 - A hit on an entry with no amplicon under the primers is off-target and dropped (0.29% of
-  reads against AAP's SILVA, `dev/aap_merge_effects.md` 0.6).
+  reads against AAP's SILVA, `dev/aap_merge_effects.md` 0.6), unless the panel's kernel
+  gives that entry a label. A panel kernel does that for every such entry its home or
+  simulated reads hit, as `unamp_<accession>`. With 27F-1492R against SILVA, 83% of the
+  entries have no amplicon and 16.5% of a mock's reads hit one, so those reads are counted
+  for their genome instead of lost. Full-length runs need this. V4 runs barely touch it:
+  no 20HM source's home hit is such an entry (`dev/unamplified_hits.md`).
 
 ### Inputs from amplicon-analysis-pipeline
 
